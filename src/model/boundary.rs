@@ -1457,10 +1457,7 @@ impl BoundaryModel {
         let (ln_w, ln_b) = self.pair_scorer.content_ln_params()?;
         let token_values: Vec<Vec<f32>> = text_flat
             .iter()
-            .map(|x| {
-                let v = apply_linear(&w_cv, h, &b_cv, x);
-                layernorm(&v, &ln_w, &ln_b).unwrap_or_else(|e| panic!("content layernorm: {e}"))
-            })
+            .map(|x| apply_linear(&w_cv, h, &b_cv, x))
             .collect();
         // Running sums per content dimension over valid tokens.
         let mut run_sum = vec![vec![0.0f32; c_dim]; n + 1];
@@ -1485,8 +1482,10 @@ impl BoundaryModel {
             let span_sum: Vec<f32> = (0..c_dim)
                 .map(|k| run_sum[e.min(n)][k] - run_sum[s.min(n)][k])
                 .collect();
-            let pooled_content: Vec<f32> =
+            let pooled_content_raw: Vec<f32> =
                 span_sum.iter().map(|v| v / len_f).collect();
+            let pooled_content = layernorm(&pooled_content_raw, &ln_w, &ln_b)
+                .unwrap_or_else(|e| panic!("content layernorm: {e}"));
 
             let mut cand = vec![0.0f32; d];
             for ri in 0..d {
@@ -1508,7 +1507,11 @@ impl BoundaryModel {
                 }
                 cand[ri] = acc;
             }
-            let _ = &pool_norm; // extracted below
+                {
+                    let (nw, nb) = (&pool_norm.0, &pool_norm.1);
+                    cand = layernorm(&cand, nw, nb)
+                        .unwrap_or_else(|e| panic!("candidate norm: {e}"));
+                }
                 candidates.push(cand);
         }
 
@@ -1541,7 +1544,7 @@ impl BoundaryModel {
                 let fh = apply_linear(&w_fo_h, d, &b_fo_h, &conditioned);
                 let fh_act: Vec<f32> = fh
                     .iter()
-                    .map(|v| v * 0.5 * (1.0 + (v * SQRT_2_OVER_PI).tanh()))
+                    .map(|v| v * 0.5 * (1.0 + erf(v / std::f32::consts::SQRT_2)))
                     .collect();
                 let fo = apply_linear(&w_fo_o, c_dim, &b_fo_o, &fh_act);
                 sc += fo[0];
@@ -1575,7 +1578,7 @@ impl BoundaryModel {
             None
         };
 
-        Ok(SharedPoolScores {
+                Ok(SharedPoolScores {
             starts: sel_s,
             ends: sel_e,
             valid: sel_valid,
@@ -1613,6 +1616,18 @@ fn sigmoid_f32(x: f32) -> f32 {
 
 fn gelu_f32(x: f32) -> f32 {
     x * 0.5 * (1.0 + ((2.0_f32).sqrt() * (x + 0.044715 * x * x * x)).tanh())
+}
+
+fn erf(x: f32) -> f32 {
+    // Abramowitz & Stegun 7.1.26 approximation (|err| < 1.5e-7)
+    let sign = if x < 0.0 { -1.0 } else { 1.0 };
+    let x = x.abs();
+    let t = 1.0 / (1.0 + 0.3275911 * x);
+    let y = 1.0
+        - t * (0.254829592
+            - t * (0.284496736
+                - t * (1.421413741 - t * (1.453152027 - t * 1.061405429))));
+    sign * y
 }
 
 fn layernorm(x: &[f32], weight: &[f32], bias: &[f32]) -> Result<Vec<f32>> {

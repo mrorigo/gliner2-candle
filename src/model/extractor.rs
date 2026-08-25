@@ -1060,7 +1060,7 @@ mod tests {
             Tensor::from_slice(&[1u32, 1, 1, 1, 1, 0], (2, 3), &Device::Cpu).unwrap();
 
         let output = extractor.run_encoder(&input_ids, &attention_mask);
-        assert!(output.is_ok());
+        assert!(output.is_ok(), "run_encoder err: {:?}", output.err());
         let output = output.unwrap();
         assert_eq!(output.dims(), &[2, 3, 768]);
     }

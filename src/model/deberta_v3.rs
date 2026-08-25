@@ -161,7 +161,8 @@ impl DebertaV3Attention {
                 self.num_attention_heads,
                 self.attention_head_size,
             ))?
-            .transpose(1, 2)?;
+            .transpose(1, 2)?
+            .contiguous()?;
         let key_layer = key_states
             .reshape((
                 batch_size,
@@ -169,7 +170,8 @@ impl DebertaV3Attention {
                 self.num_attention_heads,
                 self.attention_head_size,
             ))?
-            .transpose(1, 2)?;
+            .transpose(1, 2)?
+            .contiguous()?;
         let value_layer = value_states
             .reshape((
                 batch_size,
@@ -177,7 +179,8 @@ impl DebertaV3Attention {
                 self.num_attention_heads,
                 self.attention_head_size,
             ))?
-            .transpose(1, 2)?;
+            .transpose(1, 2)?
+            .contiguous()?;
 
         // Compute scale factor based on pos_att_type
         let mut scale_factor = 1.0f64;
@@ -462,7 +465,6 @@ impl DebertaV3Layer {
 /// DeBERTa V3 encoder
 struct DebertaV3Encoder {
     layers: Vec<DebertaV3Layer>,
-    final_layer_norm: LayerNorm,
     num_attention_heads: usize,
 }
 
@@ -473,14 +475,8 @@ impl DebertaV3Encoder {
             let layer = DebertaV3Layer::load(vb.pp("layer").pp(i.to_string()), config)?;
             layers.push(layer);
         }
-        let final_layer_norm = candle_nn::layer_norm(
-            config.hidden_size,
-            config.layer_norm_eps,
-            vb.pp("LayerNorm"),
-        )?;
         Ok(Self {
             layers,
-            final_layer_norm,
             num_attention_heads: config.num_attention_heads,
         })
     }
@@ -495,7 +491,7 @@ impl DebertaV3Encoder {
         for layer in &self.layers {
             hidden = layer.forward(&hidden, attention_mask, rel_embeddings)?;
         }
-        self.final_layer_norm.forward(&hidden)
+        Ok(hidden)
     }
 }
 
@@ -504,6 +500,7 @@ pub struct DebertaV3Model {
     embeddings: DebertaV3Embeddings,
     encoder: DebertaV3Encoder,
     rel_embeddings: Option<Embedding>,
+    rel_layer_norm: Option<LayerNorm>,
     device: Device,
 }
 
@@ -536,11 +533,21 @@ impl DebertaV3Model {
         } else {
             None
         };
+        let rel_layer_norm = if vb.contains_tensor("encoder.LayerNorm.weight") {
+            Some(candle_nn::layer_norm(
+                config.hidden_size,
+                config.layer_norm_eps,
+                vb.pp("encoder").pp("LayerNorm"),
+            )?)
+        } else {
+            None
+        };
 
         Ok(Self {
             embeddings,
             encoder,
             rel_embeddings,
+            rel_layer_norm,
             device: vb.device().clone(),
         })
     }
@@ -607,16 +614,60 @@ impl DebertaV3Model {
         let attention_mask = (attention_mask.ones_like()? - &attention_mask)?
             .broadcast_mul(&Tensor::try_from(f32::MIN)?.to_device(attention_mask.device())?)?;
 
-        let rel_embeddings = self.rel_embeddings.as_ref().map(|e| e.embeddings());
+        let rel_embeddings = self.rel_states();
         self.encoder.forward(
             &embedding_output,
             &attention_mask,
-            rel_embeddings.as_ref().map(|t| *t),
+            rel_embeddings.as_ref(),
         )
+    }
+
+    fn rel_states(&self) -> Option<Tensor> {
+        let raw = self.rel_embeddings.as_ref()?.embeddings();
+        match &self.rel_layer_norm {
+            Some(ln) => Some(ln.forward(raw).expect("rel LayerNorm forward")),
+            None => Some(raw.clone()),
+        }
     }
 
     pub fn device(&self) -> &Device {
         &self.device
+    }
+
+    /// Debug forward returning [embedding_output, layer0_out, ..] for parity testing.
+    pub fn forward_debug(
+        &self,
+        input_ids: &Tensor,
+        attention_mask: Option<&Tensor>,
+    ) -> Result<Vec<Tensor>> {
+        let embedding_output = self.embeddings.forward(input_ids)?;
+        let mut stages = vec![embedding_output.clone()];
+
+        let attention_mask = match attention_mask {
+            Some(mask) => mask.clone(),
+            None => input_ids.ones_like()?,
+        };
+        let extended_attention_mask = attention_mask.unsqueeze(1)?.unsqueeze(2)?;
+        let pairwise_attention_mask = extended_attention_mask
+            .broadcast_mul(&extended_attention_mask.squeeze(2)?.unsqueeze(3)?)?;
+        let pairwise_attention_mask = pairwise_attention_mask.broadcast_as((
+            pairwise_attention_mask.dims()[0],
+            self.encoder.num_attention_heads,
+            pairwise_attention_mask.dims()[2],
+            pairwise_attention_mask.dims()[3],
+        ))?;
+        let attention_mask = pairwise_attention_mask.to_dtype(DType::F32)?;
+        let attention_mask = (attention_mask.ones_like()? - &attention_mask)?
+            .broadcast_mul(&Tensor::try_from(f32::MIN)?.to_device(attention_mask.device())?)?;
+
+        let rel_embeddings = self.rel_states();
+        let mut hidden = embedding_output;
+        for layer in &self.encoder.layers {
+            hidden = layer.forward(&hidden, &attention_mask, rel_embeddings.as_ref())?;
+            stages.push(hidden.clone());
+        }
+        stages.push(hidden);
+        Ok(stages)
     }
 }
 
@@ -629,11 +680,11 @@ fn build_relative_position(
     max_relative_positions: isize,
     device: &Device,
 ) -> Result<Tensor> {
-    // Match candle-transformers/debertav2:
-    // q_ids: (1, query), k_ids: (key, 1), rel_pos = k - q
-    let q_ids = Tensor::arange(0i64, query_size as i64, device)?.unsqueeze(0)?;
-    let k_ids = Tensor::arange(0i64, key_size as i64, device)?.unsqueeze(1)?;
-    let mut rel_pos = k_ids.broadcast_sub(&q_ids)?;
+    // Match HF DeBERTa V2/V3:
+    // q_ids: (query, 1), k_ids: (1, key), rel_pos = q - k
+    let q_ids = Tensor::arange(0i64, query_size as i64, device)?.unsqueeze(1)?;
+    let k_ids = Tensor::arange(0i64, key_size as i64, device)?.unsqueeze(0)?;
+    let mut rel_pos = q_ids.broadcast_sub(&k_ids)?;
 
     if position_buckets > 0 && max_relative_positions > 0 {
         rel_pos =

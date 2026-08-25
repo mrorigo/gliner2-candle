@@ -33,16 +33,17 @@ fn test_gliner25_small_boundary_scoring() {
     assert!(model.boundary.is_some());
 
     let ws_tok = gliner2_rs::tokenizer::WhitespaceTokenizer::new();
-    let collator = gliner2_rs::batch::ExtractorCollator::with_max_len(ws_tok, false, config.max_len);
+    let tok_path = download_from_hub(model_id, "tokenizer.json");
+    let hf_tok = tokenizers::Tokenizer::from_file(&tok_path).expect("load tokenizer");
+    let collator =
+        gliner2_rs::batch::ExtractorCollator::with_hf_tokenizer(ws_tok, hf_tok, false, config.max_len);
 
     let schema_json = serde_json::json!({
         "entities": ["person", "organization"]
     });
-    let schema = gliner2_rs::schema::types::Schema::from_dict(&schema_json).expect("build schema");
 
     let text = "Apple CEO Tim Cook announced the new iPhone 15 in Cupertino.";
-    let schema_dict = schema.to_dict();
-    let samples = vec![(text.to_string(), schema_dict)];
+    let samples = vec![(text.to_string(), schema_json)];
     let batch = collator.collate(&samples).expect("collate");
     let batch = batch.to(candle_core::Device::Cpu, None).expect("to device");
 
@@ -106,7 +107,7 @@ fn test_gliner25_small_boundary_scoring() {
 
     println!("OK: {num_valid} valid candidates, max_score={max_score:.4}");
     println!("Top candidates (score > 0):");
-    for (ci, (((&s, &e), &valid), scores)) in scored.starts.iter()
+    for (_ci, (((&s, &e), &valid), scores)) in scored.starts.iter()
         .zip(&scored.ends)
         .zip(&scored.valid)
         .zip(&scored.scores)
@@ -156,5 +157,273 @@ fn test_gliner25_engine_extract_entities() {
         Err(e) => {
             panic!("Engine extraction failed: {e}");
         }
+    }
+}
+
+#[test]
+#[ignore = "debug collation comparison"]
+fn test_collation_comparison() {
+    let model_id = "fastino/gliner2.5-small-v1";
+    let hf_config_path = download_from_hub(model_id, "config.json");
+    let hf_config = std::fs::read_to_string(&hf_config_path).expect("read config.json");
+    let mut config = gliner2_rs::config::presets::gliner25_small();
+    config.boundary = gliner2_rs::config::BoundaryConfig::from_hf_config_json(&hf_config);
+
+    // Load HF tokenizer
+    let tok_path = download_from_hub(model_id, "tokenizer.json");
+    let hf_tok = tokenizers::Tokenizer::from_file(&tok_path).expect("load tokenizer");
+
+    let ws_tok = gliner2_rs::tokenizer::WhitespaceTokenizer::new();
+    let collator = gliner2_rs::batch::ExtractorCollator::with_hf_tokenizer(ws_tok, hf_tok, false, config.max_len);
+
+    let schema_json = serde_json::json!({
+        "entities": ["person", "organization", "location"]
+    });
+
+    let text = "Apple CEO Tim Cook announced the new iPhone 15 in Cupertino.";
+    let samples = vec![(text.to_string(), schema_json)];
+    let batch = collator.collate(&samples).expect("collate");
+
+    println!("=== RUST COLLATION ===");
+    println!("input_ids len: {}", batch.input_ids.dim(1).unwrap());
+    let ids = batch.input_ids.flatten_all().unwrap().to_vec1::<i64>().unwrap();
+    let ids_u32: Vec<u32> = ids.iter().map(|&x| x as u32).collect();
+    println!("input_ids: {:?}", ids_u32);
+    println!("text_word_indices: {:?}", batch.text_word_indices);
+    println!("schema_special_indices: {:?}", batch.schema_special_indices);
+
+    // Compare with Python:
+    // Python input_ids: [287, 128003, 6967, 287, 128005, 604, 128005, 1416, 128005, 1250, 1263, 1263, 128002, 6038, 101312, 41718, 3712, 1577, 262, 353, 16998, 706, 267, 3189, 649, 41290, 323]
+    // Python text_word_indices: [13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 26]
+    // Python query_marker_indices: [4, 6, 8]
+    // Python start_mappings: [0, 6, 10, 14, 19, 29, 33, 37, 44, 47, 50, 59]
+    // Python end_mappings: [5, 9, 13, 18, 28, 32, 36, 43, 46, 49, 59, 60]
+}
+
+/// Numeric parity vs Python reference dumps in /tmp/g25diag/.
+#[test]
+#[ignore = "numeric parity debug; requires /tmp/g25diag dumps"]
+fn test_numeric_parity() {
+    let model_id = "fastino/gliner2.5-small-v1";
+    let hf_config_path = download_from_hub(model_id, "config.json");
+    let hf_config = std::fs::read_to_string(&hf_config_path).expect("read config.json");
+    let mut config = gliner25_small();
+    config.boundary = BoundaryConfig::from_hf_config_json(&hf_config);
+
+    let mut model = gliner2_rs::model::Extractor::new(&config).expect("construct extractor");
+    let weights_path = download_from_hub(model_id, "model.safetensors");
+    model.load_weights(&weights_path).expect("load weights");
+    let boundary = model.boundary.as_ref().expect("boundary present");
+
+    let tok_path = download_from_hub(model_id, "tokenizer.json");
+    let hf_tok = tokenizers::Tokenizer::from_file(&tok_path).expect("load tokenizer");
+    let ws_tok = gliner2_rs::tokenizer::WhitespaceTokenizer::new();
+    let collator = gliner2_rs::batch::ExtractorCollator::with_hf_tokenizer(
+        ws_tok, hf_tok, false, config.max_len,
+    );
+
+    let schema_json = serde_json::json!({
+        "entities": ["person", "organization", "location"]
+    });
+    let text = "Apple CEO Tim Cook announced the new iPhone 15 in Cupertino.";
+    let batch = collator
+        .collate(&vec![(text.to_string(), schema_json)])
+        .expect("collate")
+        .to(candle_core::Device::Cpu, None)
+        .expect("to device");
+
+    let token_embs = model
+        .encoder
+        .forward(&batch.input_ids, &batch.attention_mask)
+        .expect("encoder forward")
+        .narrow(0, 0, 1).unwrap().squeeze(0).unwrap();
+    let h = token_embs.dims()[1];
+    let rows = token_embs.to_vec2::<f32>().unwrap();
+
+    // text states
+    let count = batch.text_word_counts[0];
+    let twi = batch.text_word_indices.as_ref().unwrap().to_vec2::<i64>().unwrap();
+    let word_positions: Vec<usize> = twi[0][..count].iter().map(|&v| v as usize).collect();
+    let mut flat_text = Vec::with_capacity(count * h);
+    for &w in &word_positions {
+        flat_text.extend_from_slice(&rows[w]);
+    }
+    let text_states = candle_core::Tensor::from_slice(&flat_text, (count, h), &candle_core::Device::Cpu).unwrap();
+
+    // query states ([E] markers only)
+    let specials = &batch.schema_special_indices[0][0];
+    let schema_tokens = &batch.schema_tokens_list[0][0];
+    let mut sp = 0;
+    let mut pending: Option<usize> = None;
+    let mut queries: Vec<(String, usize)> = Vec::new();
+    for token in schema_tokens {
+        if token.starts_with('[') && token.ends_with(']') {
+            let pos = specials[sp];
+            sp += 1;
+            pending = if token == "[E]" { Some(pos) } else { None };
+            continue;
+        }
+        if let Some(marker_pos) = pending.take() {
+            queries.push((token.clone(), marker_pos));
+        }
+    }
+    let q = queries.len();
+    let mut flat_queries = Vec::with_capacity(q * h);
+    for (_, pos) in &queries {
+        flat_queries.extend_from_slice(&rows[*pos]);
+    }
+    let query_states = candle_core::Tensor::from_slice(&flat_queries, (q, h), &candle_core::Device::Cpu).unwrap();
+
+    // --- Compare text_states with Python ---
+    let py: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string("/tmp/g25diag/text_states.json").unwrap(),
+    ).unwrap();
+    let py_data = py["data"].as_array().unwrap();
+    let rs_data = text_states.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+    let mut max_diff: f32 = 0.0;
+    for (a, b) in py_data.iter().zip(&rs_data) {
+        max_diff = max_diff.max((a.as_f64().unwrap() as f32 - b).abs());
+    }
+    println!("text_states shape rust=({count},{h}) python={:?} max_diff={max_diff:.6}", py["shape"]);
+
+    let scored = boundary.score_sample(&text_states, count, &query_states).expect("score_sample");
+
+    // Compare pair scores per query
+    let py_pair: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string("/tmp/g25diag/pair_logits.json").unwrap(),
+    ).unwrap();
+    println!("python pair_logits shape={:?}", py_pair["shape"]);
+    let names = ["person", "organization", "location"];
+    for (qi, name) in names.iter().enumerate() {
+        let mut top: Vec<(usize, usize, f32)> = Vec::new();
+        for ci in 0..scored.starts.len() {
+            if !scored.valid[ci] { continue; }
+            top.push((scored.starts[ci], scored.ends[ci], scored.scores[ci][qi]));
+        }
+        top.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap());
+        println!("{name} top5: {:?}", &top[..top.len().min(5)]);
+    }
+}
+
+/// Compare raw encoder token embeddings vs Python dump.
+#[test]
+#[ignore = "encoder parity debug; requires /tmp/g25diag dumps"]
+fn test_encoder_parity() {
+    let model_id = "fastino/gliner2.5-small-v1";
+    let hf_config_path = download_from_hub(model_id, "config.json");
+    let hf_config = std::fs::read_to_string(&hf_config_path).expect("read config.json");
+    let mut config = gliner25_small();
+    config.boundary = BoundaryConfig::from_hf_config_json(&hf_config);
+
+    let mut model = gliner2_rs::model::Extractor::new(&config).expect("construct extractor");
+    let weights_path = download_from_hub(model_id, "model.safetensors");
+    model.load_weights(&weights_path).expect("load weights");
+
+    let tok_path = download_from_hub(model_id, "tokenizer.json");
+    let hf_tok = tokenizers::Tokenizer::from_file(&tok_path).expect("load tokenizer");
+    let ws_tok = gliner2_rs::tokenizer::WhitespaceTokenizer::new();
+    let collator = gliner2_rs::batch::ExtractorCollator::with_hf_tokenizer(
+        ws_tok, hf_tok, false, config.max_len,
+    );
+
+    let schema_json = serde_json::json!({
+        "entities": ["person", "organization", "location"]
+    });
+    let text = "Apple CEO Tim Cook announced the new iPhone 15 in Cupertino.";
+    let batch = collator
+        .collate(&vec![(text.to_string(), schema_json)])
+        .expect("collate")
+        .to(candle_core::Device::Cpu, None)
+        .expect("to device");
+
+    let embs = model
+        .encoder
+        .forward(&batch.input_ids, &batch.attention_mask)
+        .expect("encoder forward")
+        .narrow(0, 0, 1).unwrap().squeeze(0).unwrap();
+    let rs: Vec<Vec<f32>> = embs.to_vec2::<f32>().unwrap();
+
+    let py: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string("/tmp/g25diag/token_embs.json").unwrap(),
+    ).unwrap();
+    let py_shape: Vec<usize> = py["shape"].as_array().unwrap()
+        .iter().map(|v| v.as_u64().unwrap() as usize).collect();
+    let py_data: Vec<f32> = py["data"].as_array().unwrap()
+        .iter().map(|v| v.as_f64().unwrap() as f32).collect();
+
+    println!("rust shape {:?} python shape {:?}", embs.dims(), py_shape);
+    let (s_len, s_h) = (py_shape[0], py_shape[1]);
+    // per-position max diff
+    let mut worst: Vec<(usize, f32)> = Vec::new();
+    for pos in 0..s_len.min(rs.len()) {
+        let mut md: f32 = 0.0;
+        for j in 0..s_h {
+            md = md.max((py_data[pos * s_h + j] - rs[pos][j]).abs());
+        }
+        worst.push((pos, md));
+    }
+    worst.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+    println!("worst positions: {:?}", &worst[..8.min(worst.len())]);
+    let global: f32 = worst.iter().map(|(_, d)| *d).fold(0.0, f32::max);
+    println!("global max_diff={global:.6}");
+}
+
+
+
+/// Staged encoder parity: embeddings + per-layer outputs vs Python dumps.
+#[test]
+#[ignore = "staged parity debug; requires /tmp/g25diag dumps"]
+fn test_staged_parity() {
+    let model_id = "fastino/gliner2.5-small-v1";
+    let hf_config_path = download_from_hub(model_id, "config.json");
+    let hf_config = std::fs::read_to_string(&hf_config_path).expect("read config.json");
+    let mut config = gliner25_small();
+    config.boundary = BoundaryConfig::from_hf_config_json(&hf_config);
+
+    let mut model = gliner2_rs::model::Extractor::new(&config).expect("construct extractor");
+    let weights_path = download_from_hub(model_id, "model.safetensors");
+    model.load_weights(&weights_path).expect("load weights");
+
+    let tok_path = download_from_hub(model_id, "tokenizer.json");
+    let hf_tok = tokenizers::Tokenizer::from_file(&tok_path).expect("load tokenizer");
+    let ws_tok = gliner2_rs::tokenizer::WhitespaceTokenizer::new();
+    let collator = gliner2_rs::batch::ExtractorCollator::with_hf_tokenizer(
+        ws_tok, hf_tok, false, config.max_len,
+    );
+
+    let schema_json = serde_json::json!({
+        "entities": ["person", "organization", "location"]
+    });
+    let text = "Apple CEO Tim Cook announced the new iPhone 15 in Cupertino.";
+    let batch = collator
+        .collate(&vec![(text.to_string(), schema_json)])
+        .expect("collate")
+        .to(candle_core::Device::Cpu, None)
+        .expect("to device");
+
+    let stages = model.encoder.forward_debug(&batch.input_ids, &batch.attention_mask).unwrap();
+
+    fn compare(path: &str, rs_flat: &[f32]) -> f32 {
+        let py: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let py_data: Vec<f32> = py["data"].as_array().unwrap()
+            .iter().map(|v| v.as_f64().unwrap() as f32).collect();
+        let mut md: f32 = 0.0;
+        for (a, b) in py_data.iter().zip(rs_flat) {
+            md = md.max((a - b).abs());
+        }
+        md
+    }
+
+    // embeddings
+    let emb: Vec<f32> = stages[0].narrow(0,0,1).unwrap().squeeze(0).unwrap().flatten_all().unwrap().to_vec1().unwrap();
+    println!("embeddings max_diff={:.6}", compare("/tmp/g25diag/embeddings.json", &emb));
+    for (i, st) in stages.iter().enumerate().skip(1) {
+        let flat: Vec<f32> = st.narrow(0,0,1).unwrap().squeeze(0).unwrap().flatten_all().unwrap().to_vec1().unwrap();
+        let path = if i == stages.len()-1 {
+            "/tmp/g25diag/token_embs.json".to_string()
+        } else {
+            format!("/tmp/g25diag/layer_{}.json", i-1)
+        };
+        println!("stage_{i} ({path}) max_diff={:.6}", compare(&path, &flat));
     }
 }

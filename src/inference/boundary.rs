@@ -182,7 +182,7 @@ pub(crate) fn extract_sample(
                     }
                     let mut entries = Vec::with_capacity(hits.len());
                     for (s, e, conf) in hits {
-                        let char_start = char_offset(starts_map, s.saturating_sub(1));
+                        let char_start = char_offset(starts_map, s.min(text_len.saturating_sub(1)));
                         let char_end = char_offset(ends_map, (e - 1).min(text_len - 1));
                         let text = safe_slice(original_text, char_start, char_end);
                         if include_confidence {
@@ -266,7 +266,7 @@ pub(crate) fn extract_sample(
                                         let span_jsons: Vec<JsonValue> = spans
                                             .iter()
                                             .map(|&(s, e)| {
-                                                let cs = char_offset(starts_map, s.saturating_sub(1));
+                                                let cs = char_offset(starts_map, s.min(text_len.saturating_sub(1)));
                                                 let ce = char_offset(ends_map, (e - 1).min(text_len - 1));
                                                 json!({"text": safe_slice(original_text, cs, ce), "start": cs, "end": ce})
                                             })
@@ -363,12 +363,12 @@ pub(crate) fn extract_sample(
                                         }
                                         let (hs, he) = pair_heads[idx];
                                         let (ts, te) = pair_tails[idx];
-                                        let cs_h = char_offset(starts_map, hs.saturating_sub(1));
+                                        let cs_h = char_offset(starts_map, hs.min(text_len.saturating_sub(1)));
                                         let ce_h = char_offset(
                                             ends_map,
                                             (he - 1).min(text_len - 1),
                                         );
-                                        let cs_t = char_offset(starts_map, ts.saturating_sub(1));
+                                        let cs_t = char_offset(starts_map, ts.min(text_len.saturating_sub(1)));
                                         let ce_t = char_offset(
                                             ends_map,
                                             (te - 1).min(text_len - 1),
