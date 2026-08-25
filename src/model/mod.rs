@@ -23,6 +23,7 @@
 //! model.load_weights("path/to/weights.safetensors")?;
 //! ```
 
+pub mod boundary;
 pub mod candle_encoder;
 pub mod classifier;
 pub mod count_embed;
@@ -34,6 +35,7 @@ pub mod span_rep;
 pub mod weight_mapping;
 
 // Re-export main types
+pub use boundary::BoundaryModel;
 pub use candle_encoder::{CandleEncoder, EncoderType};
 pub use classifier::ClassifierHead;
 pub use count_pred::CountPredictionLayer;

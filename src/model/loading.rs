@@ -163,6 +163,27 @@ impl ModelLoader {
     /// * `vb` - The VarBuilder containing the loaded weights.
     /// * `model` - The model to rebuild.
     fn rebuild_model(&self, vb: VarBuilder, model: &mut Extractor) -> Result<()> {
+        // GLiNER2.5 boundary architecture: shared encoder + boundary head.
+        if self.config.architecture == crate::config::Architecture::Gliner25 {
+            model.encoder = crate::model::candle_encoder::CandleEncoder::from_var_builder(
+                vb.clone(),
+                &self.config,
+                self.device.clone(),
+            )
+            .map_err(|e| GlinerError::model_loading(format!("Failed to rebuild encoder: {e}")))?;
+
+            let boundary = crate::model::boundary::BoundaryModel::load(
+                vb,
+                &self.config,
+                &self.device,
+            )
+            .map_err(|e| {
+                GlinerError::model_loading(format!("Failed to load boundary head: {e}"))
+            })?;
+            model.boundary = Some(boundary);
+            return Ok(());
+        }
+
         // Rebuild encoder with loaded weights
         model.encoder = crate::model::candle_encoder::CandleEncoder::from_var_builder(
             vb.clone(),

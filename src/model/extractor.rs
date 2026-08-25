@@ -144,6 +144,8 @@ impl ExtractorOutput {
 pub struct Extractor {
     /// Model configuration.
     pub config: ExtractorConfig,
+    /// Architecture family (GLiNER2 vs GLiNER2.5).
+    pub architecture: crate::config::Architecture,
     /// Hidden size of the model.
     pub hidden_size: usize,
     /// Maximum span width.
@@ -166,12 +168,16 @@ pub struct Extractor {
     pub count_embed: CountEmbedLayer,
     /// Classifier head.
     pub classifier: ClassifierHead,
+    /// GLiNER2.5 boundary model (populated at weight-load time; `None` for
+    /// GLiNER2 checkpoints and before loading).
+    pub boundary: Option<crate::model::boundary::BoundaryModel>,
 }
 
 impl std::fmt::Debug for Extractor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Extractor")
             .field("config", &self.config)
+            .field("architecture", &self.architecture)
             .field("hidden_size", &self.hidden_size)
             .field("max_width", &self.max_width)
             .field("device", &self.device)
@@ -231,6 +237,7 @@ impl Extractor {
 
         Ok(Self {
             config: config.clone(),
+            architecture: config.architecture,
             hidden_size: config.hidden_size,
             max_width: config.max_width,
             device,
@@ -241,6 +248,7 @@ impl Extractor {
             count_pred,
             count_embed,
             classifier,
+            boundary: None,
         })
     }
 
@@ -324,6 +332,13 @@ impl Extractor {
     pub fn forward(&self, batch: &PreprocessedBatch) -> Result<ExtractorOutput> {
         if batch.is_empty() {
             return Ok(ExtractorOutput::empty(self.device.clone()));
+        }
+
+        // GLiNER2.5 uses the boundary path, not the span-enumeration grid.
+        if self.architecture == crate::config::Architecture::Gliner25 {
+            return Err(GlinerError::config(
+                "GLiNER2.5 boundary decoding is not yet implemented (see docs/PLAN_2.5.md Phase 2)",
+            ));
         }
 
         // Step 1: Run encoder to get token embeddings

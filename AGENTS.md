@@ -2,29 +2,34 @@
 
 ## 🎯 Project Overview
 
-This is a pure Rust implementation of the [GLiNER2](https://github.com/urchade/GLiNER2) information extraction model. The entire PyTorch/Python codebase has been ported to Rust using HuggingFace's `candle` ML framework.
+This is a pure Rust implementation of the [GLiNER2](https://github.com/urchade/GLiNER2) and [GLiNER2.5](https://github.com/urchade/GLiNER2.5) information extraction models. The entire PyTorch/Python codebase has been ported to Rust using HuggingFace's `candle` ML framework.
 
-**Key Achievement**: The full pipeline works end-to-end with real GLiNER2 model weights downloaded from HuggingFace Hub. The model loads, runs forward pass, and produces valid output structure.
+**Key Achievement**: Both GLiNER2 (span-enumeration) and GLiNER2.5 (boundary-prediction) pipelines work end-to-end with real model weights downloaded from HuggingFace Hub.
 
-**Current Status**: Entity extraction returns empty results (debugging in progress). The architecture is complete; the issue is in schema embedding extraction and span scoring logic.
+**Current Status (Phase 2 complete)**: 
+- GLiNER2: Fully functional entity extraction.
+- GLiNER2.5: `score_sample()` runs end-to-end producing valid candidate scores. Engine integration works (from_pretrained + extract_entities). Small model produces modest scores (sigmoid ~0.18); threshold tuning needed for production use.
 
 ## 🏗️ Architecture Summary
 
 ### Pipeline Flow
 ```
-Text + Schema → Tokenizer → Collator → DeBERTa V3 Encoder → Span Rep → Classifier → Output
+GLiNER2:  Text + Schema → Tokenizer → Collator → DeBERTa V3 → Span Rep → Classifier → Output
+GLiNER2.5: Text + Schema → Tokenizer → Collator → DeBERTa V3 → BoundaryEncoder → Score Sample → Output
 ```
 
 ### Key Components
 | Component | File | Purpose |
 |-----------|------|---------|
 | **DeBERTa V3 Encoder** | `src/model/deberta_v3.rs` | Custom DeBERTa V3 implementation (no token_type_embeddings) |
+| **Boundary Encoder** | `src/model/boundary.rs` | Boundary projection, attention, SwiGLU refinement + score_sample |
 | **Span Representation** | `src/model/span_rep.rs` | markerV0: project_start/end/out_project (Linear+GELU+Linear) |
 | **Classifier** | `src/model/classifier.rs` | 2-layer MLP: 768→1536→1 with ReLU |
 | **Count Prediction** | `src/model/count_pred.rs` | 2-layer MLP: 768→1536→20 with ReLU |
 | **Candle Encoder** | `src/model/candle_encoder.rs` | Wrapper supporting BERT/DeBERTa V2/V3 |
 | **Collator** | `src/batch/collator.rs` | Tokenization + schema encoding + batching |
-| **Inference Engine** | `src/inference/engine.rs` | Main GLiNER2 API + entity extraction logic |
+| **Inference Engine** | `src/inference/engine.rs` | Main GLiNER2/2.5 API + entity extraction logic |
+| **Boundary Decode** | `src/inference/boundary.rs` | GLiNER2.5 boundary-path query building + entity decoding |
 
 ### Model Architecture (GLiNER2 base-v1)
 - **Encoder**: DeBERTa-v3-base (128011 vocab, 768 hidden, 12 layers, 12 heads)

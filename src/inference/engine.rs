@@ -145,7 +145,46 @@ impl GLiNER2 {
         let input = model_name_or_path.as_ref();
         let input_str = input.to_string_lossy().to_string();
         let is_local = input.exists();
-        let config = ExtractorConfig::new(input_str.clone());
+        let mut config = ExtractorConfig::new(input_str.clone());
+
+        // Detect the architecture family (GLiNER2 vs GLiNER2.5 boundary).
+        config.architecture = crate::config::Architecture::detect(&input_str);
+
+        // For remote models, download and parse config.json for encoder dimensions.
+        if !is_local {
+            if let Some(hf_config_path) = Self::download_hf_config(&input_str) {
+                if let Ok(hf_config_str) = std::fs::read_to_string(&hf_config_path) {
+                    // Parse boundary config for GLiNER2.5
+                    config.boundary =
+                        crate::config::BoundaryConfig::from_hf_config_json(&hf_config_str);
+                }
+            }
+            // Encoder dims are in a separate encoder_config/config.json
+            if let Some(enc_path) = Self::download_encoder_config(&input_str) {
+                if let Ok(enc_str) = std::fs::read_to_string(&enc_path) {
+                    if let Ok(enc) = serde_json::from_str::<serde_json::Value>(&enc_str) {
+                        if let Some(vs) = enc.get("vocab_size").and_then(|v| v.as_u64()) {
+                            config.vocab_size = vs as usize;
+                        }
+                        if let Some(hs) = enc.get("hidden_size").and_then(|v| v.as_u64()) {
+                            config.hidden_size = hs as usize;
+                        }
+                        if let Some(nl) = enc.get("num_hidden_layers").and_then(|v| v.as_u64()) {
+                            config.num_hidden_layers = nl as usize;
+                        }
+                        if let Some(nh) = enc.get("num_attention_heads").and_then(|v| v.as_u64()) {
+                            config.num_attention_heads = nh as usize;
+                        }
+                        if let Some(is) = enc.get("intermediate_size").and_then(|v| v.as_u64()) {
+                            config.intermediate_size = is as usize;
+                        }
+                    }
+                }
+            }
+        } else {
+            config.boundary =
+                crate::config::BoundaryConfig::detect(input.to_string_lossy().as_ref());
+        }
 
         let mut model = Extractor::new(&config)?;
 
@@ -203,6 +242,38 @@ impl GLiNER2 {
             Ok(path) => Some(path),
             Err(e) => {
                 tracing::warn!("Failed to download model weights for '{}': {}", model_id, e);
+                None
+            }
+        }
+    }
+
+    /// Download `config.json` from HuggingFace Hub for a remote model.
+    fn download_hf_config(model_id: &str) -> Option<std::path::PathBuf> {
+        use hf_hub::{Repo, RepoType, api::sync::ApiBuilder};
+
+        let repo = Repo::with_revision(model_id.to_string(), RepoType::Model, "main".to_string());
+        let api = ApiBuilder::new().with_progress(false).build().ok()?;
+        let repo_api = api.repo(repo);
+        match repo_api.get("config.json") {
+            Ok(path) => Some(path),
+            Err(e) => {
+                tracing::warn!("Failed to download config.json for '{}': {}", model_id, e);
+                None
+            }
+        }
+    }
+
+    /// Download `encoder_config/config.json` from HuggingFace Hub.
+    fn download_encoder_config(model_id: &str) -> Option<std::path::PathBuf> {
+        use hf_hub::{Repo, RepoType, api::sync::ApiBuilder};
+
+        let repo = Repo::with_revision(model_id.to_string(), RepoType::Model, "main".to_string());
+        let api = ApiBuilder::new().with_progress(false).build().ok()?;
+        let repo_api = api.repo(repo);
+        match repo_api.get("encoder_config/config.json") {
+            Ok(path) => Some(path),
+            Err(e) => {
+                tracing::debug!("No encoder_config/config.json for '{}': {}", model_id, e);
                 None
             }
         }
@@ -767,6 +838,31 @@ impl GLiNER2 {
 
         // Move to device
         let batch = batch.to(self.device.clone(), None)?;
+
+        // GLiNER2.5 boundary path.
+        if model.architecture == crate::config::Architecture::Gliner25 {
+            let boundary = model.boundary.as_ref().ok_or_else(|| {
+                GlinerError::inference(
+                    "GLiNER2.5 model weights not loaded (boundary head missing)",
+                )
+            })?;
+            let token_embs = model.encoder.forward(&batch.input_ids, &batch.attention_mask)?;
+            let mut results = Vec::with_capacity(batch.batch_size());
+            for sample_idx in 0..batch.batch_size() {
+                let states = token_embs.narrow(0, sample_idx, 1)?.squeeze(0)?;
+                let sample_result = crate::inference::boundary::extract_sample(
+                    boundary,
+                    &states,
+                    &batch,
+                    sample_idx,
+                    threshold,
+                    include_confidence,
+                )?;
+                let _ = batch.original_texts.get(sample_idx);
+                results.push(sample_result);
+            }
+            return Ok(results);
+        }
 
         // Run forward pass
         let output = model.forward(&batch)?;
