@@ -37,6 +37,7 @@
 
 pub mod batch;
 pub mod config;
+pub mod constraints;
 pub mod error;
 pub mod inference;
 pub mod model;

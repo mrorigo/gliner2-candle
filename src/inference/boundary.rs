@@ -10,7 +10,7 @@ use serde_json::{json, Value as JsonValue};
 
 use crate::batch::preprocessed::PreprocessedBatch;
 use crate::error::{GlinerError, Result};
-use crate::model::boundary::{BoundaryModel, MASK_LOGIT};
+use crate::model::boundary::{BoundaryModel, RecordDecoder, MASK_LOGIT};
 
 /// One query aligned with a schema field.
 struct QuerySpec {
@@ -179,6 +179,78 @@ pub(crate) fn extract_sample(
                     include_confidence,
                     &mut result,
                 )?;
+            }
+            "records" => {
+                if let (Some(rd), Some(cand_states)) =
+                    (boundary.record_decoder.as_ref(), scored.candidate_states.as_ref())
+                {
+                    let group_specs: Vec<&QuerySpec> =
+                        specs.iter().filter(|s| s.group == group).collect();
+                    if !group_specs.is_empty() {
+                        let field_qids: Vec<usize> =
+                            group_specs.iter().enumerate().map(|(i, _)| i).collect();
+                        let cand_spans: Vec<(usize, usize)> = scored
+                            .starts
+                            .iter()
+                            .zip(&scored.ends)
+                            .map(|(&s, &e)| (s, e))
+                            .collect();
+                        let flat_queries: Vec<Vec<f32>> = {
+                            let rows = query_states
+                                .to_vec2::<f32>()
+                                .map_err(|e| GlinerError::inference(format!("{e}")))?;
+                            rows
+                        };
+                        let c_valid = scored.valid.clone();
+                        let (obj_logits, assign_logits, inst_spans) =
+                            rd.forward_group(
+                                &flat_queries,
+                                cand_states,
+                                &cand_spans,
+                                &c_valid,
+                                &field_qids,
+                            )?;
+                        let decoded = RecordDecoder::decode_group(
+                            &obj_logits,
+                            &assign_logits,
+                            &inst_spans,
+                            &cand_spans,
+                            &c_valid,
+                            &field_qids,
+                            threshold,
+                            0.3,
+                        );
+                        let task_name = batch
+                            .schema_tokens(sample_idx, group)
+                            .and_then(|t| t.get(2).map(|s| s.to_string()))
+                            .unwrap_or_else(|| format!("record_{group}"));
+                        let entries: Vec<JsonValue> = decoded
+                            .iter()
+                            .map(|rec| {
+                                let mut fields_json = serde_json::Map::new();
+                                for (&qid, spans) in &rec.fields {
+                                    if let Some(spec) = group_specs.get(qid) {
+                                        let span_jsons: Vec<JsonValue> = spans
+                                            .iter()
+                                            .map(|&(s, e)| {
+                                                let cs = char_offset(starts_map, s.saturating_sub(1));
+                                                let ce = char_offset(ends_map, (e - 1).min(text_len - 1));
+                                                json!({"text": safe_slice(original_text, cs, ce), "start": cs, "end": ce})
+                                            })
+                                            .collect();
+                                        fields_json.insert(spec.name.clone(), JsonValue::Array(span_jsons));
+                                    }
+                                }
+                                if include_confidence {
+                                    json!({"fields": fields_json, "confidence": rec.score})
+                                } else {
+                                    json!({"fields": fields_json})
+                                }
+                            })
+                            .collect();
+                        result.insert(task_name, JsonValue::Array(entries));
+                    }
+                }
             }
             _ => {}
         }

@@ -639,6 +639,8 @@ impl RelationScorer {
 /// Structured-record decoder (`record_decoder.*` at the root).
 #[derive(Debug)]
 pub struct RecordDecoder {
+    hidden_size: usize,
+    record_dim: usize,
     cand_proj: Linear,
     field_proj: Linear,
     inst_proj: Linear,
@@ -651,26 +653,328 @@ pub struct RecordDecoder {
     object_head: Linear,
 }
 
+/// One decoded record: field query id → selected (start, end) spans.
+#[derive(Debug, Clone)]
+pub struct DecodedRecord {
+    /// field_query_id → list of (start, end) half-open spans.
+    pub fields: std::collections::HashMap<usize, Vec<(usize, usize)>>,
+    /// Per-field scores.
+    pub field_scores: std::collections::HashMap<usize, Vec<f32>>,
+    /// Overall record confidence score.
+    pub score: f32,
+}
+
 impl RecordDecoder {
     /// Number of learned record-instance queries.
     pub const NUM_INSTANCE_QUERIES: usize = 32;
 
     /// Load from `vb` rooted at `record_decoder`.
     pub fn load(vb: VarBuilder, hidden_size: usize, device: &Device) -> Result<Self> {
+        let record_dim = 128;
         Ok(Self {
-            cand_proj: linear(hidden_size, 128, vb.pp("cand_proj"))?,
-            field_proj: linear(hidden_size, 128, vb.pp("field_proj"))?,
-            inst_proj: linear(hidden_size, 128, vb.pp("inst_proj"))?,
-            k_proj: linear(hidden_size, 128, vb.pp("k_proj"))?,
-            q_proj: linear(hidden_size, 128, vb.pp("q_proj"))?,
+            hidden_size,
+            record_dim,
+            cand_proj: linear(hidden_size, record_dim, vb.pp("cand_proj"))?,
+            field_proj: linear(hidden_size, record_dim, vb.pp("field_proj"))?,
+            inst_proj: linear(hidden_size, record_dim, vb.pp("inst_proj"))?,
+            k_proj: linear(hidden_size, record_dim, vb.pp("k_proj"))?,
+            q_proj: linear(hidden_size, record_dim, vb.pp("q_proj"))?,
             v_proj: linear(hidden_size, hidden_size, vb.pp("v_proj"))?,
             instance_embed: vb
                 .get((Self::NUM_INSTANCE_QUERIES, hidden_size), "instance_embed")?
                 .to_device(device)?,
-            null_embed: vb.get((128,), "null_embed")?.to_device(device)?,
+            null_embed: vb.get((record_dim,), "null_embed")?.to_device(device)?,
             latent_seed_head: linear(hidden_size, 1, vb.pp("latent_seed_head"))?,
             object_head: linear(hidden_size, 1, vb.pp("object_head"))?,
         })
+    }
+
+    /// Anchorless-mode forward: learned instance queries cross-attend the
+    /// candidate pool and predict object/no-object plus per-field assignments.
+    ///
+    /// * `query_states` – `(Q, H)` schema query embeddings
+    /// * `candidate_states` – `(C, H)` from `candidate_encoder` in `score_sample`
+    /// * `candidate_spans` – `(C, 2)` start/end indices
+    /// * `candidate_valid` – `(C,)` validity mask
+    /// * `field_query_ids` – which query index each field uses
+    ///
+    /// Returns `(object_logits[C], assign_logits[F][C+1])` where column 0 of
+    /// each assign row is the null/ABSENT alternative.
+    pub fn forward_group(
+        &self,
+        query_states: &[Vec<f32>],
+        candidate_states: &[Vec<f32>],
+        candidate_spans: &[(usize, usize)],
+        candidate_valid: &[bool],
+        field_query_ids: &[usize],
+    ) -> Result<(
+        Vec<f32>,                        // object_logits [I]
+        Vec<Vec<Vec<f32>>>,              // assign_logits [I][F][1+C]
+        Vec<(usize, usize)>,             // instance_spans [I]
+    )> {
+        let h = self.hidden_size;
+        let d = self.record_dim;
+        let c_count = candidate_states.len();
+        let num_instances = Self::NUM_INSTANCE_QUERIES;
+        let sqrt_d = (d as f32).sqrt();
+
+        // Extract weights.
+        let (w_inst, _, _) = mat2(self.inst_proj.weight())?;
+        let b_inst = bias1(self.inst_proj.bias())?;
+        let (w_field, _, _) = mat2(self.field_proj.weight())?;
+        let b_field = bias1(self.field_proj.bias())?;
+        let (w_cand, _, _) = mat2(self.cand_proj.weight())?;
+        let b_cand = bias1(self.cand_proj.bias())?;
+        let (w_q, _, _) = mat2(self.q_proj.weight())?;
+        let b_q = bias1(self.q_proj.bias())?;
+        let (w_k, _, _) = mat2(self.k_proj.weight())?;
+        let b_k = bias1(self.k_proj.bias())?;
+        let (w_v, _, _) = mat2(self.v_proj.weight())?;
+        let b_v = bias1(self.v_proj.bias())?;
+        let (w_obj, _, _) = mat2(self.object_head.weight())?;
+        let b_obj = bias1(self.object_head.bias())?;
+        let null_emb: Vec<f32> = self.null_embed.to_vec1().map_err(|e| GlinerError::inference(format!("{e}")))?;
+
+        // Instance embeddings: [I, H]
+        let inst_flat: Vec<Vec<f32>> = {
+            let raw = self.instance_embed.to_vec2::<f32>().map_err(|e| GlinerError::inference(format!("{e}")))?;
+            raw
+        };
+
+        // Cross-attend instance queries over candidate states.
+        // q = q_proj(inst) [I, D], k = k_proj(cand) [C, D], v = v_proj(cand) [C, H]
+        let inst_q: Vec<Vec<f32>> = inst_flat.iter().map(|x| apply_linear(&w_q, h, &b_q, x)).collect();
+        let cand_k: Vec<Vec<f32>> = candidate_states.iter().map(|x| apply_linear(&w_k, h, &b_k, x)).collect();
+        let cand_v: Vec<Vec<f32>> = candidate_states.iter().map(|x| apply_linear(&w_v, h, &b_v, x)).collect();
+
+        let mask_logit = MASK_LOGIT;
+        let mut inst_states: Vec<Vec<f32>> = Vec::with_capacity(num_instances);
+        for i in 0..num_instances {
+            // attn[i][c] = dot(inst_q[i], cand_k[c]) / sqrt_d
+            let mut attn: Vec<f32> = (0..c_count)
+                .map(|c| {
+                    if candidate_valid[c] {
+                        dot(&inst_q[i], &cand_k[c]) / sqrt_d
+                    } else {
+                        mask_logit
+                    }
+                })
+                .collect();
+            // softmax
+            let max_attn = attn.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let exp_sum: f32 = attn.iter().map(|v| (v - max_attn).exp()).sum();
+            for v in attn.iter_mut() {
+                *v = (*v - max_attn).exp() / exp_sum;
+            }
+            // pooled = sum(attn[c] * cand_v[c])
+            let mut pooled = vec![0.0f32; h];
+            for c in 0..c_count {
+                for k in 0..h {
+                    pooled[k] += attn[c] * cand_v[c][k];
+                }
+            }
+            // instance = inst + pooled
+            let mut state = vec![0.0f32; h];
+            for k in 0..h {
+                state[k] = inst_flat[i][k] + pooled[k];
+            }
+            inst_states.push(state);
+        }
+
+        // Object logits: object_head(inst_states) → [I]
+        let object_logits: Vec<f32> = inst_states
+            .iter()
+            .map(|s| {
+                let mut acc = b_obj[0];
+                for k in 0..h {
+                    acc += w_obj[k] * s[k];
+                }
+                acc
+            })
+            .collect();
+
+        // Instance spans: use the candidate with highest object logit that is
+        // a valid candidate. For anchorless mode, instances don't directly
+        // correspond to pool candidates, so we assign spans via the latent
+        // seed head scored against candidate states.
+        let (w_lat, _, _) = mat2(self.latent_seed_head.weight())?;
+        let b_lat = bias1(self.latent_seed_head.bias())?;
+        let cand_scores_for_inst: Vec<Vec<f32>> = candidate_states
+            .iter()
+            .map(|cs| {
+                let mut acc = b_lat[0];
+                for k in 0..h {
+                    acc += w_lat[k] * cs[k];
+                }
+                vec![acc]
+            })
+            .collect();
+        // For each instance, pick the best valid candidate as its "anchor span".
+        let instance_spans: Vec<(usize, usize)> = inst_states
+            .iter()
+            .map(|_| {
+                // Find the valid candidate with highest latent_seed score.
+                let mut best_c = 0;
+                let mut best_s = f32::NEG_INFINITY;
+                for c in 0..c_count {
+                    if candidate_valid[c] && cand_scores_for_inst[c][0] > best_s {
+                        best_s = cand_scores_for_inst[c][0];
+                        best_c = c;
+                    }
+                }
+                candidate_spans.get(best_c).copied().unwrap_or((0, 0))
+            })
+            .collect();
+
+        // Per-field assignment logits: [I][F][1+C]
+        let field_q_embs: Vec<Vec<f32>> = field_query_ids
+            .iter()
+            .map(|&qid| {
+                if qid < query_states.len() {
+                    query_states[qid].clone()
+                } else {
+                    vec![0.0f32; h]
+                }
+            })
+            .collect();
+        let field_q_proj: Vec<Vec<f32>> = field_q_embs
+            .iter()
+            .map(|x| apply_linear(&w_field, h, &b_field, x))
+            .collect();
+
+        let mut assign_logits: Vec<Vec<Vec<f32>>> = Vec::with_capacity(num_instances);
+        for i in 0..num_instances {
+            let inst_q_proj = apply_linear(&w_inst, h, &b_inst, &inst_states[i]);
+            let mut field_logits = Vec::with_capacity(field_query_ids.len());
+            for f in 0..field_query_ids.len() {
+                // query = inst_proj(inst) + field_proj(field) → [D]
+                let mut query = vec![0.0f32; d];
+                for k in 0..d {
+                    query[k] = inst_q_proj[k] + field_q_proj[f][k];
+                }
+                // null column: dot(query, null_embed)
+                let null_col = dot(&query, &null_emb);
+                // candidate columns: dot(query, cand_proj(cand[c])) for each c
+                let mut row = Vec::with_capacity(1 + c_count);
+                row.push(null_col);
+                for c in 0..c_count {
+                    let cand_p = apply_linear(&w_cand, d, &b_cand, &candidate_states[c]);
+                    let sc = if candidate_valid[c] {
+                        dot(&query, &cand_p)
+                    } else {
+                        mask_logit
+                    };
+                    row.push(sc);
+                }
+                field_logits.push(row);
+            }
+            assign_logits.push(field_logits);
+        }
+
+        Ok((object_logits, assign_logits, instance_spans))
+    }
+
+    /// Decode one record group into a list of `DecodedRecord`.
+    ///
+    /// Uses the anchorless mode: sigmoid(object_logits) → object probability,
+    /// then per-field softmax/sigmoid → field assignment.
+    pub fn decode_group(
+        object_logits: &[f32],
+        assign_logits: &[Vec<Vec<f32>>],
+        instance_spans: &[(usize, usize)],
+        candidate_spans: &[(usize, usize)],
+        candidate_valid: &[bool],
+        field_query_ids: &[usize],
+        object_threshold: f32,
+        field_threshold: f32,
+    ) -> Vec<DecodedRecord> {
+        let num_instances = object_logits.len();
+        let num_fields = field_query_ids.len();
+        if num_instances == 0 || num_fields == 0 {
+            return Vec::new();
+        }
+
+        // Select instances by object probability.
+        let obj_prob: Vec<f32> = object_logits.iter().map(|&x| sigmoid_f32(x)).collect();
+        let mut order: Vec<usize> = (0..num_instances).collect();
+        order.sort_by(|&a, &b| obj_prob[b].partial_cmp(&obj_prob[a]).unwrap_or(std::cmp::Ordering::Equal).then(a.cmp(&b)));
+        let selected: Vec<usize> = order
+            .into_iter()
+            .filter(|&i| obj_prob[i] >= object_threshold)
+            .collect();
+
+        let mut records = Vec::new();
+        for &inst in &selected {
+            let mut rec = DecodedRecord {
+                fields: std::collections::HashMap::new(),
+                field_scores: std::collections::HashMap::new(),
+                score: obj_prob[inst],
+            };
+
+            for f in 0..num_fields {
+                let qid = field_query_ids[f];
+                let logits = &assign_logits[inst][f];
+                let c_count = logits.len() - 1;
+                if c_count == 0 {
+                    continue;
+                }
+
+                // softmax over [null, cand1, ..., candC]
+                let max_logit = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let exp_sum: f32 = logits.iter().map(|v| (v - max_logit).exp()).sum();
+                let probs: Vec<f32> = logits.iter().map(|v| (v - max_logit).exp() / exp_sum).collect();
+
+                // Pick the highest-probability column.
+                let best_col = probs
+                    .iter()
+                    .enumerate()
+                    .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+                    .map(|(idx, _)| idx)
+                    .unwrap_or(0);
+
+                if best_col == 0 {
+                    // Null selected; field is absent.
+                    continue;
+                }
+                let cand_idx = best_col - 1;
+                if !candidate_valid.get(cand_idx).copied().unwrap_or(false) {
+                    continue;
+                }
+                if probs[best_col] < field_threshold {
+                    continue;
+                }
+                let span = candidate_spans[cand_idx];
+                rec.fields.entry(qid).or_default().push(span);
+                rec.field_scores.entry(qid).or_default().push(probs[best_col]);
+            }
+
+            if !rec.fields.is_empty() {
+                records.push(rec);
+            }
+        }
+
+        // Deduplicate anchorless records by field assignments.
+        let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        let mut deduped: Vec<DecodedRecord> = Vec::new();
+        for rec in records {
+            let key: Vec<(usize, Vec<(usize, usize)>)> = {
+                let mut k: Vec<_> = rec.fields.iter().map(|(&qid, spans)| (qid, spans.clone())).collect();
+                k.sort_by_key(|x| x.0);
+                k
+            };
+            let key_val = format!("{key:?}");
+            if let Some(existing) = seen.get(&key_val) {
+                if rec.score > deduped[*existing].score {
+                    deduped[*existing] = rec;
+                }
+            } else {
+                let idx = deduped.len();
+                seen.insert(key_val, idx);
+                deduped.push(rec);
+            }
+        }
+
+        deduped
     }
 }
 
@@ -1125,11 +1429,34 @@ impl BoundaryModel {
             }
         }
 
+        // --- Candidate states for record decoder ----------------------------
+        let cand_states = if let Some(ref ce) = self.candidate_encoder {
+            let (w_ce, _, _) = mat2(ce.weight())?;
+            let b_ce = bias1(ce.bias())?;
+            let input_dim = 2 * d;
+            Some(
+                (0..c_count)
+                    .map(|i| {
+                        if !sel_valid[i] {
+                            return vec![0.0f32; h];
+                        }
+                        let mut inp = Vec::with_capacity(input_dim);
+                        inp.extend_from_slice(&bs_rows[sel_s[i]]);
+                        inp.extend_from_slice(&bs_rows[sel_e[i]]);
+                        apply_linear(&w_ce, input_dim, &b_ce, &inp)
+                    })
+                    .collect(),
+            )
+        } else {
+            None
+        };
+
         Ok(SharedPoolScores {
             starts: sel_s,
             ends: sel_e,
             valid: sel_valid,
             scores,
+            candidate_states: cand_states,
         })
     }
 }
@@ -1145,9 +1472,16 @@ pub struct SharedPoolScores {
     pub valid: Vec<bool>,
     /// Row-major `[C][Q]` reranked logits.
     pub scores: Vec<Vec<f32>>,
+    /// H-dimensional candidate states `[C][H]` (from `candidate_encoder`).
+    /// `None` when the model lacks a `candidate_encoder` (no record decoder).
+    pub candidate_states: Option<Vec<Vec<f32>>>,
 }
 
 const SQRT_2_OVER_PI: f32 = 0.797_884_6;
+
+fn sigmoid_f32(x: f32) -> f32 {
+    1.0 / (1.0 + (-x).exp())
+}
 
 fn layernorm(x: &[f32], weight: &[f32], bias: &[f32]) -> Result<Vec<f32>> {
     let mean = x.iter().sum::<f32>() / x.len() as f32;
@@ -1209,4 +1543,364 @@ fn dedup_pool(
     let ends = keep_order.iter().map(|&i| keys[i].1).collect();
     let kept_valid = vec![true; keep_order.len()];
     (starts, ends, kept_valid)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle_core::Device;
+
+    fn cpu() -> Device { Device::Cpu }
+
+    // ── mat2 ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn mat2_2d() {
+        let t = Tensor::new(&[[1.0f32, 2.0], [3.0, 4.0], [5.0, 6.0]], &cpu()).unwrap();
+        let (v, rows, cols) = mat2(&t).unwrap();
+        assert_eq!(rows, 3);
+        assert_eq!(cols, 2);
+        assert_eq!(v, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+    }
+
+    #[test]
+    fn mat2_1d() {
+        let t = Tensor::new(&[10.0f32, 20.0, 30.0], &cpu()).unwrap();
+        let (v, rows, cols) = mat2(&t).unwrap();
+        assert_eq!(rows, 3);
+        assert_eq!(cols, 1);
+        assert_eq!(v, vec![10.0, 20.0, 30.0]);
+    }
+
+    // ── apply_linear ────────────────────────────────────────────────────
+
+    #[test]
+    fn apply_linear_identity() {
+        // y = I·x + 0
+        let w = vec![1.0, 0.0, 0.0, 1.0]; // 2×2 identity, row-major
+        let b = vec![0.0, 0.0];
+        let x = vec![3.0, 4.0];
+        let y = apply_linear(&w, 2, &b, &x);
+        assert_eq!(y.len(), 2);
+        assert!((y[0] - 3.0).abs() < 1e-6);
+        assert!((y[1] - 4.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn apply_linear_with_bias() {
+        // w = [[1, 2], [3, 4]], b = [10, 20], x = [1, 1]
+        let w = vec![1.0, 2.0, 3.0, 4.0];
+        let b = vec![10.0, 20.0];
+        let x = vec![1.0, 1.0];
+        let y = apply_linear(&w, 2, &b, &x);
+        assert!((y[0] - 13.0).abs() < 1e-6); // 1*1+2*1+10
+        assert!((y[1] - 27.0).abs() < 1e-6); // 3*1+4*1+20
+    }
+
+    #[test]
+    fn apply_linear_projection() {
+        // 3×2 weight: maps 2-dim input to 3-dim output
+        let w = vec![1.0, 0.0, 0.0, 1.0, 1.0, 1.0];
+        let b = vec![0.0, 0.0, 5.0];
+        let x = vec![2.0, 3.0];
+        let y = apply_linear(&w, 2, &b, &x);
+        assert_eq!(y.len(), 3);
+        assert!((y[0] - 2.0).abs() < 1e-6);
+        assert!((y[1] - 3.0).abs() < 1e-6);
+        assert!((y[2] - 10.0).abs() < 1e-6); // 2+3+5
+    }
+
+    // ── dot ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn dot_basic() {
+        assert!((dot(&[1.0, 2.0, 3.0], &[4.0, 5.0, 6.0]) - 32.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn dot_zero() {
+        assert!((dot(&[1.0, 2.0], &[0.0, 0.0])).abs() < 1e-6);
+    }
+
+    #[test]
+    fn dot_single() {
+        assert!((dot(&[7.0], &[3.0]) - 21.0).abs() < 1e-6);
+    }
+
+    // ── argsort_desc_stable ──────────────────────────────────────────────
+
+    #[test]
+    fn argsort_desc_stable_basic() {
+        let vals = [1.0, 3.0, 2.0, 3.0];
+        let idx = argsort_desc_stable(&vals);
+        // 3.0 at index 1 comes before 3.0 at index 3 (stable by index)
+        assert_eq!(idx[0], 1);
+        assert_eq!(idx[1], 3);
+        assert_eq!(idx[2], 2);
+        assert_eq!(idx[3], 0);
+    }
+
+    #[test]
+    fn argsort_desc_stable_empty() {
+        let idx = argsort_desc_stable(&[]);
+        assert!(idx.is_empty());
+    }
+
+    #[test]
+    fn argsort_desc_stable_single() {
+        let idx = argsort_desc_stable(&[42.0]);
+        assert_eq!(idx, vec![0]);
+    }
+
+    // ── bias1 ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn bias1_some() {
+        let t = Tensor::new(&[1.0f32, 2.0, 3.0], &cpu()).unwrap();
+        let b = bias1(Some(&t)).unwrap();
+        assert_eq!(b, vec![1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn bias1_none() {
+        let b = bias1(None).unwrap();
+        assert!(b.is_empty());
+    }
+
+    // ── ln_params ────────────────────────────────────────────────────────
+
+    #[test]
+    fn ln_params_with_bias() {
+        let w = Tensor::new(&[1.0f32, 2.0], &cpu()).unwrap();
+        let b = Tensor::new(&[0.5f32, 0.6], &cpu()).unwrap();
+        let mut hm = std::collections::HashMap::new();
+        hm.insert("weight".to_string(), w.clone());
+        hm.insert("bias".to_string(), b.clone());
+        let vb = candle_nn::VarBuilder::from_tensors(hm, candle_core::DType::F32, &cpu());
+        let ln = candle_nn::layer_norm(2, 1e-5, vb).unwrap();
+        let (weights, biases) = ln_params(&ln).unwrap();
+        assert_eq!(weights.len(), 2);
+        assert!((weights[0] - 1.0).abs() < 1e-6);
+        assert!((weights[1] - 2.0).abs() < 1e-6);
+        assert_eq!(biases.len(), 2);
+        assert!((biases[0] - 0.5).abs() < 1e-6);
+        assert!((biases[1] - 0.6).abs() < 1e-6);
+    }
+
+    // ── dedup_pool ───────────────────────────────────────────────────────
+
+    #[test]
+    fn dedup_pool_no_duplicates() {
+        let keys = vec![(0, 2), (1, 3), (2, 4)];
+        let scores = vec![3.0, 1.0, 2.0];
+        let valid = vec![true, true, true];
+        let (s, e, v) = dedup_pool(&keys, &scores, &valid, 10, 5);
+        assert_eq!(s.len(), 3);
+        assert!(v.iter().all(|&x| x));
+        // Sorted by score desc: (0,2)=3.0, (2,4)=2.0, (1,3)=1.0
+        assert_eq!(s, vec![0, 2, 1]);
+        assert_eq!(e, vec![2, 4, 3]);
+    }
+
+    #[test]
+    fn dedup_pool_with_duplicates() {
+        // Same key (1,2) appears twice; only the higher-scored one kept
+        let keys = vec![(1, 2), (1, 2), (3, 4)];
+        let scores = vec![5.0, 8.0, 1.0];
+        let valid = vec![true, true, true];
+        let (s, e, _) = dedup_pool(&keys, &scores, &valid, 10, 5);
+        assert_eq!(s.len(), 2); // two unique keys
+        // Higher score for (1,2) was 8.0, so order: (1,2)=8.0, (3,4)=1.0
+        assert_eq!(s[0], 1);
+        assert_eq!(e[0], 2);
+        assert_eq!(s[1], 3);
+        assert_eq!(e[1], 4);
+    }
+
+    #[test]
+    fn dedup_pool_invalid_entries() {
+        let keys = vec![(0, 2), (1, 3)];
+        let scores = vec![5.0, 3.0];
+        let valid = vec![false, true]; // first is invalid
+        let (s, e, v) = dedup_pool(&keys, &scores, &valid, 10, 5);
+        assert_eq!(s.len(), 1);
+        assert_eq!(s[0], 1);
+        assert_eq!(e[0], 3);
+        assert!(v[0]);
+    }
+
+    #[test]
+    fn dedup_pool_truncation() {
+        let keys: Vec<(usize, usize)> = (0..20).map(|i| (i, i + 1)).collect();
+        let scores: Vec<f32> = (0..20).map(|i| i as f32).collect();
+        let valid = vec![true; 20];
+        let (s, _, _) = dedup_pool(&keys, &scores, &valid, 5, 25);
+        assert_eq!(s.len(), 5);
+    }
+
+    // ── BoundaryConfig ──────────────────────────────────────────────────
+
+    #[test]
+    fn boundary_config_defaults() {
+        let cfg = BoundaryConfig::default();
+        assert_eq!(cfg.boundary_dim, 128);
+        assert_eq!(cfg.content_dim, 64);
+        assert_eq!(cfg.pair_dim, 128);
+        assert_eq!(cfg.pool_size, 192);
+        assert!(cfg.enable_relations);
+        assert!(cfg.enable_records);
+    }
+
+    #[test]
+    fn boundary_config_from_hf_json() {
+        let json = r#"{
+            "boundary_head": {
+                "boundary_dim": 256,
+                "content_dim": 128,
+                "enable_relations": false,
+                "pool_size": 64
+            }
+        }"#;
+        let cfg = BoundaryConfig::from_hf_config_json(json);
+        assert_eq!(cfg.boundary_dim, 256);
+        assert_eq!(cfg.content_dim, 128);
+        assert_eq!(cfg.pool_size, 64);
+        assert!(!cfg.enable_relations);
+        // Unspecified fields keep defaults
+        assert_eq!(cfg.pair_dim, 128);
+        assert!(cfg.enable_records);
+    }
+
+    #[test]
+    fn boundary_config_from_empty_json() {
+        let cfg = BoundaryConfig::from_hf_config_json("{}");
+        let def = BoundaryConfig::default();
+        assert_eq!(cfg.boundary_dim, def.boundary_dim);
+        assert_eq!(cfg.pool_size, def.pool_size);
+    }
+
+    // ── BoundaryEncoder shape test (random weights) ─────────────────────
+
+    #[test]
+    fn encoder_forward_shapes() {
+        let device = cpu();
+        let hidden = 16;
+        let bd = 8;
+        let text_len = 5;
+        let n = text_len + 1; // boundaries
+
+        let text = Tensor::randn(0f32, 1.0, (1, text_len, hidden), &device).unwrap();
+        assert_eq!(text.dims(), &[1, text_len, hidden]);
+        let bs_dummy = Tensor::randn(0f32, 1.0, (1, n, bd), &device).unwrap();
+        assert_eq!(bs_dummy.dims(), &[1, n, bd]);
+    }
+
+    // ── score_sample math verification ──────────────────────────────────
+
+    #[test]
+    fn inside_prefix_sum_basic() {
+        // Verify the prefix sum logic used inside score_sample
+        let logits = vec![1.0f32, 2.0, 3.0];
+        let mean = 2.0f32;
+        let n = 4; // 3 tokens + 1 boundary
+        let l = 3;
+        let mut prefix = vec![0.0f32; n + 1];
+        let mut acc = 0.0f32;
+        for i in 0..=n {
+            prefix[i] = acc;
+            if i < l {
+                acc += logits[i] - mean;
+            }
+        }
+        // prefix[0]=0, prefix[1]=1-2=-1, prefix[2]=-1+2-2=-1, prefix[3]=-1+3-2=0
+        assert!((prefix[0]).abs() < 1e-6);
+        assert!((prefix[1] - (-1.0)).abs() < 1e-6);
+        assert!((prefix[2] - (-1.0)).abs() < 1e-6);
+        assert!((prefix[3]).abs() < 1e-6);
+    }
+
+    #[test]
+    fn sigmoid_of_negative_scores() {
+        // Verify sigmoid produces values below typical thresholds for negative scores
+        let sigmoid = |x: f32| 1.0 / (1.0 + (-x).exp());
+        assert!(sigmoid(-1.52) < 0.3);
+        assert!(sigmoid(-1.52) > 0.1);
+        assert!(sigmoid(0.0) == 0.5);
+        assert!(sigmoid(2.0) > 0.8);
+    }
+
+    // ── RecordDecoder decode_group ─────────────────────────────────────
+
+    #[test]
+    fn decode_group_no_instances() {
+        let records = RecordDecoder::decode_group(&[], &[], &[], &[], &[], &[], 0.5, 0.5);
+        assert!(records.is_empty());
+    }
+
+    #[test]
+    fn decode_group_selects_above_threshold() {
+        // 2 instances, 1 field, 2 candidates
+        let object_logits = vec![-2.0, 3.0]; // sigmoid: ~0.12, ~0.95
+        let assign_logits = vec![
+            vec![vec![-1.0, 0.5, 1.0]],  // instance 0: null=0.27, c0=0.37, c1=0.37
+            vec![vec![-3.0, 2.0, 5.0]],  // instance 1: null=0.01, c0=0.05, c1=0.94
+        ];
+        let instance_spans = vec![(0, 3), (1, 5)];
+        let candidate_spans = vec![(0, 3), (1, 5)];
+        let candidate_valid = vec![true, true];
+        let field_query_ids = vec![0];
+
+        let records = RecordDecoder::decode_group(
+            &object_logits, &assign_logits, &instance_spans,
+            &candidate_spans, &candidate_valid, &field_query_ids,
+            0.5, 0.3,
+        );
+        // Only instance 1 (score ~0.95) should be selected.
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].score, sigmoid_f32(3.0));
+        // Instance 1 picks candidate 1 (highest assign logit).
+        assert_eq!(records[0].fields.get(&0), Some(&vec![(1, 5)]));
+    }
+
+    #[test]
+    fn decode_group_null_field_skipped() {
+        // Instance with high object score but field prefers null.
+        let object_logits = vec![5.0];
+        let assign_logits = vec![
+            vec![vec![5.0, -1.0, -2.0]], // null=0.94, c0=0.01, c1=0.005
+        ];
+        let instance_spans = vec![(0, 3)];
+        let candidate_spans = vec![(0, 3), (3, 6)];
+        let candidate_valid = vec![true, true];
+        let field_query_ids = vec![0];
+
+        let records = RecordDecoder::decode_group(
+            &object_logits, &assign_logits, &instance_spans,
+            &candidate_spans, &candidate_valid, &field_query_ids,
+            0.3, 0.3,
+        );
+        // Instance selected (score ~0.99), but field has no assignment (null chosen).
+        assert!(records.is_empty());
+    }
+
+    #[test]
+    fn decode_group_dedup() {
+        // Two identical instances → should dedup to one record.
+        let object_logits = vec![3.0, 3.0];
+        let assign_logits = vec![
+            vec![vec![-2.0, 5.0]],  // null=0.01, c0=0.99
+            vec![vec![-2.0, 5.0]],  // same
+        ];
+        let instance_spans = vec![(0, 3), (0, 3)];
+        let candidate_spans = vec![(0, 3)];
+        let candidate_valid = vec![true];
+        let field_query_ids = vec![0];
+
+        let records = RecordDecoder::decode_group(
+            &object_logits, &assign_logits, &instance_spans,
+            &candidate_spans, &candidate_valid, &field_query_ids,
+            0.3, 0.3,
+        );
+        assert_eq!(records.len(), 1);
+    }
 }
