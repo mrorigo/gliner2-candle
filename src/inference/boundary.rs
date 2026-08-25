@@ -18,18 +18,33 @@ struct QuerySpec {
     group: usize,
     /// Field name (entity type or classification label).
     name: String,
-    /// Sequence position of this field's `[E]`/`[L]` marker token.
+    /// Sequence position of this field's `[E]`/`[L]`/`[R]` marker token.
     marker_pos: usize,
 }
 
-/// Build query specs by walking each schema's token list in lockstep with its
-/// special-token position indices.
+/// Metadata for a single relation type within a schema group.
+struct RelationSpec {
+    /// Schema group index.
+    group: usize,
+    /// Human-readable relation type name.
+    relation_name: String,
+    /// Query index of the head entity role.
+    head_qid: usize,
+    /// Query index of the tail entity role.
+    tail_qid: usize,
+}
+
+/// Build query specs and relation metadata by walking each schema's token list.
 ///
 /// Entity groups contribute one query per `[E]` marker; classification groups
-/// one per `[L]` label. Other task types are skipped (relations/records come
-/// in PLAN_2.5 Phase 3).
-fn build_queries(batch: &PreprocessedBatch, sample_idx: usize) -> Result<Vec<QuerySpec>> {
+/// one per `[L]` label; relation groups one per `[R]` marker. Relation groups
+/// also produce [`RelationSpec`] entries linking head/tail role query indices.
+fn build_queries(
+    batch: &PreprocessedBatch,
+    sample_idx: usize,
+) -> Result<(Vec<QuerySpec>, Vec<RelationSpec>)> {
     let mut specs = Vec::new();
+    let mut relations = Vec::new();
     let num = batch.num_schemas(sample_idx).unwrap_or(0);
     for g in 0..num {
         let tokens = batch
@@ -39,7 +54,8 @@ fn build_queries(batch: &PreprocessedBatch, sample_idx: usize) -> Result<Vec<Que
             .schema_special_indices_for(sample_idx, g)
             .ok_or_else(|| GlinerError::inference("missing schema special indices"))?;
         let mut sp = 0usize;
-        let mut pending: Option<(String, usize)> = None; // (marker kind, position)
+        let mut pending: Option<(String, usize)> = None;
+        let first_role_qid = specs.len();
         for token in tokens {
             if token.starts_with('[') && token.ends_with(']') {
                 let pos = *specials.get(sp).ok_or_else(|| {
@@ -47,7 +63,7 @@ fn build_queries(batch: &PreprocessedBatch, sample_idx: usize) -> Result<Vec<Que
                 })?;
                 sp += 1;
                 pending = match token.as_str() {
-                    "[E]" | "[L]" => Some((token.clone(), pos)),
+                    "[E]" | "[L]" | "[R]" => Some((token.clone(), pos)),
                     _ => None,
                 };
                 continue;
@@ -61,8 +77,25 @@ fn build_queries(batch: &PreprocessedBatch, sample_idx: usize) -> Result<Vec<Que
                 let _ = marker;
             }
         }
+        // If this group has relation roles ([R] markers), pair them up.
+        let role_specs: Vec<&QuerySpec> = specs[first_role_qid..]
+            .iter()
+            .filter(|s| s.group == g)
+            .collect();
+        if role_specs.len() >= 2 {
+            let relation_name = tokens
+                .get(2)
+                .cloned()
+                .unwrap_or_else(|| format!("relation_{g}"));
+            relations.push(RelationSpec {
+                group: g,
+                relation_name,
+                head_qid: first_role_qid,
+                tail_qid: first_role_qid + 1,
+            });
+        }
     }
-    Ok(specs)
+    Ok((specs, relations))
 }
 
 /// Boundary-path extraction for a single collated sample.
@@ -94,7 +127,7 @@ pub(crate) fn extract_sample(
         .map_err(|e| GlinerError::inference(format!("{e}")))?;
 
     // --- Query states -------------------------------------------------------
-    let specs = build_queries(batch, sample_idx)?;
+    let (specs, relation_specs) = build_queries(batch, sample_idx)?;
     let q = specs.len();
     let mut flat_queries = Vec::with_capacity(q * h);
     if q > 0 {
@@ -249,6 +282,122 @@ pub(crate) fn extract_sample(
                             })
                             .collect();
                         result.insert(task_name, JsonValue::Array(entries));
+                    }
+                }
+            }
+            "relations" => {
+                if let Some(rs) = boundary.relation_scorer.as_ref() {
+                    if let Some(bs) = scored.boundary_states.as_ref() {
+                        // Find the relation spec for this group.
+                        if let Some(rel) = relation_specs.iter().find(|r| r.group == group) {
+                            let head_qid = rel.head_qid;
+                            let tail_qid = rel.tail_qid;
+                            if head_qid < q && tail_qid < q {
+                                // Build relation query state (directional concat).
+                                let qr: Vec<f32> = {
+                                    let rows = query_states
+                                        .to_vec2::<f32>()
+                                        .map_err(|e| GlinerError::inference(format!("{e}")))?;
+                                    let mut r = Vec::with_capacity(2 * h);
+                                    r.extend_from_slice(&rows[head_qid]);
+                                    r.extend_from_slice(&rows[tail_qid]);
+                                    r
+                                };
+                                // Collect head/tail candidates by their per-query scores.
+                                let mut head_cands: Vec<(usize, f32)> = Vec::new();
+                                let mut tail_cands: Vec<(usize, f32)> = Vec::new();
+                                for ci in 0..scored.valid.len() {
+                                    if !scored.valid[ci] {
+                                        continue;
+                                    }
+                                    let s_h = sigmoid(scored.scores[ci][head_qid]);
+                                    let s_t = sigmoid(scored.scores[ci][tail_qid]);
+                                    if s_h >= threshold {
+                                        head_cands.push((ci, s_h));
+                                    }
+                                    if s_t >= threshold {
+                                        tail_cands.push((ci, s_t));
+                                    }
+                                }
+                                // Sort descending by score, take top-K.
+                                head_cands.sort_by(|a, b| {
+                                    b.1.partial_cmp(&a.1)
+                                        .unwrap_or(std::cmp::Ordering::Equal)
+                                });
+                                tail_cands.sort_by(|a, b| {
+                                    b.1.partial_cmp(&a.1)
+                                        .unwrap_or(std::cmp::Ordering::Equal)
+                                });
+                                let max_pairs_per_type = 32;
+                                head_cands.truncate(max_pairs_per_type);
+                                tail_cands.truncate(max_pairs_per_type);
+
+                                // Generate all head×tail pairs, skip self-loops.
+                                let mut pair_heads: Vec<(usize, usize)> = Vec::new();
+                                let mut pair_tails: Vec<(usize, usize)> = Vec::new();
+                                for &(hi, _) in &head_cands {
+                                    for &(ti, _) in &tail_cands {
+                                        let hs = (scored.starts[hi], scored.ends[hi]);
+                                        let ts = (scored.starts[ti], scored.ends[ti]);
+                                        if hs == ts {
+                                            continue; // no self-loops
+                                        }
+                                        pair_heads.push(hs);
+                                        pair_tails.push(ts);
+                                    }
+                                }
+                                if !pair_heads.is_empty() {
+                                    let pair_scores = rs.forward(
+                                        bs,
+                                        &qr,
+                                        &pair_heads,
+                                        &pair_tails,
+                                        text_len,
+                                    )?;
+                                    // Decode pairs above threshold.
+                                    let mut entries: Vec<JsonValue> = Vec::new();
+                                    for (idx, &score) in pair_scores.iter().enumerate() {
+                                        let prob = sigmoid(score);
+                                        if prob < threshold {
+                                            continue;
+                                        }
+                                        let (hs, he) = pair_heads[idx];
+                                        let (ts, te) = pair_tails[idx];
+                                        let cs_h = char_offset(starts_map, hs.saturating_sub(1));
+                                        let ce_h = char_offset(
+                                            ends_map,
+                                            (he - 1).min(text_len - 1),
+                                        );
+                                        let cs_t = char_offset(starts_map, ts.saturating_sub(1));
+                                        let ce_t = char_offset(
+                                            ends_map,
+                                            (te - 1).min(text_len - 1),
+                                        );
+                                        let mut obj = json!({
+                                            "head": {
+                                                "text": safe_slice(original_text, cs_h, ce_h),
+                                                "start": cs_h,
+                                                "end": ce_h,
+                                            },
+                                            "tail": {
+                                                "text": safe_slice(original_text, cs_t, ce_t),
+                                                "start": cs_t,
+                                                "end": ce_t,
+                                            },
+                                        });
+                                        if include_confidence {
+                                            obj.as_object_mut().unwrap().insert(
+                                                "confidence".into(),
+                                                json!(prob),
+                                            );
+                                        }
+                                        entries.push(obj);
+                                    }
+                                    let task_name = rel.relation_name.clone();
+                                    result.insert(task_name, JsonValue::Array(entries));
+                                }
+                            }
+                        }
                     }
                 }
             }

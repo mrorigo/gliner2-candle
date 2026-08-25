@@ -33,7 +33,7 @@
 //! Forward-pass decoding lives in `crate::inference`; this module owns the
 //! parameter structures and weight loading.
 
-use candle_core::{Device, Tensor};
+use candle_core::{Device, DType, Tensor};
 use candle_nn::{layer_norm, linear, Linear, Module, VarBuilder};
 
 use crate::config::{Architecture, BoundaryConfig, ExtractorConfig};
@@ -633,6 +633,130 @@ impl RelationScorer {
             // content_linear input: head/tail projected concat
             content_linear: linear(4 * hidden_size, 1, vb.pp("content_linear"))?,
         })
+    }
+
+    /// Score relation pairs from boundary endpoint states.
+    ///
+    /// Pure-Rust forward pass mirroring `SparseRelationScorer.forward()`.
+    ///
+    /// * `boundary_states` – `[L+1][d]` from `BoundaryEncoder`
+    /// * `relation_query` – `[2*hidden]` directional relation query state
+    /// * `head_spans`, `tail_spans` – half-open `(start, end)` per pair
+    /// * `text_len` – valid sequence length for distance normalisation
+    ///
+    /// Returns one logit per pair.
+    pub fn forward(
+        &self,
+        boundary_states: &[Vec<f32>],
+        relation_query: &[f32],
+        head_spans: &[(usize, usize)],
+        tail_spans: &[(usize, usize)],
+        text_len: usize,
+    ) -> Result<Vec<f32>> {
+        let h = self.head_content_projection.weight().dims()[0]; // hidden_size
+        let n_pairs = head_spans.len();
+        if n_pairs == 0 {
+            return Ok(Vec::new());
+        }
+        let d = boundary_states[0].len(); // boundary_dim
+        let seq_len = boundary_states.len(); // L+1
+
+        // Weight extraction
+        let (w_hcp, _, _) = mat2(&self.head_content_projection.weight())?;
+        let b_hcp = bias1(self.head_content_projection.bias())?;
+        let (w_tcp, _, _) = mat2(&self.tail_content_projection.weight())?;
+        let b_tcp = bias1(self.tail_content_projection.bias())?;
+        let (w_rcg, _, rcg_in) = mat2(&self.relation_content_gate.weight())?;
+        let b_rcg = bias1(self.relation_content_gate.bias())?;
+        let (w_mlp0, _, mlp0_in) = mat2(&self.mlp_hidden.weight())?;
+        let b_mlp0 = bias1(self.mlp_hidden.bias())?;
+        let (w_mlp3, _, _) = mat2(&self.mlp_out.weight())?;
+        let b_mlp3 = bias1(self.mlp_out.bias())?;
+        let (w_cl, _, cl_in) = mat2(&self.content_linear.weight())?;
+        let b_cl = bias1(self.content_linear.bias())?;
+
+        let gather = |pos: usize| -> Vec<f32> {
+            let safe = pos.min(seq_len - 1);
+            boundary_states[safe].clone()
+        };
+
+        let mut scores = Vec::with_capacity(n_pairs);
+        for i in 0..n_pairs {
+            let (hs, he) = head_spans[i];
+            let (ts, te) = tail_spans[i];
+
+            let h_start_st = gather(hs);
+            let h_end_st = gather(he.saturating_sub(1).min(seq_len - 1));
+            let t_start_st = gather(ts);
+            let t_end_st = gather(te.saturating_sub(1).min(seq_len - 1));
+
+            // Positional features
+            let delta = (ts as f32) - (hs as f32);
+            let order = delta.signum();
+            let dist = delta.abs() / (text_len.max(1) as f32);
+
+            // MLP features: [h_start, h_end, t_start, t_end, rel, order, dist]
+            let mut feats = Vec::with_capacity(6 * h + 2);
+            feats.extend_from_slice(&h_start_st);
+            feats.extend_from_slice(&h_end_st);
+            feats.extend_from_slice(&t_start_st);
+            feats.extend_from_slice(&t_end_st);
+            feats.extend_from_slice(relation_query);
+            feats.push(order);
+            feats.push(dist);
+
+            let mlp_hidden = apply_linear(&w_mlp0, mlp0_in, &b_mlp0, &feats);
+            let mlp_hidden_gelu: Vec<f32> = mlp_hidden.iter().map(|v| gelu_f32(*v)).collect();
+            let mut score = apply_linear(&w_mlp3, h, &b_mlp3, &mlp_hidden_gelu)[0];
+
+            // Biaffine content path
+            // Pool span as mean of boundary states in [start, end)
+            let pool = |start: usize, end: usize| -> Vec<f32> {
+                let s = start.min(seq_len - 1);
+                let e = end.min(seq_len);
+                let width = (e - s).max(1);
+                let mut result = vec![0.0f32; d];
+                for pos in s..e {
+                    for j in 0..d {
+                        result[j] += boundary_states[pos][j];
+                    }
+                }
+                for v in &mut result {
+                    *v /= width as f32;
+                }
+                result
+            };
+
+            let head_content_raw = pool(hs, he.max(hs + 1));
+            let head_content = apply_linear(&w_hcp, h, &b_hcp, &head_content_raw);
+            let tail_content_raw = pool(ts, te.max(ts + 1));
+            let tail_content = apply_linear(&w_tcp, h, &b_tcp, &tail_content_raw);
+
+            // gate = sigmoid(relation_content_gate(rel))
+            let gate_raw = apply_linear(&w_rcg, rcg_in, &b_rcg, relation_query);
+            let gate: Vec<f32> = gate_raw.iter().map(|v| sigmoid_f32(*v)).collect();
+
+            // biaffine = sum(head_content * gate * tail_content) / sqrt(H)
+            let biaffine: f32 = head_content
+                .iter()
+                .zip(&gate)
+                .zip(&tail_content)
+                .map(|((&hc, &g), &tc)| hc * g * tc)
+                .sum::<f32>()
+                / (h as f32).sqrt();
+
+            // content_linear = linear(cat(head_content, tail_content, rel))
+            let mut cl_feats = Vec::with_capacity(2 * h + relation_query.len());
+            cl_feats.extend_from_slice(&head_content);
+            cl_feats.extend_from_slice(&tail_content);
+            cl_feats.extend_from_slice(relation_query);
+            let cl_out = apply_linear(&w_cl, cl_in, &b_cl, &cl_feats);
+            let linear_term = cl_out[0];
+
+            score += biaffine + linear_term;
+            scores.push(score);
+        }
+        Ok(scores)
     }
 }
 
@@ -1457,6 +1581,7 @@ impl BoundaryModel {
             valid: sel_valid,
             scores,
             candidate_states: cand_states,
+            boundary_states: Some(bs_rows),
         })
     }
 }
@@ -1475,12 +1600,19 @@ pub struct SharedPoolScores {
     /// H-dimensional candidate states `[C][H]` (from `candidate_encoder`).
     /// `None` when the model lacks a `candidate_encoder` (no record decoder).
     pub candidate_states: Option<Vec<Vec<f32>>>,
+    /// Boundary encoder states `[L+1][d]` for relation scoring.
+    /// `None` when the model lacks a `relation_scorer`.
+    pub boundary_states: Option<Vec<Vec<f32>>>,
 }
 
 const SQRT_2_OVER_PI: f32 = 0.797_884_6;
 
 fn sigmoid_f32(x: f32) -> f32 {
     1.0 / (1.0 + (-x).exp())
+}
+
+fn gelu_f32(x: f32) -> f32 {
+    x * 0.5 * (1.0 + ((2.0_f32).sqrt() * (x + 0.044715 * x * x * x)).tanh())
 }
 
 fn layernorm(x: &[f32], weight: &[f32], bias: &[f32]) -> Result<Vec<f32>> {
@@ -1902,5 +2034,64 @@ mod tests {
             0.3, 0.3,
         );
         assert_eq!(records.len(), 1);
+    }
+
+    #[test]
+    fn gelu_f32_basic() {
+        assert!((gelu_f32(0.0) - 0.0).abs() < 1e-6);
+        // GELU is monotonic and near-identity for large positives
+        assert!(gelu_f32(10.0) > 9.0);
+        // GELU(1) > 0, GELU(-1) < 0
+        assert!(gelu_f32(1.0) > 0.0);
+        assert!(gelu_f32(-1.0) < 0.0);
+    }
+
+    fn zero_linear(in_dim: usize, out_dim: usize) -> Linear {
+        Linear::new(
+            Tensor::zeros((out_dim, in_dim), DType::F32, &cpu()).unwrap(),
+            Some(Tensor::zeros(out_dim, DType::F32, &cpu()).unwrap()),
+        )
+    }
+
+    #[test]
+    fn relation_scorer_forward_empty() {
+        let d = 8;
+        let h = 8;
+        let rs = RelationScorer {
+            head_content_projection: zero_linear(h, h),
+            tail_content_projection: zero_linear(h, h),
+            relation_content_gate: zero_linear(2 * h, h),
+            mlp_hidden: zero_linear(6 * h + 2, h),
+            mlp_out: zero_linear(h, 1),
+            content_linear: zero_linear(4 * h, 1),
+        };
+        let bs = vec![vec![0.0f32; d]; 5]; // L+1=5
+        let rel_q = vec![0.0f32; 2 * h];
+        let result = rs.forward(&bs, &rel_q, &[], &[], 4).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn relation_scorer_forward_shapes() {
+        let d = 8;
+        let h = 8;
+        let rs = RelationScorer {
+            head_content_projection: zero_linear(h, h),
+            tail_content_projection: zero_linear(h, h),
+            relation_content_gate: zero_linear(2 * h, h),
+            mlp_hidden: zero_linear(6 * h + 2, h),
+            mlp_out: zero_linear(h, 1),
+            content_linear: zero_linear(4 * h, 1),
+        };
+        let bs = vec![vec![0.1f32; d]; 10];
+        let rel_q = vec![0.2f32; 2 * h];
+        let heads = vec![(0, 3), (1, 4)];
+        let tails = vec![(5, 8), (6, 9)];
+        let result = rs.forward(&bs, &rel_q, &heads, &tails, 8).unwrap();
+        assert_eq!(result.len(), 2);
+        // With zero weights, score should be 0 for all pairs
+        for &s in &result {
+            assert!(s.abs() < 1e-5, "expected ~0, got {s}");
+        }
     }
 }
