@@ -7,12 +7,18 @@
 use gliner2_rs::inference::engine::GLiNER2;
 use std::path::PathBuf;
 
+#[allow(dead_code)]
 fn download_from_hub(repo_id: &str, filename: &str) -> PathBuf {
     use hf_hub::{Repo, RepoType, api::sync::ApiBuilder};
     let repo = Repo::with_revision(repo_id.to_string(), RepoType::Model, "main".to_string());
-    let api = ApiBuilder::new().with_progress(true).build().expect("HF API");
+    let api = ApiBuilder::new()
+        .with_progress(true)
+        .build()
+        .expect("HF API");
     let repo_api = api.repo(repo);
-    repo_api.get(filename).expect(&format!("download {filename}"))
+    repo_api
+        .get(filename)
+        .unwrap_or_else(|_| panic!("download {filename}"))
 }
 
 /// Shared fixture text + expected primary extractions (from the Python
@@ -44,7 +50,10 @@ fn check_checkpoint(model_id: &str) {
             .as_array()
             .map(|arr| {
                 arr.iter().any(|e| {
-                    e["text"].as_str().map(|t| t.contains(needle)).unwrap_or(false)
+                    e["text"]
+                        .as_str()
+                        .map(|t| t.contains(needle))
+                        .unwrap_or(false)
                         && e["confidence"].as_f64().map(|c| c >= 0.5).unwrap_or(true)
                 })
             })
@@ -95,11 +104,17 @@ fn test_perf_linear_scaling() {
     let mut prev = std::time::Duration::ZERO;
     let mut prev_words = 0usize;
     for take in [5usize, 20, 40] {
-        let text: String = std::iter::repeat(para).take(take).collect::<Vec<_>>().join(" ");
+        let text: String = std::iter::repeat_n(para, take)
+            .collect::<Vec<_>>()
+            .join(" ");
         let words = text.split_whitespace().count();
-        let _ = engine.extract(&text, &schema, 0.5, false, false, None).unwrap(); // warmup
+        let _ = engine
+            .extract(&text, &schema, 0.5, false, false, None)
+            .unwrap(); // warmup
         let t0 = std::time::Instant::now();
-        let _ = engine.extract(&text, &schema, 0.5, false, false, None).unwrap();
+        let _ = engine
+            .extract(&text, &schema, 0.5, false, false, None)
+            .unwrap();
         let elapsed = t0.elapsed();
         if prev_words > 0 && words > 384 {
             let ratio = elapsed.as_secs_f64() / prev.as_secs_f64().max(1e-6);
@@ -142,7 +157,10 @@ fn test_gliner25_entity_attributes() {
         },
     );
     let schema = Schema::new()
-        .entities(vec![EntityDef::new("person"), EntityDef::new("organization")])
+        .entities(vec![
+            EntityDef::new("person"),
+            EntityDef::new("organization"),
+        ])
         .entity_attributes(groups)
         .expect("schema");
 
@@ -163,7 +181,10 @@ fn test_gliner25_entity_attributes() {
     let persons = entities["person"].as_array().expect("person array");
     assert!(!persons.is_empty(), "expected a person span");
     for p in persons {
-        assert!(p.get("text").is_some(), "attributed entry must be an object");
+        assert!(
+            p.get("text").is_some(),
+            "attributed entry must be an object"
+        );
         assert!(
             p.get("sentiment").is_some(),
             "person entries carry the sentiment group: {p}"
@@ -219,10 +240,12 @@ fn test_attribute_schema_expansion() {
             ..Default::default()
         },
     );
-    assert!(Schema::new()
-        .entities(vec![EntityDef::new("person")])
-        .entity_attributes(bad)
-        .is_err());
+    assert!(
+        Schema::new()
+            .entities(vec![EntityDef::new("person")])
+            .entity_attributes(bad)
+            .is_err()
+    );
 
     // Validation: requires entities first.
     let mut g2 = HashMap::new();
@@ -234,4 +257,166 @@ fn test_attribute_schema_expansion() {
         },
     );
     assert!(Schema::new().entity_attributes(g2).is_err());
+}
+
+/// End-to-end task parity vs Python reference outputs
+/// (`tests/fixtures/g25/tasks_python.json`): classification, relations,
+/// records, single-label (softmax) and multi-label attribute groups.
+#[test]
+#[ignore = "downloads ~500MB; run explicitly with --ignored"]
+fn test_task_output_parity() {
+    use gliner2_rs::schema::builder::SchemaBuilder;
+    use gliner2_rs::schema::types::{AttributeGroup, EntityDef, Schema};
+    use std::collections::HashMap;
+
+    let py: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string("tests/fixtures/g25/tasks_python.json").unwrap(),
+    )
+    .unwrap();
+    let engine = GLiNER2::from_pretrained("fastino/gliner2.5-small-v1").expect("load");
+
+    // --- Classification ---
+    let schema = SchemaBuilder::new()
+        .classification("sentiment", vec!["positive".into(), "negative".into()])
+        .done()
+        .build()
+        .unwrap();
+    let r = engine
+        .extract(
+            "I absolutely loved the movie, it was wonderful.",
+            &schema,
+            0.5,
+            false,
+            false,
+            None,
+        )
+        .unwrap();
+    println!("classification: {r}");
+    assert_eq!(
+        r["sentiment"].as_str().unwrap(),
+        py["classification"]["sentiment"].as_str().unwrap()
+    );
+
+    // --- Relations ---
+    let schema = SchemaBuilder::new()
+        .entities(vec!["person".to_string(), "company".to_string()])
+        .relation("works_for")
+        .done()
+        .build()
+        .unwrap();
+    let r = engine
+        .extract(
+            "Tim Cook works for Apple in California.",
+            &schema,
+            0.5,
+            false,
+            false,
+            None,
+        )
+        .unwrap();
+    println!("relation: {r}");
+    assert_eq!(r["entities"]["person"][0].as_str().unwrap(), "Tim Cook");
+    assert_eq!(r["entities"]["company"][0].as_str().unwrap(), "Apple");
+    // Relation pairs (keyed by relation name or relation_extraction group).
+    let rel = if let Some(w) = r.get("works_for") {
+        w.clone()
+    } else {
+        r["relation_extraction"]["works_for"].clone()
+    };
+    let pair = rel.as_array().unwrap()[0].clone();
+    let (head, tail) = if pair.is_array() {
+        (
+            pair[0].as_str().unwrap().to_string(),
+            pair[1].as_str().unwrap().to_string(),
+        )
+    } else {
+        panic!("unexpected relation entry: {pair}")
+    };
+    assert_eq!((head.as_str(), tail.as_str()), ("Tim Cook", "Apple"));
+
+    // --- Single-label attributes (softmax) ---
+    let mut groups = HashMap::new();
+    groups.insert(
+        "mood".to_string(),
+        AttributeGroup {
+            labels: vec!["happy".into(), "sad".into()],
+            multi_label: false,
+            threshold: 0.5,
+            applies_to: None,
+            qualify_labels: false,
+        },
+    );
+    let schema = Schema::new()
+        .entities(vec![EntityDef::new("person")])
+        .entity_attributes(groups)
+        .unwrap();
+    let r = engine
+        .extract(
+            "Tim Cook smiled brightly at the event in Cupertino.",
+            &schema,
+            0.5,
+            false,
+            false,
+            None,
+        )
+        .unwrap();
+    println!("attr_single: {r}");
+    let p = &r["entities"]["person"][0];
+    assert_eq!(p["text"].as_str().unwrap(), "Tim Cook");
+    let mood = &p["mood"];
+    assert_eq!(
+        mood["label"].as_str().unwrap(),
+        py["attr_single"]["entities"]["person"][0]["mood"]["label"]
+            .as_str()
+            .unwrap()
+    );
+    let conf = mood["confidence"].as_f64().unwrap();
+    let py_conf = py["attr_single"]["entities"]["person"][0]["mood"]["confidence"]
+        .as_f64()
+        .unwrap();
+    assert!(
+        (conf - py_conf).abs() < 0.01,
+        "mood confidence {conf} vs python {py_conf}"
+    );
+
+    // --- Multi-label attributes ---
+    let mut groups = HashMap::new();
+    groups.insert(
+        "skills".to_string(),
+        AttributeGroup {
+            labels: vec!["leader".into(), "engineer".into()],
+            multi_label: true,
+            ..Default::default()
+        },
+    );
+    let schema = Schema::new()
+        .entities(vec![EntityDef::new("person")])
+        .entity_attributes(groups)
+        .unwrap();
+    let r = engine
+        .extract(
+            "Tim Cook leads Apple product teams.",
+            &schema,
+            0.5,
+            false,
+            false,
+            None,
+        )
+        .unwrap();
+    println!("attr_multi: {r}");
+    let p = &r["entities"]["person"][0];
+    let skills = p["skills"].as_array().expect("skills array");
+    let py_skills = py["attr_multi"]["entities"]["person"][0]["skills"]
+        .as_array()
+        .unwrap();
+    assert_eq!(skills.len(), py_skills.len());
+    for (got, want) in skills.iter().zip(py_skills) {
+        assert_eq!(
+            got["label"].as_str().unwrap(),
+            want["label"].as_str().unwrap()
+        );
+        let c = got["confidence"].as_f64().unwrap();
+        let pc = want["confidence"].as_f64().unwrap();
+        assert!((c - pc).abs() < 0.01, "skill confidence {c} vs {pc}");
+    }
 }

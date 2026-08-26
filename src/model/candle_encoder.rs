@@ -354,12 +354,34 @@ impl CandleEncoder {
     }
 
     /// Debug staged forward: [embeddings, layer0, .., final].
-    pub fn forward_debug(&self, input_ids: &Tensor, attention_mask: &Tensor) -> Result<Vec<Tensor>> {
+    /// Per-layer sub-stages for parity bisection (DeBERTa V3 only).
+    pub fn forward_substages(
+        &self,
+        input_ids: &Tensor,
+        attention_mask: &Tensor,
+    ) -> Result<Vec<(Tensor, Tensor, Tensor, Tensor)>> {
+        match &self.model {
+            EncoderModel::DebertaV3(model) => model
+                .forward_substages(input_ids, Some(attention_mask))
+                .map_err(|e| GlinerError::model_loading(format!("{e}"))),
+            _ => Err(GlinerError::model_loading(
+                "forward_substages only supports DebertaV3",
+            )),
+        }
+    }
+
+    pub fn forward_debug(
+        &self,
+        input_ids: &Tensor,
+        attention_mask: &Tensor,
+    ) -> Result<Vec<Tensor>> {
         match &self.model {
             EncoderModel::DebertaV3(model) => model
                 .forward_debug(input_ids, Some(attention_mask))
                 .map_err(|e| GlinerError::model_loading(format!("debug forward failed: {e}"))),
-            _ => Err(GlinerError::model_loading("forward_debug only supports DebertaV3")),
+            _ => Err(GlinerError::model_loading(
+                "forward_debug only supports DebertaV3",
+            )),
         }
     }
 
@@ -447,7 +469,9 @@ impl CandleEncoder {
     }
 
     /// Build a DeBERTa V3 config from the extractor config.
-    fn build_deberta_v3_config(config: &ExtractorConfig) -> crate::model::deberta_v3::DebertaV3Config {
+    fn build_deberta_v3_config(
+        config: &ExtractorConfig,
+    ) -> crate::model::deberta_v3::DebertaV3Config {
         crate::model::deberta_v3::DebertaV3Config {
             vocab_size: config.vocab_size,
             hidden_size: config.hidden_size,

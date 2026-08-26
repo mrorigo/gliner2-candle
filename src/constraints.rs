@@ -11,8 +11,6 @@ use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
-use crate::error::{GlinerError, Result};
-
 // ── Kleene-3 helpers ──────────────────────────────────────────────────
 
 pub fn k_not(v: Option<bool>) -> Option<bool> {
@@ -82,7 +80,12 @@ impl DictAssignment {
         domains: HashMap<String, HashSet<String>>,
         label_names: HashMap<String, Vec<String>>,
     ) -> Self {
-        Self { selected, decided, domains, label_names }
+        Self {
+            selected,
+            decided,
+            domains,
+            label_names,
+        }
     }
 }
 
@@ -102,7 +105,11 @@ impl Assignment for DictAssignment {
         if let Some(d) = self.domains.get(task) {
             return d.clone();
         }
-        self.label_names.get(task).cloned().map(|v| v.into_iter().collect()).unwrap_or_default()
+        self.label_names
+            .get(task)
+            .cloned()
+            .map(|v| v.into_iter().collect())
+            .unwrap_or_default()
     }
 
     fn holds(&self, task: &str, label: &str) -> Option<bool> {
@@ -129,21 +136,60 @@ impl Assignment for DictAssignment {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum Constraint {
-    LabelRef { task: String, label: String },
-    AnySelected { task: String },
-    AnyOtherSelected { task: String },
-    IsDefault { task: String },
-    Cardinality { task: String, minimum: usize, maximum: Option<usize> },
-    MinLevel { task: String, level: String },
-    MaxLevel { task: String, level: String },
-    AtLevel { task: String, level: String },
-    Not { child: Box<Constraint> },
-    And { children: Vec<Constraint> },
-    Or { children: Vec<Constraint> },
-    ExactlyOneOf { children: Vec<Constraint> },
-    Implies { cond: Box<Constraint>, then: Box<Constraint> },
-    Iff { left: Box<Constraint>, right: Box<Constraint> },
-    Excludes { left: Box<Constraint>, right: Box<Constraint> },
+    LabelRef {
+        task: String,
+        label: String,
+    },
+    AnySelected {
+        task: String,
+    },
+    AnyOtherSelected {
+        task: String,
+    },
+    IsDefault {
+        task: String,
+    },
+    Cardinality {
+        task: String,
+        minimum: usize,
+        maximum: Option<usize>,
+    },
+    MinLevel {
+        task: String,
+        level: String,
+    },
+    MaxLevel {
+        task: String,
+        level: String,
+    },
+    AtLevel {
+        task: String,
+        level: String,
+    },
+    Not {
+        child: Box<Constraint>,
+    },
+    And {
+        children: Vec<Constraint>,
+    },
+    Or {
+        children: Vec<Constraint>,
+    },
+    ExactlyOneOf {
+        children: Vec<Constraint>,
+    },
+    Implies {
+        cond: Box<Constraint>,
+        then: Box<Constraint>,
+    },
+    Iff {
+        left: Box<Constraint>,
+        right: Box<Constraint>,
+    },
+    Excludes {
+        left: Box<Constraint>,
+        right: Box<Constraint>,
+    },
 }
 
 impl Constraint {
@@ -159,9 +205,7 @@ impl Constraint {
             | Self::MaxLevel { task, .. }
             | Self::AtLevel { task, .. } => HashSet::from([task.clone()]),
             Self::Not { child } => child.references(),
-            Self::And { children }
-            | Self::Or { children }
-            | Self::ExactlyOneOf { children } => {
+            Self::And { children } | Self::Or { children } | Self::ExactlyOneOf { children } => {
                 children.iter().flat_map(|c| c.references()).collect()
             }
             Self::Implies { cond, then } => {
@@ -212,7 +256,11 @@ impl Constraint {
                 }
             }
 
-            Self::Cardinality { task, minimum, maximum } => {
+            Self::Cardinality {
+                task,
+                minimum,
+                maximum,
+            } => {
                 let sel = a.selected(task);
                 let dom = a.domain(task);
                 let lo = sel.len();
@@ -347,27 +395,46 @@ impl Constraint {
 // ── DSL builders ───────────────────────────────────────────────────────
 
 pub fn label(task: &str, name: &str) -> Constraint {
-    Constraint::LabelRef { task: task.to_string(), label: name.to_string() }
+    Constraint::LabelRef {
+        task: task.to_string(),
+        label: name.to_string(),
+    }
 }
 
 pub fn any_selected(task: &str) -> Constraint {
-    Constraint::AnySelected { task: task.to_string() }
+    Constraint::AnySelected {
+        task: task.to_string(),
+    }
 }
 
 pub fn at_least(task: &str, k: usize) -> Constraint {
-    Constraint::Cardinality { task: task.to_string(), minimum: k, maximum: None }
+    Constraint::Cardinality {
+        task: task.to_string(),
+        minimum: k,
+        maximum: None,
+    }
 }
 
 pub fn at_most(task: &str, k: usize) -> Constraint {
-    Constraint::Cardinality { task: task.to_string(), minimum: 0, maximum: Some(k) }
+    Constraint::Cardinality {
+        task: task.to_string(),
+        minimum: 0,
+        maximum: Some(k),
+    }
 }
 
 pub fn exactly(task: &str, k: usize) -> Constraint {
-    Constraint::Cardinality { task: task.to_string(), minimum: k, maximum: Some(k) }
+    Constraint::Cardinality {
+        task: task.to_string(),
+        minimum: k,
+        maximum: Some(k),
+    }
 }
 
 pub fn not_(child: Constraint) -> Constraint {
-    Constraint::Not { child: Box::new(child) }
+    Constraint::Not {
+        child: Box::new(child),
+    }
 }
 
 pub fn all_of(children: Vec<Constraint>) -> Constraint {
@@ -379,15 +446,24 @@ pub fn any_of(children: Vec<Constraint>) -> Constraint {
 }
 
 pub fn implies(cond: Constraint, then: Constraint) -> Constraint {
-    Constraint::Implies { cond: Box::new(cond), then: Box::new(then) }
+    Constraint::Implies {
+        cond: Box::new(cond),
+        then: Box::new(then),
+    }
 }
 
 pub fn iff(left: Constraint, right: Constraint) -> Constraint {
-    Constraint::Iff { left: Box::new(left), right: Box::new(right) }
+    Constraint::Iff {
+        left: Box::new(left),
+        right: Box::new(right),
+    }
 }
 
 pub fn excludes(left: Constraint, right: Constraint) -> Constraint {
-    Constraint::Excludes { left: Box::new(left), right: Box::new(right) }
+    Constraint::Excludes {
+        left: Box::new(left),
+        right: Box::new(right),
+    }
 }
 
 pub fn exactly_one_of(children: Vec<Constraint>) -> Constraint {
@@ -430,7 +506,7 @@ impl DecodeProblem {
     ) -> DictAssignment {
         let mut selected = HashMap::new();
         let mut decided_set = HashSet::new();
-        let mut domains = HashMap::new();
+        let domains = HashMap::new();
         let mut label_names = HashMap::new();
 
         for task in &self.task_order {
@@ -472,6 +548,7 @@ pub fn decode_exact(problem: &DecodeProblem, budget: usize) -> Option<Solution> 
     let mut best_assign: Option<HashMap<String, LocalAssignment>> = None;
     let mut nodes: usize = 0;
 
+    #[allow(clippy::too_many_arguments)]
     fn dfs(
         problem: &DecodeProblem,
         order: &[String],
@@ -512,8 +589,16 @@ pub fn decode_exact(problem: &DecodeProblem, budget: usize) -> Option<Solution> 
                 let a = problem.assignment(chosen, &decided);
                 if touching.iter().all(|c| c.still_satisfiable(&a)) {
                     dfs(
-                        problem, order, suffix, i + 1, chosen,
-                        score + local.utility, best_score, best_assign, nodes, budget,
+                        problem,
+                        order,
+                        suffix,
+                        i + 1,
+                        chosen,
+                        score + local.utility,
+                        best_score,
+                        best_assign,
+                        nodes,
+                        budget,
                     );
                 }
                 chosen.remove(task);
@@ -523,13 +608,26 @@ pub fn decode_exact(problem: &DecodeProblem, budget: usize) -> Option<Solution> 
 
     let mut chosen = HashMap::new();
     dfs(
-        problem, &order, &suffix, 0, &mut chosen, 0.0,
-        &mut best_score, &mut best_assign, &mut nodes, budget,
+        problem,
+        &order,
+        &suffix,
+        0,
+        &mut chosen,
+        0.0,
+        &mut best_score,
+        &mut best_assign,
+        &mut nodes,
+        budget,
     );
 
     best_assign.map(|assignments| {
         let score = best_score;
-        Solution { assignments, score, violations: Vec::new(), exact: true }
+        Solution {
+            assignments,
+            score,
+            violations: Vec::new(),
+            exact: true,
+        }
     })
 }
 
@@ -538,8 +636,7 @@ fn order_tasks(problem: &DecodeProblem) -> Vec<String> {
     order.sort_by(|a, b| {
         let ca = problem.constraints_touching(a).len();
         let cb = problem.constraints_touching(b).len();
-        cb.cmp(&ca)
-            .then(a.cmp(b))
+        cb.cmp(&ca).then(a.cmp(b))
     });
     order
 }
@@ -547,9 +644,14 @@ fn order_tasks(problem: &DecodeProblem) -> Vec<String> {
 fn suffix_max(order: &[String], problem: &DecodeProblem) -> Vec<f32> {
     let mut suffix = vec![0.0f32; order.len() + 1];
     for i in (0..order.len()).rev() {
-        let best = problem.locals
+        let best = problem
+            .locals
             .get(&order[i])
-            .map(|ls| ls.iter().map(|l| l.utility).fold(f32::NEG_INFINITY, f32::max))
+            .map(|ls| {
+                ls.iter()
+                    .map(|l| l.utility)
+                    .fold(f32::NEG_INFINITY, f32::max)
+            })
             .unwrap_or(0.0);
         suffix[i] = best + suffix[i + 1];
     }
@@ -560,14 +662,15 @@ fn suffix_max(order: &[String], problem: &DecodeProblem) -> Vec<f32> {
 mod tests {
     use super::*;
 
+    #[allow(dead_code)]
     fn dummy_task(task: &str, labels: &[&str]) -> (String, Vec<String>) {
-        (task.to_string(), labels.iter().map(|s| s.to_string()).collect())
+        (
+            task.to_string(),
+            labels.iter().map(|s| s.to_string()).collect(),
+        )
     }
 
-    fn make_assignment(
-        selected: Vec<(&str, Vec<&str>)>,
-        decided: Vec<&str>,
-    ) -> DictAssignment {
+    fn make_assignment(selected: Vec<(&str, Vec<&str>)>, decided: Vec<&str>) -> DictAssignment {
         let sel: HashMap<String, HashSet<String>> = selected
             .into_iter()
             .map(|(t, ls)| (t.to_string(), ls.into_iter().map(String::from).collect()))
@@ -592,14 +695,20 @@ mod tests {
     #[test]
     fn k_and_basic() {
         assert_eq!(k_and(vec![Some(true), Some(true)].into_iter()), Some(true));
-        assert_eq!(k_and(vec![Some(true), Some(false)].into_iter()), Some(false));
+        assert_eq!(
+            k_and(vec![Some(true), Some(false)].into_iter()),
+            Some(false)
+        );
         assert_eq!(k_and(vec![Some(true), None].into_iter()), None);
         assert_eq!(k_and(vec![].into_iter()), Some(true));
     }
 
     #[test]
     fn k_or_basic() {
-        assert_eq!(k_or(vec![Some(false), Some(false)].into_iter()), Some(false));
+        assert_eq!(
+            k_or(vec![Some(false), Some(false)].into_iter()),
+            Some(false)
+        );
         assert_eq!(k_or(vec![Some(false), Some(true)].into_iter()), Some(true));
         assert_eq!(k_or(vec![Some(false), None].into_iter()), None);
         assert_eq!(k_or(vec![].into_iter()), Some(false));
@@ -754,15 +863,27 @@ mod tests {
         locals.insert(
             "t1".to_string(),
             vec![
-                LocalAssignment { selected: ["a".to_string()].into_iter().collect(), utility: 2.0 },
-                LocalAssignment { selected: ["b".to_string()].into_iter().collect(), utility: 1.0 },
+                LocalAssignment {
+                    selected: ["a".to_string()].into_iter().collect(),
+                    utility: 2.0,
+                },
+                LocalAssignment {
+                    selected: ["b".to_string()].into_iter().collect(),
+                    utility: 1.0,
+                },
             ],
         );
         locals.insert(
             "t2".to_string(),
             vec![
-                LocalAssignment { selected: ["x".to_string()].into_iter().collect(), utility: 3.0 },
-                LocalAssignment { selected: ["y".to_string()].into_iter().collect(), utility: 1.0 },
+                LocalAssignment {
+                    selected: ["x".to_string()].into_iter().collect(),
+                    utility: 3.0,
+                },
+                LocalAssignment {
+                    selected: ["y".to_string()].into_iter().collect(),
+                    utility: 1.0,
+                },
             ],
         );
 
@@ -783,7 +904,10 @@ mod tests {
         let mut locals = HashMap::new();
         locals.insert(
             "t1".to_string(),
-            vec![LocalAssignment { selected: ["a".to_string()].into_iter().collect(), utility: 1.0 }],
+            vec![LocalAssignment {
+                selected: ["a".to_string()].into_iter().collect(),
+                utility: 1.0,
+            }],
         );
 
         let problem = DecodeProblem {
@@ -801,15 +925,17 @@ mod tests {
         let mut locals = HashMap::new();
         locals.insert(
             "t1".to_string(),
-            vec![
-                LocalAssignment { selected: ["a".to_string()].into_iter().collect(), utility: 1.0 },
-            ],
+            vec![LocalAssignment {
+                selected: ["a".to_string()].into_iter().collect(),
+                utility: 1.0,
+            }],
         );
         locals.insert(
             "t2".to_string(),
-            vec![
-                LocalAssignment { selected: ["a".to_string()].into_iter().collect(), utility: 1.0 },
-            ],
+            vec![LocalAssignment {
+                selected: ["a".to_string()].into_iter().collect(),
+                utility: 1.0,
+            }],
         );
 
         let problem = DecodeProblem {

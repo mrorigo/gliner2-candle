@@ -536,10 +536,7 @@ impl Schema {
     /// Mirrors the Python `Schema.entity_attributes`: attribute labels are
     /// registered as hidden entity queries (excluded from the public entity
     /// order) and re-scored at retained spans after decoding.
-    pub fn entity_attributes(
-        mut self,
-        groups: HashMap<String, AttributeGroup>,
-    ) -> Result<Self> {
+    pub fn entity_attributes(mut self, groups: HashMap<String, AttributeGroup>) -> Result<Self> {
         let content_entities: std::collections::HashSet<&String> =
             self.entities.iter().map(|e| &e.name).collect();
         if content_entities.is_empty() {
@@ -617,7 +614,10 @@ impl Schema {
         let mut prompts: HashMap<String, String> = HashMap::new();
         for (group_name, group) in &self.entity_attribute_groups {
             for label in &group.labels {
-                prompts.insert(label.clone(), attribute_prompt_label(group_name, group, label));
+                prompts.insert(
+                    label.clone(),
+                    attribute_prompt_label(group_name, group, label),
+                );
             }
         }
         let mut sorted: Vec<String> = {

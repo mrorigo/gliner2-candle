@@ -9,11 +9,52 @@ Usage:
 from __future__ import annotations
 
 import json
+import os
 import re
 import sys
 from typing import Any
 
 from gliner2 import GLiNER2
+
+
+def _load_model_offline(snapshot: str):
+    """Load GLiNER2 from a local snapshot directory, working around
+    transformers 5.x incompatibility with file-path config loading."""
+    from pathlib import Path
+    from safetensors.torch import load_file
+    from gliner2.model import ExtractorConfig
+    from transformers import AutoConfig, AutoTokenizer
+
+    snap = Path(snapshot)
+
+    # If config.json exists, use from_pretrained path.
+    if (snap / "config.json").exists():
+        return GLiNER2.from_pretrained(str(snap))
+
+    # Otherwise construct the model from known config + local weights.
+    config = ExtractorConfig(
+        hidden_size=768,
+        vocab_size=128011,
+        num_hidden_layers=12,
+        num_attention_heads=12,
+        intermediate_size=3072,
+    )
+    encoder_config = AutoConfig.from_pretrained(
+        "microsoft/deberta-v3-base"
+    )
+    tokenizer = AutoTokenizer.from_pretrained("microsoft/deberta-v3-base")
+
+    model = GLiNER2(config, encoder_config=encoder_config, tokenizer=tokenizer)
+
+    model_path = snap / "model.safetensors"
+    if model_path.exists():
+        state_dict = load_file(str(model_path))
+    else:
+        import torch
+        state_dict = torch.load(str(snap / "pytorch_model.bin"), map_location="cpu")
+
+    model.load_state_dict(state_dict, strict=False)
+    return model
 
 
 def _norm_text(v: Any) -> str:
@@ -117,7 +158,7 @@ def main() -> int:
         return 2
 
     snapshot = sys.argv[1]
-    model = GLiNER2.from_pretrained(snapshot)
+    model = _load_model_offline(snapshot)
 
     fixtures = [
         {

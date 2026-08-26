@@ -172,14 +172,11 @@ impl ModelLoader {
             )
             .map_err(|e| GlinerError::model_loading(format!("Failed to rebuild encoder: {e}")))?;
 
-            let boundary = crate::model::boundary::BoundaryModel::load(
-                vb,
-                &self.config,
-                &self.device,
-            )
-            .map_err(|e| {
-                GlinerError::model_loading(format!("Failed to load boundary head: {e}"))
-            })?;
+            let boundary =
+                crate::model::boundary::BoundaryModel::load(vb, &self.config, &self.device)
+                    .map_err(|e| {
+                        GlinerError::model_loading(format!("Failed to load boundary head: {e}"))
+                    })?;
             model.boundary = Some(boundary);
             return Ok(());
         }

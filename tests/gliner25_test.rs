@@ -6,7 +6,7 @@
 //!
 //! Gated behind the `hub` feature / env var like the other hub tests.
 
-use gliner2_rs::config::{Architecture, BoundaryConfig, ExtractorConfig};
+use gliner2_rs::config::{Architecture, BoundaryConfig};
 use std::path::PathBuf;
 
 fn download_from_hub(repo_id: &str, filename: &str) -> PathBuf {
@@ -20,7 +20,9 @@ fn download_from_hub(repo_id: &str, filename: &str) -> PathBuf {
         .expect("Failed to build HF API");
 
     let repo_api = api.repo(repo);
-    repo_api.get(filename).expect(&format!("Failed to download {filename}"))
+    repo_api
+        .get(filename)
+        .unwrap_or_else(|_| panic!("Failed to download {filename}"))
 }
 
 #[test]
@@ -70,14 +72,22 @@ fn test_gliner25_base_checkpoint_loads() {
     assert_eq!(config.boundary.pool_size, 192);
 
     // Build model and load weights (shape validation happens eagerly).
-    let device = candle_core::Device::Cpu;
+    let _device = candle_core::Device::Cpu;
     let mut model = gliner2_rs::model::Extractor::new(&config)
         .expect("failed to construct extractor for GLiNER2.5");
-    assert!(model.boundary.is_none(), "boundary loads at weight-load time");
+    assert!(
+        model.boundary.is_none(),
+        "boundary loads at weight-load time"
+    );
 
     let weights_path = download_from_hub(model_id, "model.safetensors");
-    model.load_weights(&weights_path).expect("GLiNER2.5 base weights must load with zero shape mismatches");
+    model
+        .load_weights(&weights_path)
+        .expect("GLiNER2.5 base weights must load with zero shape mismatches");
 
-    assert!(model.boundary.is_some(), "boundary head must be populated after loading");
+    assert!(
+        model.boundary.is_some(),
+        "boundary head must be populated after loading"
+    );
     assert!(model.is_loaded);
 }

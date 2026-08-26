@@ -88,8 +88,8 @@ struct DebertaV3Attention {
     output_layer_norm: LayerNorm,
     num_attention_heads: usize,
     attention_head_size: usize,
-    max_relative_positions: isize,
-    position_buckets: usize,
+    _max_relative_positions: isize,
+    _position_buckets: usize,
     share_att_key: bool,
     pos_att_type: Vec<String>,
 }
@@ -132,20 +132,21 @@ impl DebertaV3Attention {
             output_layer_norm,
             num_attention_heads: config.num_attention_heads,
             attention_head_size,
-            max_relative_positions: config.max_relative_positions,
-            position_buckets: config.position_buckets,
+            _max_relative_positions: config.max_relative_positions,
+            _position_buckets: config.position_buckets,
             share_att_key: config.share_att_key,
             pos_att_type: config.pos_att_type.clone(),
         })
     }
 
-    fn forward(
+    #[allow(clippy::type_complexity)]
+    fn forward_dbg(
         &self,
         hidden_states: &Tensor,
         attention_mask: &Tensor,
         rel_embeddings: Option<&Tensor>,
         rel_idx: Option<&RelPositionIndex>,
-    ) -> Result<Tensor> {
+    ) -> Result<(Tensor, Tensor)> {
         let input_tensor = hidden_states.clone();
         let (batch_size, seq_len, hidden_size) = hidden_states.dims3()?;
 
@@ -199,17 +200,15 @@ impl DebertaV3Attention {
         let mut attention_scores = query_layer.matmul(&key_layer.transpose(2, 3)?)?;
         attention_scores = (attention_scores / scale)?;
 
-        if prof { eprintln!("PROFILE     qkv+qk={:?} seq={seq_len}", t_qkv.elapsed()); }
+        if prof {
+            eprintln!("PROFILE     qkv+qk={:?} seq={seq_len}", t_qkv.elapsed());
+        }
         // Add disentangled attention bias if relative embeddings are available
         let t_rel = std::time::Instant::now();
         match (rel_embeddings, rel_idx) {
             (Some(rel_emb), Some(idx)) => {
-                let rel_att = self.disentangled_attention_bias(
-                    &query_layer,
-                    &key_layer,
-                    rel_emb,
-                    idx,
-                )?;
+                let rel_att =
+                    self.disentangled_attention_bias(&query_layer, &key_layer, rel_emb, idx)?;
                 attention_scores = attention_scores.add(&rel_att)?;
             }
             (Some(rel_emb), None) => {
@@ -226,13 +225,17 @@ impl DebertaV3Attention {
             }
             _ => {}
         }
-        if prof { eprintln!("PROFILE     rel_bias={:?}", t_rel.elapsed()); }
+        if prof {
+            eprintln!("PROFILE     rel_bias={:?}", t_rel.elapsed());
+        }
 
         // Apply attention mask
         let t_sm = std::time::Instant::now();
         attention_scores = attention_scores.add(attention_mask)?;
         let attention_probs = candle_nn::ops::softmax(&attention_scores, 3)?;
-        if prof { eprintln!("PROFILE     mask+softmax={:?}", t_sm.elapsed()); }
+        if prof {
+            eprintln!("PROFILE     mask+softmax={:?}", t_sm.elapsed());
+        }
 
         // Context layer: (batch, heads, seq, seq) @ (batch, heads, seq, head_size)
         let context = attention_probs.matmul(&value_layer)?;
@@ -242,7 +245,21 @@ impl DebertaV3Attention {
         // Output projection + residual + layer norm
         let output = self.output_dense.forward(&context)?;
         let output = output.add(&input_tensor)?;
-        self.output_layer_norm.forward(&output)
+        let out = self.output_layer_norm.forward(&output)?;
+        Ok((out, context))
+    }
+
+    /// Standard forward (drops the raw context).
+    #[allow(dead_code)]
+    fn forward(
+        &self,
+        hidden_states: &Tensor,
+        attention_mask: &Tensor,
+        rel_embeddings: Option<&Tensor>,
+        rel_idx: Option<&RelPositionIndex>,
+    ) -> Result<Tensor> {
+        self.forward_dbg(hidden_states, attention_mask, rel_embeddings, rel_idx)
+            .map(|(out, _)| out)
     }
 
     fn scale(&self) -> f64 {
@@ -311,8 +328,7 @@ impl DebertaV3Attention {
     /// Project position embeddings to per-head layout (batch, heads, head_size, P).
     fn pos_proj(&self, proj: Tensor, batch_size: usize) -> Result<Tensor> {
         let p = proj.dims()[0];
-        Ok(proj
-            .reshape((p, self.num_attention_heads, self.attention_head_size))?
+        proj.reshape((p, self.num_attention_heads, self.attention_head_size))?
             .transpose(0, 1)?
             .unsqueeze(0)?
             .broadcast_as((
@@ -321,7 +337,7 @@ impl DebertaV3Attention {
                 p,
                 self.attention_head_size,
             ))?
-            .contiguous()?)
+            .contiguous()
     }
 }
 
@@ -398,13 +414,22 @@ impl DebertaV3Intermediate {
         })
     }
 
+    #[allow(dead_code)]
     fn forward(&self, hidden_states: &Tensor) -> Result<Tensor> {
+        self.forward_dbg(hidden_states).map(|(_, out)| out)
+    }
+
+    /// Returns `(gelu_output, layer_output)`.
+    fn forward_dbg(&self, hidden_states: &Tensor) -> Result<(Tensor, Tensor)> {
         let input_tensor = hidden_states.clone();
         let hidden = self.dense.forward(hidden_states)?;
-        let hidden = hidden.gelu()?;
+        // Exact (erf-based) GELU to match HF DebertaV2's `hidden_act="gelu"`;
+        // candle's built-in `gelu` is a tanh approximation.
+        let hidden = gelu_erf(&hidden)?;
         let output = self.output_dense.forward(&hidden)?;
         let output = output.add(&input_tensor)?;
-        self.output_layer_norm.forward(&output)
+        let out = self.output_layer_norm.forward(&output)?;
+        Ok((hidden, out))
     }
 }
 
@@ -431,20 +456,30 @@ impl DebertaV3Layer {
         rel_embeddings: Option<&Tensor>,
         rel_idx: Option<&RelPositionIndex>,
     ) -> Result<Tensor> {
+        self.forward_dbg(hidden_states, attention_mask, rel_embeddings, rel_idx)
+            .map(|x| x.3)
+    }
+
+    /// Returns `(selfattn_context, attn_out, ffn_gelu, layer_out)`.
+    #[allow(clippy::type_complexity)]
+    fn forward_dbg(
+        &self,
+        hidden_states: &Tensor,
+        attention_mask: &Tensor,
+        rel_embeddings: Option<&Tensor>,
+        rel_idx: Option<&RelPositionIndex>,
+    ) -> Result<(Tensor, Tensor, Tensor, Tensor)> {
         let t0 = std::time::Instant::now();
-        let hidden = self.attention.forward(
-            hidden_states,
-            attention_mask,
-            rel_embeddings,
-            rel_idx,
-        )?;
+        let (attn_out, ctx) =
+            self.attention
+                .forward_dbg(hidden_states, attention_mask, rel_embeddings, rel_idx)?;
         let t_attn = t0.elapsed();
         let t1 = std::time::Instant::now();
-        let out = self.intermediate.forward(&hidden);
+        let (gelu, out) = self.intermediate.forward_dbg(&attn_out)?;
         if std::env::var("GLINER2_PROFILE").is_ok() {
             eprintln!("PROFILE     attn={t_attn:?} ffn={:?}", t1.elapsed());
         }
-        out
+        Ok((ctx, attn_out, gelu, out))
     }
 }
 
@@ -496,15 +531,21 @@ impl DebertaV3Encoder {
         for (i, layer) in self.layers.iter().enumerate() {
             if profile && (i == 0 || i == self.layers.len() - 1) {
                 let t0 = std::time::Instant::now();
-                hidden = layer.forward(&hidden, attention_mask, rel_embeddings, rel_idx.as_ref())?;
+                hidden =
+                    layer.forward(&hidden, attention_mask, rel_embeddings, rel_idx.as_ref())?;
                 let el = t0.elapsed();
                 eprintln!("PROFILE   layer {i}: {el:?} seq={}", hidden.dims()[1]);
             } else {
-                hidden = layer.forward(&hidden, attention_mask, rel_embeddings, rel_idx.as_ref())?;
+                hidden =
+                    layer.forward(&hidden, attention_mask, rel_embeddings, rel_idx.as_ref())?;
             }
         }
         if profile {
-            eprintln!("PROFILE   encoder_total={:?} seq={}", t_all.elapsed(), hidden.dims()[1]);
+            eprintln!(
+                "PROFILE   encoder_total={:?} seq={}",
+                t_all.elapsed(),
+                hidden.dims()[1]
+            );
         }
         Ok(hidden)
     }
@@ -630,11 +671,8 @@ impl DebertaV3Model {
             .broadcast_mul(&Tensor::try_from(f32::MIN)?.to_device(attention_mask.device())?)?;
 
         let rel_embeddings = self.rel_states();
-        self.encoder.forward(
-            &embedding_output,
-            &attention_mask,
-            rel_embeddings.as_ref(),
-        )
+        self.encoder
+            .forward(&embedding_output, &attention_mask, rel_embeddings.as_ref())
     }
 
     fn rel_states(&self) -> Option<Tensor> {
@@ -649,7 +687,8 @@ impl DebertaV3Model {
         &self.device
     }
 
-    /// Debug forward returning [embedding_output, layer0_out, ..] for parity testing.
+    /// Debug forward returning per-layer stages for parity testing:
+    /// `[l0_in(=embeddings), l0_out(=l1_in), ..., l11_out]` — 13 entries.
     pub fn forward_debug(
         &self,
         input_ids: &Tensor,
@@ -657,6 +696,62 @@ impl DebertaV3Model {
     ) -> Result<Vec<Tensor>> {
         let embedding_output = self.embeddings.forward(input_ids)?;
         let mut stages = vec![embedding_output.clone()];
+
+        let attention_mask = match attention_mask {
+            Some(mask) => mask.clone(),
+            None => input_ids.ones_like()?,
+        };
+        let extended_attention_mask = attention_mask.unsqueeze(1)?.unsqueeze(2)?;
+        let pairwise_attention_mask = extended_attention_mask
+            .broadcast_mul(&extended_attention_mask.squeeze(2)?.unsqueeze(3)?)?;
+        let pairwise_attention_mask = pairwise_attention_mask.broadcast_as((
+            pairwise_attention_mask.dims()[0],
+            self.encoder.num_attention_heads,
+            pairwise_attention_mask.dims()[2],
+            pairwise_attention_mask.dims()[3],
+        ))?;
+        let attention_mask = pairwise_attention_mask.to_dtype(DType::F32)?;
+        let attention_mask = (attention_mask.ones_like()? - &attention_mask)?
+            .broadcast_mul(&Tensor::try_from(f32::MIN)?.to_device(attention_mask.device())?)?;
+
+        let rel_embeddings = self.rel_states();
+        let mut hidden = embedding_output;
+        // stages[i] alternates: layer input, layer output (inputs reused).
+        let rel_idx = match rel_embeddings.as_ref() {
+            Some(rel) => {
+                let (batch_size, seq_len, _) = hidden.dims3()?;
+                Some(RelPositionIndex::build(
+                    batch_size,
+                    seq_len,
+                    self.encoder.num_attention_heads,
+                    rel.dims()[0] / 2,
+                    input_ids.device(),
+                )?)
+            }
+            None => None,
+        };
+        for layer in &self.encoder.layers {
+            hidden = layer.forward(
+                &hidden,
+                &attention_mask,
+                rel_embeddings.as_ref(),
+                rel_idx.as_ref(),
+            )?;
+            stages.push(hidden.clone()); // layer output (== next layer input)
+        }
+        Ok(stages)
+    }
+}
+
+impl DebertaV3Model {
+    /// Per-layer sub-stages for parity bisection:
+    /// `[(selfattn_context, attn_out, ffn_gelu, layer_out); num_layers]`.
+    pub fn forward_substages(
+        &self,
+        input_ids: &Tensor,
+        attention_mask: Option<&Tensor>,
+    ) -> Result<Vec<(Tensor, Tensor, Tensor, Tensor)>> {
+        let embedding_output = self.embeddings.forward(input_ids)?;
 
         let attention_mask = match attention_mask {
             Some(mask) => mask.clone(),
@@ -690,18 +785,27 @@ impl DebertaV3Model {
             }
             None => None,
         };
+        let mut stages = Vec::with_capacity(self.encoder.layers.len());
         for layer in &self.encoder.layers {
-            hidden = layer.forward(
+            let st = layer.forward_dbg(
                 &hidden,
                 &attention_mask,
                 rel_embeddings.as_ref(),
                 rel_idx.as_ref(),
             )?;
-            stages.push(hidden.clone());
+            hidden = st.3.clone();
+            stages.push(st);
         }
-        stages.push(hidden);
         Ok(stages)
     }
+}
+
+/// Exact (erf-based) GELU, matching `torch.nn.functional.gelu` and HF's
+/// `ACT2FN["gelu"]`.
+fn gelu_erf(x: &Tensor) -> Result<Tensor> {
+    let half = x.affine(0.5, 0.0)?;
+    let inner = x.affine(std::f64::consts::FRAC_1_SQRT_2, 0.0)?.erf()?;
+    half * (inner.affine(1.0, 1.0)?)
 }
 
 /// Gather along the last dimension with the output written transposed.
@@ -716,8 +820,16 @@ fn gather_last_dim_transposed(input: &Tensor, indices: &Tensor) -> Result<Tensor
     let (b, h, l, p) = input.dims4()?;
     let o = indices.dims()[3];
 
-    let src = input.to_dtype(DType::F32)?.contiguous()?.flatten_all()?.to_vec1::<f32>()?;
-    let idx = indices.to_dtype(DType::U32)?.contiguous()?.flatten_all()?.to_vec1::<u32>()?;
+    let src = input
+        .to_dtype(DType::F32)?
+        .contiguous()?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
+    let idx = indices
+        .to_dtype(DType::U32)?
+        .contiguous()?
+        .flatten_all()?
+        .to_vec1::<u32>()?;
 
     let mut out = vec![0f32; b * h * l * o];
     for bh in 0..b * h {
@@ -747,8 +859,16 @@ fn gather_along_last_dim(input: &Tensor, indices: &Tensor) -> Result<Tensor> {
     let (b, h, l, p) = input.dims4()?;
     let o = indices.dims()[3];
 
-    let src = input.to_dtype(DType::F32)?.contiguous()?.flatten_all()?.to_vec1::<f32>()?;
-    let idx = indices.to_dtype(DType::U32)?.contiguous()?.flatten_all()?.to_vec1::<u32>()?;
+    let src = input
+        .to_dtype(DType::F32)?
+        .contiguous()?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
+    let idx = indices
+        .to_dtype(DType::U32)?
+        .contiguous()?
+        .flatten_all()?
+        .to_vec1::<u32>()?;
 
     let mut out = vec![0f32; b * h * l * o];
     for bh in 0..b * h {

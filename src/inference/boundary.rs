@@ -8,11 +8,11 @@
 use std::collections::{HashMap, HashSet};
 
 use candle_core::Tensor;
-use serde_json::{json, Value as JsonValue};
+use serde_json::{Value as JsonValue, json};
 
 use crate::batch::preprocessed::PreprocessedBatch;
 use crate::error::{GlinerError, Result};
-use crate::model::boundary::{BoundaryModel, RecordDecoder, MASK_LOGIT};
+use crate::model::boundary::{BoundaryModel, MASK_LOGIT, RecordDecoder};
 use crate::schema::types::AttributeGroup;
 
 /// Resolved span-attribute metadata for one extraction call.
@@ -171,7 +171,12 @@ pub(crate) fn extract_sample(
     // --- Score --------------------------------------------------------------
     let scored = boundary.score_sample(&text_states, text_len, &query_states)?;
     if std::env::var("GLINER2_PROFILE").is_ok() {
-        eprintln!("PROFILE   score_sample={:?} q={} text_len={}", t0.elapsed(), specs.len(), text_len);
+        eprintln!(
+            "PROFILE   score_sample={:?} q={} text_len={}",
+            t0.elapsed(),
+            specs.len(),
+            text_len
+        );
     }
 
     // --- Decode per group -----------------------------------------------------
@@ -184,12 +189,12 @@ pub(crate) fn extract_sample(
     for (group, task) in task_types.iter().enumerate() {
         match task.as_str() {
             "entities" => {
-                let attr_prompts: HashSet<&str> = attrs
-                    .map(|a| a.prompt_labels())
-                    .unwrap_or_default();
-                let has_attributes = attrs.map_or(false, |a| !a.is_empty());
+                let attr_prompts: HashSet<&str> =
+                    attrs.map(|a| a.prompt_labels()).unwrap_or_default();
+                let has_attributes = attrs.is_some_and(|a| !a.is_empty());
 
                 // name -> (entries, token coords per entry)
+                #[allow(clippy::type_complexity)]
                 let mut decoded_entities: Vec<(
                     String,
                     Vec<JsonValue>,
@@ -211,9 +216,8 @@ pub(crate) fn extract_sample(
                     }
                     // Boundary default overlap policy "flat": keep the
                     // maximum-total-score non-overlapping subset.
-                    let resolved = resolve_flat_spans(
-                        hits.into_iter().map(|(st, e, p)| (p, st, e)).collect(),
-                    );
+                    let resolved =
+                        resolve_flat_spans(hits.into_iter().map(|(st, e, p)| (p, st, e)).collect());
                     hits = resolved.into_iter().map(|(p, st, e)| (st, e, p)).collect();
                     if hits.is_empty() {
                         continue;
@@ -285,9 +289,10 @@ pub(crate) fn extract_sample(
                 )?;
             }
             "records" => {
-                if let (Some(rd), Some(cand_states)) =
-                    (boundary.record_decoder.as_ref(), scored.candidate_states.as_ref())
-                {
+                if let (Some(rd), Some(cand_states)) = (
+                    boundary.record_decoder.as_ref(),
+                    scored.candidate_states.as_ref(),
+                ) {
                     let group_specs: Vec<&QuerySpec> =
                         specs.iter().filter(|s| s.group == group).collect();
                     if !group_specs.is_empty() {
@@ -300,20 +305,18 @@ pub(crate) fn extract_sample(
                             .map(|(&s, &e)| (s, e))
                             .collect();
                         let flat_queries: Vec<Vec<f32>> = {
-                            let rows = query_states
+                            query_states
                                 .to_vec2::<f32>()
-                                .map_err(|e| GlinerError::inference(format!("{e}")))?;
-                            rows
+                                .map_err(|e| GlinerError::inference(format!("{e}")))?
                         };
                         let c_valid = scored.valid.clone();
-                        let (obj_logits, assign_logits, inst_spans) =
-                            rd.forward_group(
-                                &flat_queries,
-                                cand_states,
-                                &cand_spans,
-                                &c_valid,
-                                &field_qids,
-                            )?;
+                        let (obj_logits, assign_logits, inst_spans) = rd.forward_group(
+                            &flat_queries,
+                            cand_states,
+                            &cand_spans,
+                            &c_valid,
+                            &field_qids,
+                        )?;
                         let decoded = RecordDecoder::decode_group(
                             &obj_logits,
                             &assign_logits,
@@ -363,121 +366,115 @@ pub(crate) fn extract_sample(
                     let word_states: Vec<Vec<f32>> = text_states
                         .to_vec2::<f32>()
                         .map_err(|e| GlinerError::inference(format!("{e}")))?;
-                        // Find the relation spec for this group.
-                        if let Some(rel) = relation_specs.iter().find(|r| r.group == group) {
-                            let head_qid = rel.head_qid;
-                            let tail_qid = rel.tail_qid;
-                            if head_qid < q && tail_qid < q {
-                                // Build relation query state (directional concat).
-                                let qr: Vec<f32> = {
-                                    let rows = query_states
-                                        .to_vec2::<f32>()
-                                        .map_err(|e| GlinerError::inference(format!("{e}")))?;
-                                    let mut r = Vec::with_capacity(2 * h);
-                                    r.extend_from_slice(&rows[head_qid]);
-                                    r.extend_from_slice(&rows[tail_qid]);
-                                    r
-                                };
-                                // Collect head/tail candidates by their per-query scores.
-                                let mut head_cands: Vec<(usize, f32)> = Vec::new();
-                                let mut tail_cands: Vec<(usize, f32)> = Vec::new();
-                                for ci in 0..scored.valid.len() {
-                                    if !scored.valid[ci] {
-                                        continue;
-                                    }
-                                    let s_h = sigmoid(scored.scores[ci][head_qid]);
-                                    let s_t = sigmoid(scored.scores[ci][tail_qid]);
-                                    if s_h >= threshold {
-                                        head_cands.push((ci, s_h));
-                                    }
-                                    if s_t >= threshold {
-                                        tail_cands.push((ci, s_t));
-                                    }
+                    // Find the relation spec for this group.
+                    if let Some(rel) = relation_specs.iter().find(|r| r.group == group) {
+                        let head_qid = rel.head_qid;
+                        let tail_qid = rel.tail_qid;
+                        if head_qid < q && tail_qid < q {
+                            // Build relation query state (directional concat).
+                            let qr: Vec<f32> = {
+                                let rows = query_states
+                                    .to_vec2::<f32>()
+                                    .map_err(|e| GlinerError::inference(format!("{e}")))?;
+                                let mut r = Vec::with_capacity(2 * h);
+                                r.extend_from_slice(&rows[head_qid]);
+                                r.extend_from_slice(&rows[tail_qid]);
+                                r
+                            };
+                            // Collect head/tail candidates by their per-query scores.
+                            let mut head_cands: Vec<(usize, f32)> = Vec::new();
+                            let mut tail_cands: Vec<(usize, f32)> = Vec::new();
+                            for ci in 0..scored.valid.len() {
+                                if !scored.valid[ci] {
+                                    continue;
                                 }
-                                // Sort descending by score, take top-K.
-                                head_cands.sort_by(|a, b| {
-                                    b.1.partial_cmp(&a.1)
-                                        .unwrap_or(std::cmp::Ordering::Equal)
-                                });
-                                tail_cands.sort_by(|a, b| {
-                                    b.1.partial_cmp(&a.1)
-                                        .unwrap_or(std::cmp::Ordering::Equal)
-                                });
-                                let max_pairs_per_type = 32;
-                                head_cands.truncate(max_pairs_per_type);
-                                tail_cands.truncate(max_pairs_per_type);
-
-                                // Generate all head×tail pairs, skip self-loops.
-                                let mut pair_heads: Vec<(usize, usize)> = Vec::new();
-                                let mut pair_tails: Vec<(usize, usize)> = Vec::new();
-                                for &(hi, _) in &head_cands {
-                                    for &(ti, _) in &tail_cands {
-                                        let hs = (scored.starts[hi], scored.ends[hi]);
-                                        let ts = (scored.starts[ti], scored.ends[ti]);
-                                        if hs == ts {
-                                            continue; // no self-loops
-                                        }
-                                        pair_heads.push(hs);
-                                        pair_tails.push(ts);
-                                    }
+                                let s_h = sigmoid(scored.scores[ci][head_qid]);
+                                let s_t = sigmoid(scored.scores[ci][tail_qid]);
+                                if s_h >= threshold {
+                                    head_cands.push((ci, s_h));
                                 }
-                                if !pair_heads.is_empty() {
-                                    let pair_scores = rs.forward(
-                                        &word_states,
-                                        &qr,
-                                        &pair_heads,
-                                        &pair_tails,
-                                        text_len,
-                                    )?;
-                                    // Decode pairs above threshold.
-                                    let mut entries: Vec<JsonValue> = Vec::new();
-                                    for (idx, &score) in pair_scores.iter().enumerate() {
-                                        let prob = sigmoid(score);
-                                        if prob < threshold {
-                                            continue;
-                                        }
-                                        let (hs, he) = pair_heads[idx];
-                                        let (ts, te) = pair_tails[idx];
-                                        let cs_h = char_offset(starts_map, hs.min(text_len.saturating_sub(1)));
-                                        let ce_h = char_offset(
-                                            ends_map,
-                                            (he - 1).min(text_len - 1),
-                                        );
-                                        let cs_t = char_offset(starts_map, ts.min(text_len.saturating_sub(1)));
-                                        let ce_t = char_offset(
-                                            ends_map,
-                                            (te - 1).min(text_len - 1),
-                                        );
-                                        let head_text = safe_slice(original_text, cs_h, ce_h);
-                                        let tail_text = safe_slice(original_text, cs_t, ce_t);
-                                        // Output shape mirrors the Python decoder:
-                                        // spans > confidence-only > bare pairs.
-                                        let obj = if include_spans {
-                                            let mut o = json!({
-                                                "head": {"text": head_text, "start": cs_h, "end": ce_h},
-                                                "tail": {"text": tail_text, "start": cs_t, "end": ce_t},
-                                            });
-                                            if include_confidence {
-                                                let conf = json!(prob);
-                                                o["head"]["confidence"] = conf.clone();
-                                                o["tail"]["confidence"] = conf;
-                                            }
-                                            o
-                                        } else if include_confidence {
-                                            json!({
-                                                "head": {"text": head_text, "confidence": prob},
-                                                "tail": {"text": tail_text, "confidence": prob},
-                                            })
-                                        } else {
-                                            json!([head_text, tail_text])
-                                        };
-                                        entries.push(obj);
-                                    }
-                                    let task_name = rel.relation_name.clone();
-                                    result.insert(task_name, JsonValue::Array(entries));
+                                if s_t >= threshold {
+                                    tail_cands.push((ci, s_t));
                                 }
                             }
+                            // Sort descending by score, take top-K.
+                            head_cands.sort_by(|a, b| {
+                                b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+                            });
+                            tail_cands.sort_by(|a, b| {
+                                b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+                            });
+                            let max_pairs_per_type = 32;
+                            head_cands.truncate(max_pairs_per_type);
+                            tail_cands.truncate(max_pairs_per_type);
+
+                            // Generate all head×tail pairs, skip self-loops.
+                            let mut pair_heads: Vec<(usize, usize)> = Vec::new();
+                            let mut pair_tails: Vec<(usize, usize)> = Vec::new();
+                            for &(hi, _) in &head_cands {
+                                for &(ti, _) in &tail_cands {
+                                    let hs = (scored.starts[hi], scored.ends[hi]);
+                                    let ts = (scored.starts[ti], scored.ends[ti]);
+                                    if hs == ts {
+                                        continue; // no self-loops
+                                    }
+                                    pair_heads.push(hs);
+                                    pair_tails.push(ts);
+                                }
+                            }
+                            if !pair_heads.is_empty() {
+                                let pair_scores = rs.forward(
+                                    &word_states,
+                                    &qr,
+                                    &pair_heads,
+                                    &pair_tails,
+                                    text_len,
+                                )?;
+                                // Decode pairs above threshold.
+                                let mut entries: Vec<JsonValue> = Vec::new();
+                                for (idx, &score) in pair_scores.iter().enumerate() {
+                                    let prob = sigmoid(score);
+                                    if prob < threshold {
+                                        continue;
+                                    }
+                                    let (hs, he) = pair_heads[idx];
+                                    let (ts, te) = pair_tails[idx];
+                                    let cs_h =
+                                        char_offset(starts_map, hs.min(text_len.saturating_sub(1)));
+                                    let ce_h = char_offset(ends_map, (he - 1).min(text_len - 1));
+                                    let cs_t =
+                                        char_offset(starts_map, ts.min(text_len.saturating_sub(1)));
+                                    let ce_t = char_offset(ends_map, (te - 1).min(text_len - 1));
+                                    let head_text = safe_slice(original_text, cs_h, ce_h);
+                                    let tail_text = safe_slice(original_text, cs_t, ce_t);
+                                    // Output shape mirrors the Python decoder:
+                                    // spans > confidence-only > bare pairs.
+                                    let obj = if include_spans {
+                                        let mut o = json!({
+                                            "head": {"text": head_text, "start": cs_h, "end": ce_h},
+                                            "tail": {"text": tail_text, "start": cs_t, "end": ce_t},
+                                        });
+                                        if include_confidence {
+                                            let conf = json!(prob);
+                                            o["head"]["confidence"] = conf.clone();
+                                            o["tail"]["confidence"] = conf;
+                                        }
+                                        o
+                                    } else if include_confidence {
+                                        json!({
+                                            "head": {"text": head_text, "confidence": prob},
+                                            "tail": {"text": tail_text, "confidence": prob},
+                                        })
+                                    } else {
+                                        json!([head_text, tail_text])
+                                    };
+                                    entries.push(obj);
+                                }
+                                let task_name = rel.relation_name.clone();
+                                result.insert(task_name, JsonValue::Array(entries));
+                            }
                         }
+                    }
                 }
             }
             _ => {}
@@ -502,8 +499,7 @@ fn decode_classification(
     let Some(classifier) = boundary.classifier_ref() else {
         return Ok(());
     };
-    let group_specs: Vec<&QuerySpec> =
-        specs.iter().filter(|s| s.group == group).collect();
+    let group_specs: Vec<&QuerySpec> = specs.iter().filter(|s| s.group == group).collect();
     if group_specs.is_empty() {
         return Ok(());
     }
@@ -582,15 +578,12 @@ fn decode_classification(
 /// boundary-architecture default policy `flat`/`disallow`: exact-boundary
 /// duplicates collapse to their highest-ranked representative, then weighted
 /// interval scheduling maximizes total score with deterministic tie-breaking.
-fn resolve_flat_spans(
-    mut hits: Vec<(f32, usize, usize)>,
-) -> Vec<(f32, usize, usize)> {
+fn resolve_flat_spans(hits: Vec<(f32, usize, usize)>) -> Vec<(f32, usize, usize)> {
     if hits.is_empty() {
         return hits;
     }
     // Rank: descending score, ascending start/end, original order last.
-    let mut ranked: Vec<(usize, (f32, usize, usize))> =
-        hits.iter().cloned().enumerate().collect();
+    let mut ranked: Vec<(usize, (f32, usize, usize))> = hits.iter().cloned().enumerate().collect();
     ranked.sort_by(|a, b| {
         let (_, (sa, sta, ena)) = a;
         let (_, (sb, stb, enb)) = b;
@@ -603,7 +596,7 @@ fn resolve_flat_spans(
     let mut distinct: Vec<(usize, (f32, usize, usize))> = Vec::new();
     let mut seen: HashSet<(usize, usize)> = HashSet::new();
     for row in ranked {
-        let key = (row.1 .1, row.1 .2);
+        let key = (row.1.1, row.1.2);
         if seen.insert(key) {
             distinct.push(row);
         }
@@ -617,15 +610,21 @@ fn resolve_flat_spans(
         let (_, (_, sb, eb)) = &distinct[b];
         ea.cmp(eb)
             .then(sa.cmp(sb))
-            .then(distinct[b].1 .0.partial_cmp(&distinct[a].1 .0).unwrap_or(std::cmp::Ordering::Equal))
+            .then(
+                distinct[b]
+                    .1
+                    .0
+                    .partial_cmp(&distinct[a].1.0)
+                    .unwrap_or(std::cmp::Ordering::Equal),
+            )
             .then(a.cmp(&b))
     });
-    let ends: Vec<usize> = by_end.iter().map(|&i| distinct[i].1 .2).collect();
+    let ends: Vec<usize> = by_end.iter().map(|&i| distinct[i].1.2).collect();
 
     // Predecessors: rightmost interval ending <= start(i).
     let mut preds = vec![usize::MAX; n];
     for (i, &idx) in by_end.iter().enumerate() {
-        let start_i = distinct[idx].1 .1;
+        let start_i = distinct[idx].1.1;
         // bisect_right(ends, start_i, 0, i) - 1
         let mut lo = 0usize;
         let mut hi = i;
@@ -640,11 +639,13 @@ fn resolve_flat_spans(
         preds[i] = lo.wrapping_sub(1); // usize::MAX when lo == 0
     }
 
-    fn rank_key(row: &(usize, (f32, usize, usize))) -> (std::cmp::Reverse<u32>, usize, usize, usize) {
+    fn rank_key(
+        row: &(usize, (f32, usize, usize)),
+    ) -> (std::cmp::Reverse<u32>, usize, usize, usize) {
         // Approximate -score ordering via partial_cmp on f32 is unstable to
         // hash; compare through Reverse of bit pattern for total order.
-        let bits = row.1 .0.to_bits();
-        (std::cmp::Reverse(bits), row.1 .1, row.1 .2, row.0)
+        let bits = row.1.0.to_bits();
+        (std::cmp::Reverse(bits), row.1.1, row.1.2, row.0)
     }
 
     // best[i] holds (total_score, selection as sorted-by-rank index vector).
@@ -662,7 +663,7 @@ fn resolve_flat_spans(
         let (prev_score, prev_sel) = &best[preds[i].wrapping_add(1).min(best.len() - 1)];
         let mut with_sel = prev_sel.clone();
         with_sel.push(i);
-        let with_score = prev_score + distinct[idx].1 .0 as f64;
+        let with_score = prev_score + distinct[idx].1.0 as f64;
         let (without_score, without_sel) = &best[i];
 
         let take = if with_score > *without_score {
@@ -684,7 +685,7 @@ fn resolve_flat_spans(
     let final_selection = std::mem::take(&mut best[n].1);
     final_selection
         .into_iter()
-        .map(|i| distinct[by_end[i]].clone())
+        .map(|i| distinct[by_end[i]])
         .map(|(_, item)| item)
         .collect()
 }
@@ -696,6 +697,7 @@ fn resolve_flat_spans(
 /// are scored against every configured attribute query via the explicit-spans
 /// primitive, then reduced per group (sigmoid for multi_label, softmax
 /// otherwise).
+#[allow(clippy::type_complexity)]
 fn attach_entity_attributes(
     boundary: &BoundaryModel,
     text_states: &Tensor,
@@ -732,8 +734,8 @@ fn attach_entity_attributes(
     let mut pair_index: HashMap<(usize, usize), usize> = HashMap::new();
     for (_, _, coords) in decoded_entities.iter() {
         for &coord in coords {
-            if !pair_index.contains_key(&coord) {
-                pair_index.insert(coord, pairs.len());
+            if let std::collections::hash_map::Entry::Vacant(e) = pair_index.entry(coord) {
+                e.insert(pairs.len());
                 pairs.push(coord);
             }
         }
@@ -754,7 +756,8 @@ fn attach_entity_attributes(
     let attr_query_states = Tensor::from_slice(&flat, (attr_rows.len(), h), query_states.device())
         .map_err(|e| GlinerError::inference(format!("{e}")))?;
 
-    let logits = boundary.score_explicit_spans(text_states, text_len, &attr_query_states, &pairs)?;
+    let logits =
+        boundary.score_explicit_spans(text_states, text_len, &attr_query_states, &pairs)?;
 
     // Attach per entity entry.
     for (entity_name, entries, coords) in decoded_entities.iter_mut() {
@@ -768,10 +771,10 @@ fn attach_entity_attributes(
                 None => continue,
             };
             for (group_name, group) in &attrs.groups {
-                if let Some(applies_to) = &group.applies_to {
-                    if !applies_to.contains(entity_name) {
-                        continue;
-                    }
+                if let Some(applies_to) = &group.applies_to
+                    && !applies_to.contains(entity_name)
+                {
+                    continue;
                 }
                 let present: Vec<(&str, f32)> = group
                     .labels
@@ -790,15 +793,13 @@ fn attach_entity_attributes(
                         .iter()
                         .filter_map(|&(label, value)| {
                             let prob = sigmoid(value);
-                            (prob >= group.threshold).then(|| {
-                                json!({"label": label, "confidence": prob})
-                            })
+                            (prob >= group.threshold)
+                                .then(|| json!({"label": label, "confidence": prob}))
                         })
                         .collect();
                     obj.insert(group_name.clone(), JsonValue::Array(values));
                 } else {
-                    let probs: Vec<f32> =
-                        present.iter().map(|&(_, v)| sigmoid(v)).collect();
+                    let probs: Vec<f32> = present.iter().map(|&(_, v)| sigmoid(v)).collect();
                     let best = probs
                         .iter()
                         .enumerate()
@@ -806,11 +807,11 @@ fn attach_entity_attributes(
                         .map(|(i, _)| i)
                         .unwrap_or(0);
                     // Softmax over raw logits.
-                    let max_logit = present.iter().map(|&(_, v)| v).fold(f32::NEG_INFINITY, f32::max);
-                    let sum_exp: f32 = present
+                    let max_logit = present
                         .iter()
-                        .map(|&(_, v)| (v - max_logit).exp())
-                        .sum();
+                        .map(|&(_, v)| v)
+                        .fold(f32::NEG_INFINITY, f32::max);
+                    let sum_exp: f32 = present.iter().map(|&(_, v)| (v - max_logit).exp()).sum();
                     let best_prob = (present[best].1 - max_logit).exp() / sum_exp;
                     obj.insert(
                         group_name.clone(),
@@ -830,7 +831,10 @@ fn text_word_positions(
     _seq_len: usize,
 ) -> Result<Vec<usize>> {
     // The collator records first-subword positions per whitespace word.
-    let count = *batch.text_word_counts.get(sample_idx).ok_or_else(|| GlinerError::inference("missing text word count"))?;
+    let count = *batch
+        .text_word_counts
+        .get(sample_idx)
+        .ok_or_else(|| GlinerError::inference("missing text word count"))?;
     // Recompute positions from mapped indices is unreliable here; instead read
     // the tensor the collator produced.
     let tensor = batch
@@ -848,18 +852,13 @@ fn text_word_positions(
 }
 
 fn char_offset(mapping: Option<&[usize]>, word_idx: usize) -> usize {
-    mapping
-        .and_then(|m| m.get(word_idx))
-        .copied()
-        .unwrap_or(0)
+    mapping.and_then(|m| m.get(word_idx)).copied().unwrap_or(0)
 }
 
 fn safe_slice(text: &str, start: usize, end: usize) -> String {
     let end = end.min(text.len());
     let start = start.min(end);
-    text.get(start..end)
-        .map(str::to_string)
-        .unwrap_or_default()
+    text.get(start..end).map(str::to_string).unwrap_or_default()
 }
 
 fn sigmoid(x: f32) -> f32 {

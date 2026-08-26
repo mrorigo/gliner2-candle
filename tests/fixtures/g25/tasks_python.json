@@ -1,0 +1,71 @@
+{
+ "classification": {
+  "sentiment": "positive"
+ },
+ "relation": {
+  "entities": {
+   "person": [
+    "Tim Cook"
+   ],
+   "company": [
+    "Apple"
+   ]
+  },
+  "relation_extraction": {
+   "works_for": [
+    [
+     "Tim Cook",
+     "Apple"
+    ]
+   ]
+  }
+ },
+ "record": {
+  "employee": [
+   {
+    "name": [
+     "Tim Cook"
+    ],
+    "employer": [
+     "Apple"
+    ]
+   }
+  ],
+  "entities": {
+   "person": [
+    "Tim Cook"
+   ],
+   "employer": [
+    "Apple"
+   ]
+  }
+ },
+ "attr_single": {
+  "entities": {
+   "person": [
+    {
+     "text": "Tim Cook",
+     "mood": {
+      "label": "happy",
+      "confidence": 0.9966161847114563
+     }
+    }
+   ]
+  }
+ },
+ "attr_multi": {
+  "entities": {
+   "person": [
+    {
+     "text": "Tim Cook",
+     "skills": [
+      {
+       "label": "leader",
+       "confidence": 0.5735862851142883
+      }
+     ]
+    }
+   ]
+  }
+ }
+}

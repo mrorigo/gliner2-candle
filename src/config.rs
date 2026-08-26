@@ -169,19 +169,15 @@ impl std::str::FromStr for HiddenActivation {
 /// this with boundary prediction (start/end/inside scoring plus a reranker).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum Architecture {
     /// Original GLiNER2 span-enumeration architecture.
     #[serde(rename = "gliner2")]
+    #[default]
     Gliner2,
     /// GLiNER2.5 boundary-prediction architecture ("boundary" in HF config).
     #[serde(rename = "gliner2.5")]
     Gliner25,
-}
-
-impl Default for Architecture {
-    fn default() -> Self {
-        Self::Gliner2
-    }
 }
 
 impl Architecture {
@@ -229,6 +225,22 @@ impl Architecture {
 ///
 /// These mirror the `boundary_head` section of the upstream `config.json`;
 /// training-only knobs (loss weights, sampling budgets) are ignored.
+fn default_true() -> bool {
+    true
+}
+
+fn default_rotary_base() -> f64 {
+    10_000.0
+}
+
+fn default_multihead_heads() -> usize {
+    8
+}
+
+/// Inference-relevant settings of the GLiNER2.5 boundary head.
+///
+/// These mirror the `boundary_head` section of the upstream `config.json`;
+/// training-only knobs (loss weights, sampling budgets) are ignored.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct BoundaryConfig {
@@ -262,6 +274,19 @@ pub struct BoundaryConfig {
     pub enable_span_content: bool,
     /// Abstention threshold for boundary scores.
     pub abstention_threshold: f32,
+    /// Rotary endpoint embeddings (explicit-spans / reranker paths).
+    #[serde(default = "default_true")]
+    pub enable_rotary_endpoints: bool,
+    #[serde(default = "default_rotary_base")]
+    pub rotary_base: f64,
+    #[serde(default = "default_true")]
+    pub reranker_endpoint_compat: bool,
+    #[serde(default = "default_true")]
+    pub endpoint_difference_features: bool,
+    #[serde(default = "default_true")]
+    pub query_conditioned_inside_weight: bool,
+    #[serde(default = "default_multihead_heads")]
+    pub multihead_pair_compat_heads: usize,
 }
 
 impl Default for BoundaryConfig {
@@ -282,6 +307,12 @@ impl Default for BoundaryConfig {
             use_inside_evidence: true,
             enable_span_content: true,
             abstention_threshold: 0.5,
+            enable_rotary_endpoints: true,
+            rotary_base: 10_000.0,
+            reranker_endpoint_compat: true,
+            endpoint_difference_features: true,
+            query_conditioned_inside_weight: true,
+            multihead_pair_compat_heads: 8,
         }
     }
 }
@@ -295,8 +326,7 @@ impl BoundaryConfig {
         {
             let get_usize = |key: &str| bh.get(key).and_then(|x| x.as_u64()).map(|x| x as usize);
             let get_f32 = |key: &str| bh.get(key).and_then(|x| x.as_f64()).map(|x| x as f32);
-            let get_bool =
-                |key: &str| bh.get(key).and_then(|x| x.as_bool());
+            let get_bool = |key: &str| bh.get(key).and_then(|x| x.as_bool());
             if let Some(x) = get_usize("boundary_dim") {
                 config.boundary_dim = x;
             }

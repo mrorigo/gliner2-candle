@@ -130,8 +130,8 @@ pub fn remap_result_spans(result: &mut JsonValue, original_text: &str, chunk: &T
             if is_span_dict(map) {
                 let start = map.get("start").and_then(|v| v.as_u64()).unwrap_or(0) as usize
                     + chunk.start_char;
-                let end =
-                    map.get("end").and_then(|v| v.as_u64()).unwrap_or(0) as usize + chunk.start_char;
+                let end = map.get("end").and_then(|v| v.as_u64()).unwrap_or(0) as usize
+                    + chunk.start_char;
                 map.insert("start".to_string(), JsonValue::from(start));
                 map.insert("end".to_string(), JsonValue::from(end));
                 if end <= original_text.len() && start <= end {
@@ -177,7 +177,11 @@ pub fn merge_chunk_results(
     }
 
     let merged = merge_objects(&chunk_results, policy)?;
-    Ok(strip_span_metadata(&merged, include_confidence, include_spans))
+    Ok(strip_span_metadata(
+        &merged,
+        include_confidence,
+        include_spans,
+    ))
 }
 
 fn merge_objects(results: &[JsonValue], policy: MergePolicy) -> Result<JsonValue> {
@@ -238,7 +242,11 @@ fn merge_entity_values(values: &[JsonValue], policy: MergePolicy) -> JsonValue {
 fn merge_generic_values(values: &[JsonValue], policy: MergePolicy) -> JsonValue {
     let non_empty: Vec<&JsonValue> = values
         .iter()
-        .filter(|v| !v.is_null() && *v != &JsonValue::Object(Default::default()) && *v != &JsonValue::Array(vec![]))
+        .filter(|v| {
+            !v.is_null()
+                && *v != &JsonValue::Object(Default::default())
+                && *v != &JsonValue::Array(vec![])
+        })
         .collect();
     if non_empty.is_empty() {
         return values.first().cloned().unwrap_or(JsonValue::Null);
@@ -257,7 +265,7 @@ fn merge_generic_values(values: &[JsonValue], policy: MergePolicy) -> JsonValue 
                 ca.partial_cmp(&cb).unwrap_or(std::cmp::Ordering::Equal)
             })
             .cloned()
-            .map(|v| v.clone())
+            .cloned()
             .unwrap_or_else(|| (*non_empty[0]).clone());
     }
     if non_empty.iter().all(|v| v.is_array()) {
@@ -288,10 +296,7 @@ fn merge_nested_dicts(values: &[&JsonValue], policy: MergePolicy) -> JsonValue {
     }
     let mut out = serde_json::Map::new();
     for key in keys {
-        let vals: Vec<JsonValue> = values
-            .iter()
-            .filter_map(|v| v.get(&key).cloned())
-            .collect();
+        let vals: Vec<JsonValue> = values.iter().filter_map(|v| v.get(&key).cloned()).collect();
         out.insert(key, merge_generic_values(&vals, policy));
     }
     JsonValue::Object(out)
@@ -373,7 +378,11 @@ fn resolve_overlaps(mut items: Vec<SpanItem>, policy: MergePolicy) -> Vec<SpanIt
                     })
                 })
                 .collect();
-            distinct.into_iter().zip(keep_mask).filter_map(|(it, k)| k.then_some(it)).collect()
+            distinct
+                .into_iter()
+                .zip(keep_mask)
+                .filter_map(|(it, k)| k.then_some(it))
+                .collect()
         }
         MergePolicy::HighestConfidence => {
             // Weighted interval scheduling maximizing total confidence.
@@ -402,7 +411,11 @@ fn resolve_overlaps(mut items: Vec<SpanItem>, policy: MergePolicy) -> Vec<SpanIt
             let mut best_score = vec![0.0f32; n + 1];
             let mut take = vec![false; n];
             for rank in 0..n {
-                let prev_rank = if pred_rank[rank] == NONE { 0 } else { pred_rank[rank] + 1 };
+                let prev_rank = if pred_rank[rank] == NONE {
+                    0
+                } else {
+                    pred_rank[rank] + 1
+                };
                 let with = best_score[prev_rank] + distinct[order[rank]].confidence;
                 let without = best_score[rank];
                 if with > without {
@@ -418,7 +431,11 @@ fn resolve_overlaps(mut items: Vec<SpanItem>, policy: MergePolicy) -> Vec<SpanIt
             while rank > 0 {
                 if take[rank - 1] {
                     selected.insert(order[rank - 1]);
-                    rank = if pred_rank[rank - 1] == NONE { 0 } else { pred_rank[rank - 1] + 1 };
+                    rank = if pred_rank[rank - 1] == NONE {
+                        0
+                    } else {
+                        pred_rank[rank - 1] + 1
+                    };
                 } else {
                     rank -= 1;
                 }
@@ -458,10 +475,7 @@ fn dedupe_items(items: Vec<JsonValue>, policy: MergePolicy) -> JsonValue {
     let mut span_items: Vec<JsonValue> = Vec::new();
     let mut others: Vec<JsonValue> = Vec::new();
     for item in items {
-        let is_span = item
-            .as_object()
-            .map(is_span_dict)
-            .unwrap_or(false);
+        let is_span = item.as_object().map(is_span_dict).unwrap_or(false);
         if is_span {
             span_items.push(item);
         } else {
@@ -476,8 +490,12 @@ fn dedupe_items(items: Vec<JsonValue>, policy: MergePolicy) -> JsonValue {
     out.sort_by(|a, b| {
         let sa = a["start"].as_u64().unwrap_or(0);
         let sb = b["start"].as_u64().unwrap_or(0);
-        sa.cmp(&sb)
-            .then(a["end"].as_u64().unwrap_or(0).cmp(&b["end"].as_u64().unwrap_or(0)))
+        sa.cmp(&sb).then(
+            a["end"]
+                .as_u64()
+                .unwrap_or(0)
+                .cmp(&b["end"].as_u64().unwrap_or(0)),
+        )
     });
 
     // Non-span items: canonical-key dedupe keeping the higher-confidence copy.
@@ -490,9 +508,7 @@ fn dedupe_items(items: Vec<JsonValue>, policy: MergePolicy) -> JsonValue {
                 out.push(item);
             }
             Some(&idx) => {
-                if representative_confidence(&item)
-                    > representative_confidence(&out[idx])
-                {
+                if representative_confidence(&item) > representative_confidence(&out[idx]) {
                     out[idx] = item;
                 }
             }
@@ -501,11 +517,18 @@ fn dedupe_items(items: Vec<JsonValue>, policy: MergePolicy) -> JsonValue {
     JsonValue::Array(out)
 }
 
-fn strip_span_metadata(value: &JsonValue, include_confidence: bool, include_spans: bool) -> JsonValue {
+fn strip_span_metadata(
+    value: &JsonValue,
+    include_confidence: bool,
+    include_spans: bool,
+) -> JsonValue {
     match value {
-        JsonValue::Array(items) => {
-            JsonValue::Array(items.iter().map(|i| strip_span_metadata(i, include_confidence, include_spans)).collect())
-        }
+        JsonValue::Array(items) => JsonValue::Array(
+            items
+                .iter()
+                .map(|i| strip_span_metadata(i, include_confidence, include_spans))
+                .collect(),
+        ),
         JsonValue::Object(map) => {
             if is_span_dict(map) && !include_spans {
                 // Reduce span dicts to text (+confidence when requested).
@@ -523,7 +546,10 @@ fn strip_span_metadata(value: &JsonValue, include_confidence: bool, include_span
                 if k == "confidence" && !include_confidence {
                     continue;
                 }
-                out.insert(k.clone(), strip_span_metadata(v, include_confidence, include_spans));
+                out.insert(
+                    k.clone(),
+                    strip_span_metadata(v, include_confidence, include_spans),
+                );
             }
             JsonValue::Object(out)
         }
@@ -601,7 +627,8 @@ mod tests {
                 sample_result(s, e, local, 0.9)
             })
             .collect();
-        let merged = merge_chunk_results(text, &chunks, results, true, true, MergePolicy::Allow).unwrap();
+        let merged =
+            merge_chunk_results(text, &chunks, results, true, true, MergePolicy::Allow).unwrap();
         let people = merged["entities"]["person"].as_array().unwrap();
         assert!(!people.is_empty());
         // all remapped to doc offsets, text matches original slice
@@ -649,9 +676,15 @@ mod tests {
             {"start": 24, "end": 32, "text": "Tim Cook", "confidence": 0.9},
             {"start": 24, "end": 26, "text": "Ti", "confidence": 0.85},
         ]}})];
-        let merged =
-            merge_chunk_results(text, &chunks, results, true, true, MergePolicy::HighestConfidence)
-                .unwrap();
+        let merged = merge_chunk_results(
+            text,
+            &chunks,
+            results,
+            true,
+            true,
+            MergePolicy::HighestConfidence,
+        )
+        .unwrap();
         let people = merged["entities"]["person"].as_array().unwrap();
         // Overlapping candidates: (0,27)=0.8, (24,32)=0.9, (24,26)=0.85 —
         // every pair overlaps, so the best non-overlapping set is the single
@@ -693,8 +726,8 @@ mod tests {
             end_word: 1,
         }];
         let results = vec![sample_result(0, 5, "Apple", 0.9)];
-        let merged = merge_chunk_results(text, &chunks, results, false, false, MergePolicy::Allow)
-            .unwrap();
+        let merged =
+            merge_chunk_results(text, &chunks, results, false, false, MergePolicy::Allow).unwrap();
         let person = &merged["entities"]["person"];
         let arr = person.as_array().unwrap();
         assert_eq!(arr[0], json!({"text": "Apple"}));
@@ -704,14 +737,25 @@ mod tests {
     fn test_classification_merge_picks_max_confidence() {
         let text = "happy days";
         let chunks = vec![
-            TextChunk { text: text.into(), start_char: 0, end_char: text.len(), start_word: 0, end_word: 2 },
-            TextChunk { text: text.into(), start_char: 0, end_char: text.len(), start_word: 0, end_word: 2 },
+            TextChunk {
+                text: text.into(),
+                start_char: 0,
+                end_char: text.len(),
+                start_word: 0,
+                end_word: 2,
+            },
+            TextChunk {
+                text: text.into(),
+                start_char: 0,
+                end_char: text.len(),
+                start_word: 0,
+                end_word: 2,
+            },
         ];
         let mk = |c: f64| json!({"sentiment": {"label": "positive", "confidence": c}});
         let results = vec![mk(0.6), mk(0.9)];
-        let merged = merge_chunk_results(text, &chunks, results, true, false, MergePolicy::Allow)
-            .unwrap();
+        let merged =
+            merge_chunk_results(text, &chunks, results, true, false, MergePolicy::Allow).unwrap();
         assert!((merged["sentiment"]["confidence"].as_f64().unwrap() - 0.9).abs() < 1e-9);
     }
 }
-
