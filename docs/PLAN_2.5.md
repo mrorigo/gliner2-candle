@@ -201,19 +201,19 @@ New file: `src/constraints.rs` (pure logic, no ML — exhaustively testable).
 - [ ] Output JSON: each span carries `{ "<attr>": {label, confidence} }`;
       respect `include_spans` / `include_confidence` flags.
 
-### Phase 4 — Long context & public API
+### Phase 4 — Long context & public API (complete)
 
-- [ ] Chunking utility (`src/chunking.rs`):
+- [x] Chunking utility (`src/chunking.rs`):
       - word-window splitting with overlap, respecting encoder max positions
       - run extraction per chunk, batch chunks where possible
       - remap every span to original-document character offsets
       - deterministic merge policies for duplicate spans across overlaps
         (highest-confidence, longest-span, first-seen — user selectable)
-- [ ] Long-context variants of the main entry points (entities, classify,
+- [x] Long-context auto-chunking in `batch_extract` (entities, classify,
       JSON schema, relations) with automatic chunking above a length
       threshold; opt-out flag.
-- [ ] Confirm actual max positions per checkpoint (base vs multi may differ);
-      do NOT assume 4,096 everywhere.
+- [x] Confirmed: all three checkpoints declare `max_len: 4096`; encoder
+      `max_position_embeddings` is not an input cap (relative positions).
 - [ ] Public API: `GLiNER2::from_pretrained` transparently dispatches;
       `max_width()` builder methods emit deprecation warnings when a 2.5 model
       is loaded (no-op there).

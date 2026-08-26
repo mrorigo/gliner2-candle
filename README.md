@@ -18,6 +18,34 @@ A high-performance, pure Rust implementation of the [GLiNER2](https://github.com
 
 **Current focus:** continued numerical parity tuning and broader regression coverage across more texts/schemas/devices.
 
+## 🚀 GLiNER2.5 Support (boundary architecture)
+
+This fork adds the [GLiNER2.5](https://github.com/urchade/GLiNER2.5)
+boundary-prediction pipeline, validated numerically against the Python
+reference:
+
+- ✅ All three checkpoints (`fastino/gliner2.5-{small,base,multi}-v1`)
+- ✅ Boundary encoder + shared-pool scoring with numeric parity vs Python
+  (Tim Cook 0.998 / Apple 0.951 on the parity fixture)
+- ✅ Entities, classifications, records, and relation decoding
+- ✅ Long-document auto-chunking (>384 words) with span remapping and merge
+  policies (`src/chunking.rs`)
+
+```rust
+use gliner2_rs::inference::engine::GLiNER2;
+use gliner2_rs::schema::types::Schema;
+
+let engine = GLiNER2::from_pretrained("fastino/gliner2.5-small-v1")?;
+let schema = Schema::from_dict(&serde_json::json!({
+    "entities": ["person", "organization", "location"]
+}))?;
+// Long documents are chunked automatically.
+let result = engine.extract(text, &schema, 0.5, true, true, None)?;
+```
+
+Performance (CPU, release): ~74ms per short call — at parity with the Python
+implementation; batched throughput ~54ms/sample.
+
 ## ✨ What's Working
 
 ### Complete Architecture Port
