@@ -6,16 +6,25 @@ This is a pure Rust implementation of the [GLiNER2](https://github.com/urchade/G
 
 **Key Achievement**: Both GLiNER2 (span-enumeration) and GLiNER2.5 (boundary-prediction) pipelines work end-to-end with real model weights downloaded from HuggingFace Hub.
 
-**Current Status (Phase 2 complete)**: 
+**Current Status (Phase 4 complete; Phase 5 validation pending)**:
 - GLiNER2: Fully functional entity extraction.
-- GLiNER2.5: `score_sample()` runs end-to-end producing valid candidate scores. Engine integration works (from_pretrained + extract_entities). Small model produces modest scores (sigmoid ~0.18); threshold tuning needed for production use.
+- GLiNER2.5: Full boundary pipeline with numeric parity vs the Python
+  reference on the parity fixture (Tim Cook 0.998 / Apple 0.951 /
+  Cupertino). Entities, classifications, records, and relations decode.
+- Long documents (>384 words) are auto-chunked in `batch_extract` and merged;
+  matches Python recall characteristics (both implementations degrade on long
+  single-window inputs — chunking is required, not optional).
+- Performance (release, CPU): short inputs at Python parity (~74ms/call);
+  batch of 8 at ~54ms/sample. Long-context gap localized to encoder c2p/p2c
+  rel-bias + L^2 softmax.
 
 ## 🏗️ Architecture Summary
 
 ### Pipeline Flow
 ```
-GLiNER2:  Text + Schema → Tokenizer → Collator → DeBERTa V3 → Span Rep → Classifier → Output
-GLiNER2.5: Text + Schema → Tokenizer → Collator → DeBERTa V3 → BoundaryEncoder → Score Sample → Output
+GLiNER2:   Text + Schema → Tokenizer → Collator → DeBERTa V3 → Span Rep → Classifier → Output
+GLiNER2.5: Text + Schema → Tokenizer → Collator → DeBERTa V3 (custom deberta_v3.rs) → gather word/marker states → BoundaryEncoder → shared-pool scoring → decode
+           (>384 words: split into overlapping chunks, extract per chunk, merge spans)
 ```
 
 ### Key Components
@@ -112,29 +121,35 @@ All projectors are Linear+GELU+Linear (no LayerNorm).
 5. Filter by threshold (default 0.5)
 6. Extract text spans using character position mappings
 
-## 🐛 Current Debugging Focus
+## 🐛 Debugging Notes (resolved — keep for reference)
 
-### Issue: Entity Extraction Returns Empty Results
-The model loads and runs successfully, but no entities are extracted. Debug output shows:
-- `schema_special_indices=[[0, 2, 5, 7, 9]]` - These are schema token POSITIONS, not subword positions
-- `text_word_indices=[]` - Empty! This is a problem
-- `input_ids.len()=33`
+### Fixed: Wrong/merged entity extraction (GLiNER2.5)
+Root causes, in the order they were found and fixed:
+1. **Relative-position sign flip**: candle-transformers' `debertav2` computes
+   `rel_pos = k - q`; HF uses `q - k`. This corrupts c2p/p2c attention gathers.
+   Fix: GLiNER2.5 uses the custom `src/model/deberta_v3.rs`.
+2. **Missing rel-embedding LayerNorm**: HF applies `norm_rel_ebd=layer_norm`
+   (`encoder.LayerNorm`) to rel_embeddings before attention. Do not also apply
+   it as an output LayerNorm — DeBERTa has no output LN.
+3. **Boundary scorer omissions** (`src/model/boundary.rs`): candidate_norm
+   must be applied to pool candidates; content LayerNorm applies to the pooled
+   span mean (not per-token); FiLM GELU is exact erf, not tanh.
 
-### Root Cause
-When using the HF tokenizer path in `collator.rs`:
-1. `schema_special_indices` tracks schema token positions (0, 2, 5, 7, 9) but needs SUBWORD positions
-2. `text_word_indices` is empty because the text token tracking logic isn't working
-3. Schema embeddings are extracted from wrong positions in encoder output
+Parity fixtures live in `/tmp/g25diag/*.json` (regenerate via Python dumps);
+tests: `test_encoder_parity`, `test_staged_parity`, `test_numeric_parity`
+(ignored; require the fixture files).
 
-### Files to Fix
-1. **`src/batch/collator.rs`** - Lines 300-400: Fix `schema_special_indices` and `text_word_indices` tracking
-2. **`src/inference/engine.rs`** - Lines 850-1050: Entity extraction logic (has debug output)
+### Perf pitfalls
+- Never benchmark unoptimized builds: candle dispatch overhead in debug is
+  ~30-100x. `[profile.dev.package."*"] opt-level = 3` handles this for tests.
+- Profile with `GLINER2_PROFILE=1` (stage timings: encoder / boundary head /
+  per-layer attn+ffn / rel-bias / softmax).
 
-### Debug Command
-```bash
-cargo test --test real_inference_test test_real_gliner2_model_loading -- --nocapture
-```
-This shows debug output from collator and entity extraction.
+### Checkpoint facts (verified from Hub configs)
+- All three 2.5 checkpoints declare `max_len: 4096`;
+  `gliner2.5-multi-v1` vocab is 250112 (others 128011).
+- Encoder `max_position_embeddings: 512` is NOT an input cap — DeBERTa uses
+  relative positions (`position_buckets: 256` → rel table 512 rows).
 
 ## 🧪 Testing
 
