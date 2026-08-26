@@ -36,6 +36,7 @@
 // -------------------------------------------------------------------------
 
 pub mod batch;
+pub mod chunking;
 pub mod config;
 pub mod constraints;
 pub mod error;

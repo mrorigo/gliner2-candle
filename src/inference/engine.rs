@@ -777,26 +777,94 @@ impl GLiNER2 {
         // Convert schema to dict format
         let schema_dict = schema.to_dict();
 
-        // Create samples
-        let samples: Vec<(String, JsonValue)> = texts
-            .iter()
-            .map(|text| (text.clone(), schema_dict.clone()))
-            .collect();
+        let is_boundary = model.architecture == crate::config::Architecture::Gliner25;
+        // Match the Python reference: chunk documents beyond the default chunk
+        // size (384 words) rather than waiting for the full encoder window —
+        // boundary-model recall collapses on long single-window inputs.
+        const MAX_ENCODER_WORDS: usize = 4096usize.saturating_sub(64);
+        let context_words = crate::chunking::DEFAULT_CHUNK_SIZE
+            .min(max_len.or(self.config().max_len).map_or(MAX_ENCODER_WORDS, |m| {
+                m.saturating_sub(64).max(32)
+            }))
+            .max(32);
+
+        // Expand long documents into overlapping chunks (boundary path only).
+        // Each entry maps to (original_text_index, Option<&[TextChunk]>, chunk_idx).
+        struct Expanded {
+            original: usize,
+            text: String,
+        }
+        let mut expanded: Vec<Expanded> = Vec::new();
+        let mut chunk_lists: Vec<Option<Vec<crate::chunking::TextChunk>>> =
+            Vec::with_capacity(texts.len());
+        for (i, text) in texts.iter().enumerate() {
+            let needs_chunk =
+                is_boundary && text.split_whitespace().count() > context_words;
+            if needs_chunk {
+                let chunks = crate::chunking::split_text_into_chunks(
+                    text,
+                    context_words,
+                    crate::chunking::DEFAULT_CHUNK_OVERLAP.min(context_words / 2),
+                )?;
+                for chunk in chunks.iter() {
+                    expanded.push(Expanded {
+                        original: i,
+                        text: chunk.text.clone(),
+                    });
+                }
+                chunk_lists.push(Some(chunks));
+            } else {
+                expanded.push(Expanded {
+                    original: i,
+                    text: text.clone(),
+                });
+                chunk_lists.push(None);
+            }
+        }
 
         // Process in batches
-        let mut all_results = Vec::with_capacity(texts.len());
-
-        // Sequential processing (Tensor is not Sync in tch 0.24)
-        for chunk in samples.chunks(batch_size) {
+        let mut all_expanded_results: Vec<JsonValue> = Vec::with_capacity(expanded.len());
+        for group in expanded.chunks(batch_size.max(1)) {
+            let samples: Vec<(String, JsonValue)> = group
+                .iter()
+                .map(|e| (e.text.clone(), schema_dict.clone()))
+                .collect();
             let results = self.process_batch(
-                chunk,
+                &samples,
                 model,
                 threshold,
                 include_confidence,
                 include_spans,
                 max_len,
             )?;
-            all_results.extend(results);
+            all_expanded_results.extend(results);
+        }
+
+        // Regroup chunk results back to their original documents.
+        let mut all_results: BatchExtractionResult = Vec::with_capacity(texts.len());
+        let mut cursor = 0usize;
+        for (i, text) in texts.iter().enumerate() {
+            match &chunk_lists[i] {
+                None => {
+                    all_results.push(all_expanded_results[cursor].clone());
+                    cursor += 1;
+                }
+                Some(chunks) => {
+                    let chunk_results: Vec<JsonValue> = all_expanded_results
+                        [cursor..cursor + chunks.len()]
+                        .to_vec();
+                    cursor += chunks.len();
+                    let merged = crate::chunking::merge_chunk_results(
+                        text,
+                        chunks,
+                        chunk_results,
+                        include_confidence,
+                        include_spans,
+                        crate::chunking::MergePolicy::Allow,
+                    )?;
+                    all_results.push(merged);
+                }
+            }
         }
 
         Ok(all_results)
