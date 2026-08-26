@@ -119,3 +119,119 @@ fn test_perf_linear_scaling() {
         prev_words = words;
     }
 }
+
+/// Span attributes (Phase 3e): attribute labels ride along as hidden entity
+/// queries; retained spans are re-scored via score_explicit_spans.
+#[test]
+#[ignore = "downloads ~500MB; run explicitly with --ignored"]
+fn test_gliner25_entity_attributes() {
+    use gliner2_rs::schema::types::{AttributeGroup, EntityDef, Schema};
+    use std::collections::HashMap;
+
+    let engine = GLiNER2::from_pretrained("fastino/gliner2.5-small-v1").expect("load");
+
+    let mut groups = HashMap::new();
+    groups.insert(
+        "sentiment".to_string(),
+        AttributeGroup {
+            labels: vec!["positive".to_string(), "negative".to_string()],
+            multi_label: true,
+            threshold: 0.5,
+            applies_to: Some(vec!["person".to_string()]),
+            qualify_labels: false,
+        },
+    );
+    let schema = Schema::new()
+        .entities(vec![EntityDef::new("person"), EntityDef::new("organization")])
+        .entity_attributes(groups)
+        .expect("schema");
+
+    let result = engine
+        .extract(
+            "Apple CEO Tim Cook announced great results in Cupertino.",
+            &schema,
+            0.5,
+            false,
+            false,
+            None,
+        )
+        .expect("extract");
+    println!("{result:#}");
+
+    let entities = result.get("entities").expect("entities");
+    // Attributed format forces object entries.
+    let persons = entities["person"].as_array().expect("person array");
+    assert!(!persons.is_empty(), "expected a person span");
+    for p in persons {
+        assert!(p.get("text").is_some(), "attributed entry must be an object");
+        assert!(
+            p.get("sentiment").is_some(),
+            "person entries carry the sentiment group: {p}"
+        );
+        let sent = p["sentiment"].as_array().unwrap();
+        for v in sent {
+            assert!(v.get("label").is_some() && v.get("confidence").is_some());
+        }
+    }
+    if let Some(orgs) = entities["organization"].as_array() {
+        for o in orgs {
+            assert!(
+                o.get("sentiment").is_none(),
+                "sentiment must not attach to organization: {o}"
+            );
+        }
+    }
+}
+
+/// Attribute prompt labels must not leak into the public entity output.
+#[test]
+fn test_attribute_schema_expansion() {
+    use gliner2_rs::schema::types::{AttributeGroup, EntityDef, Schema};
+    use std::collections::HashMap;
+
+    let mut groups = HashMap::new();
+    groups.insert(
+        "lang".to_string(),
+        AttributeGroup {
+            labels: vec!["english".to_string()],
+            ..Default::default()
+        },
+    );
+    let schema = Schema::new()
+        .entities(vec![EntityDef::new("person")])
+        .entity_attributes(groups)
+        .expect("schema");
+
+    let (expanded, prompts) = schema.expanded_with_attributes().expect("expand");
+    assert_eq!(prompts.get("english").map(String::as_str), Some("english"));
+    // Hidden query appended after content entities; public order untouched.
+    assert_eq!(schema.entities.len(), 1);
+    assert_eq!(expanded.entities.len(), 2);
+    assert_eq!(expanded.entities[1].name, "english");
+
+    // Validation: unknown applies_to entity rejected.
+    let mut bad = HashMap::new();
+    bad.insert(
+        "g".to_string(),
+        AttributeGroup {
+            labels: vec!["x".to_string()],
+            applies_to: Some(vec!["nonexistent".to_string()]),
+            ..Default::default()
+        },
+    );
+    assert!(Schema::new()
+        .entities(vec![EntityDef::new("person")])
+        .entity_attributes(bad)
+        .is_err());
+
+    // Validation: requires entities first.
+    let mut g2 = HashMap::new();
+    g2.insert(
+        "g".to_string(),
+        AttributeGroup {
+            labels: vec!["x".to_string()],
+            ..Default::default()
+        },
+    );
+    assert!(Schema::new().entity_attributes(g2).is_err());
+}

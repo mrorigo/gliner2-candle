@@ -191,15 +191,17 @@ New file: `src/constraints.rs` (pure logic, no ML — exhaustively testable).
 - [ ] Output type: entities + relations referencing them (by index/text),
       matching Python result shape.
 
-#### 3c. Span attributes
+#### 3c. Span attributes (complete)
 
-- [ ] Extend `EntityDef`/schema with `AttributeGroup { labels, applies_to,
+- [x] Extend schema with `AttributeGroup { labels, applies_to,
       multi, qualify_labels, threshold }`; builder method
       `.entity_attributes({...})`.
-- [ ] Attribute heads scored per selected span in the same forward pass
-      (weight names TBD).
-- [ ] Output JSON: each span carries `{ "<attr>": {label, confidence} }`;
-      respect `include_spans` / `include_confidence` flags.
+- [x] Attribute labels registered as hidden entity queries; retained spans
+      re-scored via `BoundaryModel::score_explicit_spans` (no dedicated
+      weights — mirrors the Python runtime).
+- [x] Output JSON: multi_label groups attach `[{label, confidence}]` filtered
+      by threshold; single-label groups attach the softmax argmax. Attributed
+      entries are always objects; respects include_flags.
 
 ### Phase 4 — Long context & public API (complete)
 

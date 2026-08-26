@@ -406,6 +406,22 @@ pub struct BoundaryQueryHead {
 }
 
 impl BoundaryQueryHead {
+    /// Debug access to projection linears (parity tooling).
+    pub fn projections(
+        &self,
+    ) -> [(&str, &Linear); 6] {
+        [
+            ("start_query", &self.start_query_projection),
+            ("end_query", &self.end_query_projection),
+            ("inside_query", &self.inside_query_projection),
+            ("start_boundary", &self.start_boundary_projection),
+            ("end_boundary", &self.end_boundary_projection),
+            ("inside_text", &self.inside_text_projection),
+        ]
+    }
+}
+
+impl BoundaryQueryHead {
     /// Load from `vb` rooted at `boundary_head.boundary_query_head`.
     pub fn load(vb: VarBuilder, hidden_size: usize, cfg: &BoundaryConfig) -> Result<Self> {
         let d = cfg.boundary_dim;
@@ -470,6 +486,11 @@ pub struct SharedPoolBuilder {
 }
 
 impl SharedPoolBuilder {
+    /// Debug access to pool-builder projections (parity tooling).
+    pub fn debug_projections(&self) -> (&Linear, &Linear) {
+        (&self.start_projection, &self.end_projection)
+    }
+
     /// Load from `vb` rooted at `boundary_head.shared_pool_builder`.
     pub fn load(vb: VarBuilder, d: usize) -> Result<Self> {
         Ok(Self {
@@ -492,6 +513,12 @@ pub struct SharedPoolScorer {
     film_output_hidden: Linear,
     film_output_out: Linear,
     candidate_norm: candle_nn::LayerNorm,
+    /// Span-content pooler owned by this scorer (`shared_pool_scorer.content_pooler`).
+    ///
+    /// Distinct from `PairScorer`'s pooler of the same shape — they carry
+    /// different weights and must not be interchanged.
+    pub(crate) content_value_projection: Linear,
+    pub(crate) content_layer_norm: candle_nn::LayerNorm,
 }
 
 impl SharedPoolScorer {
@@ -510,12 +537,51 @@ impl SharedPoolScorer {
             film_output_hidden: linear(d, c, vb.pp("film_output.0"))?,
             film_output_out: linear(c, 1, vb.pp("film_output.3"))?,
             candidate_norm: layer_norm(d, BOUNDARY_LAYER_NORM_EPS, vb.pp("candidate_norm"))?,
+            content_value_projection: linear(hidden_size, c, vb.pp("content_pooler.value_projection"))?,
+            content_layer_norm: layer_norm(
+                c,
+                BOUNDARY_LAYER_NORM_EPS,
+                vb.pp("content_pooler.layer_norm"),
+            )?,
         })
     }
 
     /// Candidate LayerNorm parameters (`candidate_norm`).
     pub fn candidate_norm_params(&self) -> Result<(Vec<f32>, Vec<f32>)> {
         ln_params(&self.candidate_norm)
+    }
+
+    /// Debug access to scorer projections (parity tooling).
+    pub fn debug_projections(&self) -> Vec<(&'static str, &Linear)> {
+        vec![
+            ("start", &self.start_projection),
+            ("end", &self.end_projection),
+            ("length", &self.length_projection),
+            ("prior", &self.prior_projection),
+            ("content", &self.content_projection),
+            ("query", &self.query_projection),
+            ("film", &self.film),
+        ]
+    }
+
+    /// Debug access to the FiLM output MLP (parity tooling).
+    pub fn debug_film_mlp(&self) -> (&Linear, &Linear) {
+        (&self.film_output_hidden, &self.film_output_out)
+    }
+
+    /// Debug access to the candidate LayerNorm (parity tooling).
+    pub fn debug_candidate_norm(&self) -> &candle_nn::LayerNorm {
+        &self.candidate_norm
+    }
+
+    /// Span-content LayerNorm parameters (`shared_pool_scorer.content_pooler.layer_norm`).
+    pub fn content_ln_params(&self) -> Result<(Vec<f32>, Vec<f32>)> {
+        ln_params(&self.content_layer_norm)
+    }
+
+    /// Debug access to this scorer's span-content value projection.
+    pub fn debug_content_value(&self) -> &Linear {
+        &self.content_value_projection
     }
 }
 
@@ -557,6 +623,11 @@ impl PairScorer {
     /// Span-content value-projection weights (`content_pooler.value_projection`).
     pub fn content_value_weight(&self) -> Tensor {
         self.content_value_projection.weight().clone()
+    }
+
+    /// Debug access to the span-content value projection (parity tooling).
+    pub fn content_value(&self) -> &Linear {
+        &self.content_value_projection
     }
 
     /// Span-content value-projection bias.
@@ -1224,6 +1295,35 @@ impl BoundaryModel {
         text_len: usize,
         query_states: &Tensor,
     ) -> Result<SharedPoolScores> {
+        self.score_spans(text_states, text_len, query_states, None)
+    }
+
+    /// Score caller-provided half-open spans for every query.
+    ///
+    /// Port of the Python `score_explicit_spans` primitive: bypasses proposal
+    /// top-k and pool selection while retaining the exact proposal
+    /// compatibility prior and pair-reranker computation used by ordinary
+    /// candidates. Intended for span-conditioned features such as entity
+    /// attributes.
+    ///
+    /// Returns scores `[C][Q]` where row `i` corresponds to `spans[i]`.
+    pub fn score_explicit_spans(
+        &self,
+        text_states: &Tensor,
+        text_len: usize,
+        query_states: &Tensor,
+        spans: &[(usize, usize)],
+    ) -> Result<SharedPoolScores> {
+        self.score_spans(text_states, text_len, query_states, Some(spans))
+    }
+
+    fn score_spans(
+        &self,
+        text_states: &Tensor,
+        text_len: usize,
+        query_states: &Tensor,
+        explicit: Option<&[(usize, usize)]>,
+    ) -> Result<SharedPoolScores> {
         let h = self.hidden_size;
         let d = self.config.boundary_dim;
         let c_dim = self.config.content_dim;
@@ -1297,45 +1397,9 @@ impl BoundaryModel {
             }
         }
 
-        // --- DocumentCandidatePool -------------------------------------------
-        const POOL_BOUNDARY_TOP_K: usize = 32;
-        let pool_size = self.config.pool_size;
-        const MIN_POOL_PER_QUERY: usize = 8;
-
-        let mut union_start = vec![MASK_LOGIT; n];
-        let mut union_end = vec![MASK_LOGIT; n];
-        for i in 0..n {
-            if !boundary_valid(i) {
-                continue;
-            }
-            for qi in 0..q {
-                union_start[i] = union_start[i].max(start_logits[qi][i]);
-                union_end[i] = union_end[i].max(end_logits[qi][i]);
-            }
-        }
-
-        let top_starts: Vec<usize> = argsort_desc_stable(&union_start)
-            .into_iter()
-            .filter(|&i| boundary_valid(i))
-            .take(POOL_BOUNDARY_TOP_K)
-            .collect();
-        let top_ends: Vec<usize> = argsort_desc_stable(&union_end)
-            .into_iter()
-            .filter(|&i| boundary_valid(i))
-            .take(POOL_BOUNDARY_TOP_K)
-            .collect();
-
-        let mut pair_s: Vec<usize> = Vec::new();
-        let mut pair_e: Vec<usize> = Vec::new();
-        let mut pair_valid: Vec<bool> = Vec::new();
-        for &s in &top_starts {
-            for &e in &top_ends {
-                pair_s.push(s);
-                pair_e.push(e);
-                pair_valid.push(e > s && boundary_valid(s) && boundary_valid(e));
-            }
-        }
-
+        // --- Candidate selection ---------------------------------------------
+        // Explicit spans bypass pool selection entirely; the shared-pool path
+        // mirrors upstream `DocumentCandidatePool`.
         let pbsk: Vec<Vec<f32>> = self
             .pool_builder
             .start_projection
@@ -1349,47 +1413,29 @@ impl BoundaryModel {
             .to_vec2::<f32>()
             .map_err(|e| GlinerError::inference(format!("{e}")))?;
 
-        let compat: Vec<f32> = (0..pair_s.len())
-            .map(|p| dot(&pbsk[pair_s[p]], &pbek[pair_e[p]]) / sqrt_d)
-            .collect();
-        let union_pair_score: Vec<f32> = (0..pair_s.len())
-            .map(|p| compat[p] + union_start[pair_s[p]] + union_end[pair_e[p]])
-            .collect();
-
-        // Per-query quota reservations (priority band above global scores).
-        let quota = MIN_POOL_PER_QUERY.min(pair_s.len());
-        let mut all_keys: Vec<(usize, usize)> = Vec::new();
-        let mut all_scores: Vec<f32> = Vec::new();
-        let mut all_valid: Vec<bool> = Vec::new();
-        if quota > 0 && q > 0 {
-            for qi in 0..q {
-                let pq: Vec<f32> = (0..pair_s.len())
-                    .map(|p| {
-                        if !pair_valid[p] {
-                            MASK_LOGIT
-                        } else {
-                            start_logits[qi][pair_s[p]]
-                                + end_logits[qi][pair_e[p]]
-                                + compat[p]
-                        }
-                    })
-                    .collect();
-                let order = argsort_desc_stable(&pq);
-                for (rank, &p) in order.iter().take(quota).enumerate() {
-                    all_keys.push((pair_s[p], pair_e[p]));
-                    all_scores.push(-MASK_LOGIT * 0.5 + (quota - rank) as f32);
-                    all_valid.push(pair_valid[p]);
+        let (sel_s, sel_e, sel_valid): (Vec<usize>, Vec<usize>, Vec<bool>) = match explicit {
+            Some(spans) => {
+                let mut ss = Vec::with_capacity(spans.len());
+                let mut ee = Vec::with_capacity(spans.len());
+                let mut vv = Vec::with_capacity(spans.len());
+                for &(s, e) in spans {
+                    ss.push(s);
+                    ee.push(e);
+                    vv.push(e > s && e <= n);
                 }
+                (ss, ee, vv)
             }
-        }
-        for p in 0..pair_s.len() {
-            all_keys.push((pair_s[p], pair_e[p]));
-            all_scores.push(union_pair_score[p]);
-            all_valid.push(pair_valid[p]);
-        }
-
-        let (sel_s, sel_e, sel_valid) =
-            dedup_pool(&all_keys, &all_scores, &all_valid, pool_size, n);
+            None => self.select_shared_pool(
+                &start_logits,
+                &end_logits,
+                &pbsk,
+                &pbek,
+                sqrt_d,
+                q,
+                n,
+                text_len,
+            )?,
+        };
         let c_count = sel_s.len();
 
         // Retained candidates' compat prior.
@@ -1418,9 +1464,9 @@ impl BoundaryModel {
 
         // Span-content pooling: value-project tokens, mean over the span via a
         // running-sum, then LayerNorm (content_soft_max_pool = false).
-        let (ln_w, ln_b) = self.pair_scorer.content_ln_params()?;
+        let (ln_w, ln_b) = self.pool_scorer.content_ln_params()?;
         let token_values: Vec<Vec<f32>> = self
-            .pair_scorer
+            .pool_scorer
             .content_value_projection
             .forward(text_states)?
             .to_vec2::<f32>()
@@ -1520,22 +1566,34 @@ impl BoundaryModel {
             .to_vec2::<f32>()
             .map_err(|e| GlinerError::inference(format!("{e}")))?;
 
+        let debug_terms = std::env::var("GLINER2_DEBUG_TERMS").is_ok();
+        let mut terms: Vec<[f32; 5]> = Vec::with_capacity(c_count);
         let mut scores = vec![vec![MASK_LOGIT; q]; c_count];
         for ci in 0..c_count {
             if !sel_valid[ci] {
+                if debug_terms {
+                    terms.push([0.0; 5]);
+                }
                 continue;
             }
             let (s, e) = (sel_s[ci], sel_e[ci]);
             let len_i = (e - s).max(1);
             for qi in 0..q {
                 let mut sc = dots[ci][qi] + fo[ci][qi];
-                sc += start_logits[qi][s] + end_logits[qi][e];
+                let sl_t = start_logits[qi][s];
+                let el_t = end_logits[qi][e];
+                sc += sl_t + el_t;
                 let interval = inside_prefix[qi][(e).min(n)] - inside_prefix[qi][(s).min(n)]
                     + inside_mean[qi] * len_i as f32;
-                sc += interval / (len_i as f32).sqrt();
+                let iv_t = interval / (len_i as f32).sqrt();
+                sc += iv_t;
                 scores[ci][qi] = sc;
+                if debug_terms && qi == 0 {
+                    terms.push([dots[ci][0], fo[ci][0], sl_t, el_t, iv_t]);
+                }
             }
         }
+        let debug_terms_out = debug_terms.then_some(terms);
 
         // --- Candidate states for record decoder ----------------------------
         let cand_states = if let Some(ref ce) = self.candidate_encoder {
@@ -1566,9 +1624,108 @@ impl BoundaryModel {
             scores,
             candidate_states: cand_states,
             boundary_states: Some(bs_rows),
+            debug_terms: debug_terms_out,
         })
     }
+    /// Shared-pool candidate selection (upstream `DocumentCandidatePool`).
+    ///
+    /// Union-marginal top-k pairing, per-query quota reservations, key dedup,
+    /// capped at `pool_size` candidates.
+    #[allow(clippy::too_many_arguments)]
+    fn select_shared_pool(
+        &self,
+        start_logits: &[Vec<f32>],
+        end_logits: &[Vec<f32>],
+        pbsk: &[Vec<f32>],
+        pbek: &[Vec<f32>],
+        sqrt_d: f32,
+        q: usize,
+        n: usize,
+        text_len: usize,
+    ) -> Result<(Vec<usize>, Vec<usize>, Vec<bool>)> {
+        const POOL_BOUNDARY_TOP_K: usize = 32;
+        let pool_size = self.config.pool_size;
+        const MIN_POOL_PER_QUERY: usize = 8;
+
+        let boundary_valid = |i: usize| i <= text_len;
+
+        let mut union_start = vec![MASK_LOGIT; n];
+        let mut union_end = vec![MASK_LOGIT; n];
+        for i in 0..n {
+            if !boundary_valid(i) {
+                continue;
+            }
+            for qi in 0..q {
+                union_start[i] = union_start[i].max(start_logits[qi][i]);
+                union_end[i] = union_end[i].max(end_logits[qi][i]);
+            }
+        }
+
+        let top_starts: Vec<usize> = argsort_desc_stable(&union_start)
+            .into_iter()
+            .filter(|&i| boundary_valid(i))
+            .take(POOL_BOUNDARY_TOP_K)
+            .collect();
+        let top_ends: Vec<usize> = argsort_desc_stable(&union_end)
+            .into_iter()
+            .filter(|&i| boundary_valid(i))
+            .take(POOL_BOUNDARY_TOP_K)
+            .collect();
+
+        let mut pair_s: Vec<usize> = Vec::new();
+        let mut pair_e: Vec<usize> = Vec::new();
+        let mut pair_valid: Vec<bool> = Vec::new();
+        for &s in &top_starts {
+            for &e in &top_ends {
+                pair_s.push(s);
+                pair_e.push(e);
+                pair_valid.push(e > s && boundary_valid(s) && boundary_valid(e));
+            }
+        }
+
+        let compat: Vec<f32> = (0..pair_s.len())
+            .map(|p| dot(&pbsk[pair_s[p]], &pbek[pair_e[p]]) / sqrt_d)
+            .collect();
+        let union_pair_score: Vec<f32> = (0..pair_s.len())
+            .map(|p| compat[p] + union_start[pair_s[p]] + union_end[pair_e[p]])
+            .collect();
+
+        // Per-query quota reservations (priority band above global scores).
+        let quota = MIN_POOL_PER_QUERY.min(pair_s.len());
+        let mut all_keys: Vec<(usize, usize)> = Vec::new();
+        let mut all_scores: Vec<f32> = Vec::new();
+        let mut all_valid: Vec<bool> = Vec::new();
+        if quota > 0 && q > 0 {
+            for qi in 0..q {
+                let pq: Vec<f32> = (0..pair_s.len())
+                    .map(|p| {
+                        if !pair_valid[p] {
+                            MASK_LOGIT
+                        } else {
+                            start_logits[qi][pair_s[p]]
+                                + end_logits[qi][pair_e[p]]
+                                + compat[p]
+                        }
+                    })
+                    .collect();
+                let order = argsort_desc_stable(&pq);
+                for (rank, &p) in order.iter().take(quota).enumerate() {
+                    all_keys.push((pair_s[p], pair_e[p]));
+                    all_scores.push(-MASK_LOGIT * 0.5 + (quota - rank) as f32);
+                    all_valid.push(pair_valid[p]);
+                }
+            }
+        }
+        for p in 0..pair_s.len() {
+            all_keys.push((pair_s[p], pair_e[p]));
+            all_scores.push(union_pair_score[p]);
+            all_valid.push(pair_valid[p]);
+        }
+
+        Ok(dedup_pool(&all_keys, &all_scores, &all_valid, pool_size, n))
+    }
 }
+
 
 /// Result of `BoundaryModel::score_sample`.
 #[derive(Debug, Clone)]
@@ -1587,6 +1744,9 @@ pub struct SharedPoolScores {
     /// Boundary encoder states `[L+1][d]` for relation scoring.
     /// `None` when the model lacks a `relation_scorer`.
     pub boundary_states: Option<Vec<Vec<f32>>>,
+    /// Per-candidate score components `[dots, film, start_m, end_m, inside]`
+    /// when `GLINER2_DEBUG_TERMS` is set (parity tooling).
+    pub debug_terms: Option<Vec<[f32; 5]>>,
 }
 
 const SQRT_2_OVER_PI: f32 = 0.797_884_6;

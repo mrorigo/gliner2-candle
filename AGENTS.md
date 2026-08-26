@@ -6,7 +6,7 @@ This is a pure Rust implementation of the [GLiNER2](https://github.com/urchade/G
 
 **Key Achievement**: Both GLiNER2 (span-enumeration) and GLiNER2.5 (boundary-prediction) pipelines work end-to-end with real model weights downloaded from HuggingFace Hub.
 
-**Current Status (Phase 4 complete; Phase 5 validation pending)**:
+**Current Status (Phases 1-5 complete)**:
 - GLiNER2: Fully functional entity extraction.
 - GLiNER2.5: Full boundary pipeline with numeric parity vs the Python
   reference on the parity fixture (Tim Cook 0.998 / Apple 0.951 /
@@ -14,9 +14,11 @@ This is a pure Rust implementation of the [GLiNER2](https://github.com/urchade/G
 - Long documents (>384 words) are auto-chunked in `batch_extract` and merged;
   matches Python recall characteristics (both implementations degrade on long
   single-window inputs — chunking is required, not optional).
-- Performance (release, CPU): short inputs at Python parity (~74ms/call);
-  batch of 8 at ~54ms/sample. Long-context gap localized to encoder c2p/p2c
-  rel-bias + L^2 softmax.
+- Performance (release, CPU): short inputs at Python parity (~71ms/call).
+  Encoder rel-bias optimized (hoisted shared gather indices, custom row-copy
+  kernels, fused p2c transpose): ~15ms -> ~7ms/layer at seq=465. Boundary
+  scorer tensorized (batched gemm projections + FiLM over all pairs):
+  score_sample ~72ms -> ~27ms/chunk. 2400-word doc: ~3.1s end-to-end.
 
 ## 🏗️ Architecture Summary
 
@@ -144,6 +146,31 @@ tests: `test_encoder_parity`, `test_staged_parity`, `test_numeric_parity`
   ~30-100x. `[profile.dev.package."*"] opt-level = 3` handles this for tests.
 - Profile with `GLINER2_PROFILE=1` (stage timings: encoder / boundary head /
   per-layer attn+ffn / rel-bias / softmax).
+
+### Fixed: two distinct span-content poolers (critical parity bug)
+The checkpoint has BOTH `boundary_head.shared_pool_scorer.content_pooler.*`
+AND `boundary_head.pair_scorer.content_pooler.*` (same shapes, DIFFERENT
+weights). The shared-pool scorer must use its own; borrowing the pair
+scorer's inflated score errors up to 8 logits on non-top candidates while
+top-1 still looked fine — easy to miss if you only compare top spans.
+Always validate the FULL candidate matrix vs Python (`pooled_indices.json`
++ `pair_logits.json` fixtures), not just the top hits. Residual agreement
+after the fix: decision-relevant logits within ~0.25 of Python; extraction
+outputs identical.
+
+### Span attributes do NOT need dedicated weights (Phase 3e unblocked)
+Verified against all three checkpoints (334 tensors each, zero attribute
+keys) AND the Python runtime:
+- `Schema.entity_attributes()` registers attribute labels as HIDDEN entity
+  queries in the prompt (excluded from public entity order)
+- After decoding, retained spans are re-scored against those queries via
+  `score_explicit_spans(text_states, text_mask, query_states, query_mask,
+  indices[B,Q,C,2])` — bypasses proposal top-k but reuses compat prior +
+  pair reranker (`models/boundary/model.py`)
+- `_attach_entity_attributes` then applies per-group sigmoid (multi_label)
+  or softmax and attaches results to each span dict
+- Rust port needs: schema AttributeGroup + hidden queries, an
+  explicit-spans scoring path in boundary.rs, post-decode attachment
 
 ### Checkpoint facts (verified from Hub configs)
 - All three 2.5 checkpoints declare `max_len: 4096`;

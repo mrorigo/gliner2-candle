@@ -228,6 +228,46 @@ impl StructureDef {
     }
 }
 
+/// Attribute group attached to extracted entity spans.
+///
+/// Mirrors the Python reference `gliner2.inference.schema.AttributeGroup`:
+/// labels are registered as hidden entity queries and re-scored at retained
+/// spans after decoding.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AttributeGroup {
+    /// Values available in this attribute group.
+    pub labels: Vec<String>,
+    /// Use independent sigmoid decisions instead of forcing one value.
+    #[serde(default)]
+    pub multi_label: bool,
+    /// Selection cutoff for multi-label groups.
+    #[serde(default = "default_attribute_threshold")]
+    pub threshold: f32,
+    /// Optional entity types this group applies to (all when `None`).
+    #[serde(default)]
+    pub applies_to: Option<Vec<String>>,
+    /// Prefix model-facing values with the group name to reduce ambiguity
+    /// while keeping returned values unqualified.
+    #[serde(default)]
+    pub qualify_labels: bool,
+}
+
+fn default_attribute_threshold() -> f32 {
+    0.5
+}
+
+impl Default for AttributeGroup {
+    fn default() -> Self {
+        Self {
+            labels: Vec::new(),
+            multi_label: false,
+            threshold: default_attribute_threshold(),
+            applies_to: None,
+            qualify_labels: false,
+        }
+    }
+}
+
 /// Entity definition with optional metadata.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EntityDef {
@@ -442,12 +482,23 @@ pub struct Schema {
     /// Relation definitions.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub relations: Vec<RelationDef>,
+    /// Attribute groups keyed by group name.
+    #[serde(skip_serializing_if = "HashMap::is_empty", default)]
+    pub entity_attribute_groups: HashMap<String, AttributeGroup>,
     /// Entity descriptions (legacy format).
     #[serde(skip_serializing_if = "HashMap::is_empty", default)]
     pub entity_descriptions: HashMap<String, String>,
     /// Structure descriptions (legacy format).
     #[serde(skip_serializing_if = "HashMap::is_empty", default)]
     pub json_descriptions: HashMap<String, HashMap<String, String>>,
+}
+
+fn attribute_prompt_label(group_name: &str, group: &AttributeGroup, label: &str) -> String {
+    if group.qualify_labels {
+        format!("{group_name}: {label}")
+    } else {
+        label.to_string()
+    }
 }
 
 impl Schema {
@@ -478,6 +529,122 @@ impl Schema {
     pub fn relations(mut self, relations: Vec<RelationDef>) -> Self {
         self.relations = relations;
         self
+    }
+
+    /// Attach attribute groups to entities declared by this schema.
+    ///
+    /// Mirrors the Python `Schema.entity_attributes`: attribute labels are
+    /// registered as hidden entity queries (excluded from the public entity
+    /// order) and re-scored at retained spans after decoding.
+    pub fn entity_attributes(
+        mut self,
+        groups: HashMap<String, AttributeGroup>,
+    ) -> Result<Self> {
+        let content_entities: std::collections::HashSet<&String> =
+            self.entities.iter().map(|e| &e.name).collect();
+        if content_entities.is_empty() {
+            return Err(GlinerError::invalid_schema(
+                "entity_attributes() requires entities() to be called first",
+            ));
+        }
+
+        const RESERVED: [&str; 4] = ["text", "confidence", "start", "end"];
+        let mut seen: HashMap<&str, &str> = HashMap::new();
+        for (group_name, group) in &groups {
+            if group_name.is_empty() || RESERVED.contains(&group_name.as_str()) {
+                return Err(GlinerError::invalid_schema(format!(
+                    "Invalid attribute group name {group_name:?}: must be non-empty \
+                     and not one of {RESERVED:?}"
+                )));
+            }
+            if group.labels.is_empty() {
+                return Err(GlinerError::invalid_schema(format!(
+                    "Attribute group '{group_name}' has no labels"
+                )));
+            }
+            if !(0.0..=1.0).contains(&group.threshold) {
+                return Err(GlinerError::invalid_schema(format!(
+                    "Attribute group '{group_name}' threshold must be in [0, 1], got {}",
+                    group.threshold
+                )));
+            }
+            if let Some(applies_to) = &group.applies_to {
+                for entity in applies_to {
+                    if !content_entities.contains(entity) {
+                        return Err(GlinerError::invalid_schema(format!(
+                            "Attribute group '{group_name}' applies to unknown entity: {entity}"
+                        )));
+                    }
+                }
+            }
+            for label in &group.labels {
+                if label.trim().is_empty() {
+                    return Err(GlinerError::invalid_schema(format!(
+                        "Attribute group '{group_name}' has an empty label"
+                    )));
+                }
+                if let Some(prev_group) = seen.get(label.as_str()) {
+                    return Err(GlinerError::invalid_schema(format!(
+                        "Label '{label}' is in both '{prev_group}' and '{group_name}'"
+                    )));
+                }
+                seen.insert(label, group_name);
+            }
+        }
+
+        // Prompt-label collisions with declared entities.
+        for (group_name, group) in &groups {
+            for label in &group.labels {
+                let prompt = attribute_prompt_label(group_name, group, label);
+                if content_entities.contains(&prompt) {
+                    return Err(GlinerError::invalid_schema(format!(
+                        "Attribute labels collide with entity labels: {prompt}; use qualify_labels=true"
+                    )));
+                }
+            }
+        }
+
+        self.entity_attribute_groups = groups;
+        Ok(self)
+    }
+
+    /// Resolved attribute metadata for inference.
+    ///
+    /// Returns `(prompt_by_label, prompt_labels_sorted)` where prompt labels
+    /// are the model-facing query names, sorted like the Python reference
+    /// before insertion into the entity list.
+    pub fn attribute_prompts(&self) -> (HashMap<String, String>, Vec<String>) {
+        let mut prompts: HashMap<String, String> = HashMap::new();
+        for (group_name, group) in &self.entity_attribute_groups {
+            for label in &group.labels {
+                prompts.insert(label.clone(), attribute_prompt_label(group_name, group, label));
+            }
+        }
+        let mut sorted: Vec<String> = {
+            let mut v: Vec<String> = prompts.values().cloned().collect();
+            v.sort();
+            v.dedup();
+            v
+        };
+        sorted.shrink_to_fit();
+        (prompts, sorted)
+    }
+
+    /// A copy of this schema with hidden attribute queries appended as entity
+    /// definitions, plus the label→prompt mapping.
+    ///
+    /// The returned schema should be used for collation; the original schema's
+    /// public entity order is unchanged.
+    pub fn expanded_with_attributes(&self) -> Result<(Schema, HashMap<String, String>)> {
+        if self.entity_attribute_groups.is_empty() {
+            return Ok((self.clone(), HashMap::new()));
+        }
+        let (prompts, sorted) = self.attribute_prompts();
+        let mut expanded = self.clone();
+        for prompt in &sorted {
+            expanded.entities.push(EntityDef::new(prompt.clone()));
+        }
+        Ok((expanded, prompts))
     }
 
     /// Check if the schema is empty.

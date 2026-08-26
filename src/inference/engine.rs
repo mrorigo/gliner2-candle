@@ -774,10 +774,30 @@ impl GLiNER2 {
         // Note: eval() requires mutable access, but we use immutable reference here
         // The is_training flag is only used internally and doesn't affect inference
 
-        // Convert schema to dict format
-        let schema_dict = schema.to_dict();
-
+        // Convert schema to dict format; on the boundary path, attribute
+        // labels become hidden entity queries in the collated prompt.
         let is_boundary = model.architecture == crate::config::Architecture::Gliner25;
+        let (schema_dict, attrs_runtime) = if is_boundary {
+            match schema.expanded_with_attributes() {
+                Ok((expanded, prompts)) => {
+                    let runtime = (!prompts.is_empty()).then(|| {
+                        crate::inference::boundary::AttributesRuntime {
+                            prompt_by_label: prompts,
+                            groups: schema
+                                .entity_attribute_groups
+                                .iter()
+                                .map(|(k, v)| (k.clone(), v.clone()))
+                                .collect(),
+                        }
+                    });
+                    (expanded.to_dict(), runtime)
+                }
+                Err(e) => return Err(e),
+            }
+        } else {
+            (schema.to_dict(), None)
+        };
+        let attrs_ref = attrs_runtime.as_ref();
         // Match the Python reference: chunk documents beyond the default chunk
         // size (384 words) rather than waiting for the full encoder window —
         // boundary-model recall collapses on long single-window inputs.
@@ -836,6 +856,7 @@ impl GLiNER2 {
                 include_confidence,
                 include_spans,
                 max_len,
+                attrs_ref,
             )?;
             all_expanded_results.extend(results);
         }
@@ -896,6 +917,7 @@ impl GLiNER2 {
         include_confidence: bool,
         include_spans: bool,
         max_len: Option<usize>,
+        attrs: Option<&crate::inference::boundary::AttributesRuntime>,
     ) -> Result<Vec<ExtractionResult>> {
         // Collate batch
         let collator = match max_len {
@@ -928,6 +950,8 @@ impl GLiNER2 {
                     sample_idx,
                     threshold,
                     include_confidence,
+                    include_spans,
+                    attrs,
                 )?;
                 let _ = batch.original_texts.get(sample_idx);
                 results.push(sample_result);
