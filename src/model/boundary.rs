@@ -1240,85 +1240,59 @@ impl BoundaryModel {
         let bs_rows = bs
             .to_vec2::<f32>()
             .map_err(|e| GlinerError::inference(format!("{e}")))?;
-        let queries_flat = query_states
-            .to_vec2::<f32>()
-            .map_err(|e| GlinerError::inference(format!("{e}")))?;
-        let text_flat = text_states
-            .to_vec2::<f32>()
-            .map_err(|e| GlinerError::inference(format!("{e}")))?;
-
         let boundary_valid = |i: usize| i <= text_len;
 
-        // --- Weight extraction -------------------------------------------------
-        // Query head: start/end/inside projections.
-        let (w_sbp, _, _) = mat2(&self.query_head.start_boundary_projection.weight())?;
-        let b_sbp = bias1(self.query_head.start_boundary_projection.bias())?;
-        let (w_ebp, _, _) = mat2(&self.query_head.end_boundary_projection.weight())?;
-        let b_ebp = bias1(self.query_head.end_boundary_projection.bias())?;
-        let (w_sq, _, _) = mat2(&self.query_head.start_query_projection.weight())?;
-        let b_sq = bias1(self.query_head.start_query_projection.bias())?;
-        let (w_eq, _, _) = mat2(&self.query_head.end_query_projection.weight())?;
-        let b_eq = bias1(self.query_head.end_query_projection.bias())?;
-        let (w_it, _, _) = mat2(&self.query_head.inside_text_projection.weight())?;
-        let b_it = bias1(self.query_head.inside_text_projection.bias())?;
-        let (w_iq, _, _) = mat2(&self.query_head.inside_query_projection.weight())?;
-        let b_iq = bias1(self.query_head.inside_query_projection.bias())?;
-
-        // Projected keys/queries.
-        let sk: Vec<Vec<f32>> = bs_rows
-            .iter()
-            .map(|x| apply_linear(&w_sbp, d, &b_sbp, x))
-            .collect();
-        let ek: Vec<Vec<f32>> = bs_rows
-            .iter()
-            .map(|x| apply_linear(&w_ebp, d, &b_ebp, x))
-            .collect();
-        let sq: Vec<Vec<f32>> = queries_flat
-            .iter()
-            .map(|x| apply_linear(&w_sq, h, &b_sq, x))
-            .collect();
-        let eq: Vec<Vec<f32>> = queries_flat
-            .iter()
-            .map(|x| apply_linear(&w_eq, h, &b_eq, x))
-            .collect();
-        let itk: Vec<Vec<f32>> = text_flat
-            .iter()
-            .map(|x| apply_linear(&w_it, h, &b_it, x))
-            .collect();
-        let iq: Vec<Vec<f32>> = queries_flat
-            .iter()
-            .map(|x| apply_linear(&w_iq, h, &b_iq, x))
-            .collect();
+        // --- Projected keys/queries (batched through candle gemm) --------------
+        let sk_t = self.query_head.start_boundary_projection.forward(&bs)?;
+        let ek_t = self.query_head.end_boundary_projection.forward(&bs)?;
+        let sq_t = self.query_head.start_query_projection.forward(query_states)?;
+        let eq_t = self.query_head.end_query_projection.forward(query_states)?;
+        let itk_t = self.query_head.inside_text_projection.forward(text_states)?;
+        let iq_t = self.query_head.inside_query_projection.forward(query_states)?;
 
         // --- Marginal logits -------------------------------------------------
+        // start/end: (Q, n) = sq @ sk^T / sqrt_d
+        let start_mm = sq_t
+            .matmul(&sk_t.transpose(0, 1)?)?
+            .affine(1.0 / sqrt_d as f64, 0.0)?
+            .to_vec2::<f32>()
+            .map_err(|e| GlinerError::inference(format!("{e}")))?;
+        let end_mm = eq_t
+            .matmul(&ek_t.transpose(0, 1)?)?
+            .affine(1.0 / sqrt_d as f64, 0.0)?
+            .to_vec2::<f32>()
+            .map_err(|e| GlinerError::inference(format!("{e}")))?;
         let mut start_logits = vec![vec![MASK_LOGIT; n]; q];
         let mut end_logits = vec![vec![MASK_LOGIT; n]; q];
         for qi in 0..q {
             for i in 0..n {
                 if boundary_valid(i) {
-                    start_logits[qi][i] = dot(&sq[qi], &sk[i]) / sqrt_d;
-                    end_logits[qi][i] = dot(&eq[qi], &ek[i]) / sqrt_d;
+                    start_logits[qi][i] = start_mm[qi][i];
+                    end_logits[qi][i] = end_mm[qi][i];
                 }
             }
         }
 
         // Inside logits over tokens plus per-query prefix sums over boundaries:
         // prefix[0] = 0; prefix[i+1] = sum of centered inside logits [0..i].
+        let inside_mm = iq_t
+            .matmul(&itk_t.transpose(0, 1)?)?
+            .affine(1.0 / sqrt_d as f64, 0.0)?
+            .to_vec2::<f32>()
+            .map_err(|e| GlinerError::inference(format!("{e}")))?;
         let mut inside_mean = vec![0.0f32; q];
         let mut inside_prefix = vec![vec![0.0f32; n + 1]; q];
         for qi in 0..q {
-            let mut logits = vec![0.0f32; l];
             let mut sum = 0.0f32;
             for t in 0..text_len.min(l) {
-                logits[t] = dot(&iq[qi], &itk[t]) / sqrt_d;
-                sum += logits[t];
+                sum += inside_mm[qi][t];
             }
             inside_mean[qi] = sum / (text_len.max(1) as f32);
             let mut acc = 0.0f32;
             for i in 0..=n {
                 inside_prefix[qi][i] = acc;
                 if i < l && i < text_len {
-                    acc += logits[i] - inside_mean[qi];
+                    acc += inside_mm[qi][i] - inside_mean[qi];
                 }
             }
         }
@@ -1362,18 +1336,18 @@ impl BoundaryModel {
             }
         }
 
-        let (w_pbs, _, _) = mat2(&self.pool_builder.start_projection.weight())?;
-        let b_pbs = bias1(self.pool_builder.start_projection.bias())?;
-        let (w_pbe, _, _) = mat2(&self.pool_builder.end_projection.weight())?;
-        let b_pbe = bias1(self.pool_builder.end_projection.bias())?;
-        let pbsk: Vec<Vec<f32>> = bs_rows
-            .iter()
-            .map(|x| apply_linear(&w_pbs, d, &b_pbs, x))
-            .collect();
-        let pbek: Vec<Vec<f32>> = bs_rows
-            .iter()
-            .map(|x| apply_linear(&w_pbe, d, &b_pbe, x))
-            .collect();
+        let pbsk: Vec<Vec<f32>> = self
+            .pool_builder
+            .start_projection
+            .forward(&bs)?
+            .to_vec2::<f32>()
+            .map_err(|e| GlinerError::inference(format!("{e}")))?;
+        let pbek: Vec<Vec<f32>> = self
+            .pool_builder
+            .end_projection
+            .forward(&bs)?
+            .to_vec2::<f32>()
+            .map_err(|e| GlinerError::inference(format!("{e}")))?;
 
         let compat: Vec<f32> = (0..pair_s.len())
             .map(|p| dot(&pbsk[pair_s[p]], &pbek[pair_e[p]]) / sqrt_d)
@@ -1430,6 +1404,7 @@ impl BoundaryModel {
             .collect();
 
         // --- SharedPoolScorer --------------------------------------------------
+        // Weight rows for the scalar candidate-composition kernel below.
         let (w_ss, _, _) = mat2(&self.pool_scorer.start_projection.weight())?;
         let b_ss = bias1(self.pool_scorer.start_projection.bias())?;
         let (w_se, _, _) = mat2(&self.pool_scorer.end_projection.weight())?;
@@ -1440,25 +1415,16 @@ impl BoundaryModel {
         let b_prior = bias1(self.pool_scorer.prior_projection.bias())?;
         let (w_cproj, _, _) = mat2(&self.pool_scorer.content_projection.weight())?;
         let b_cproj = bias1(self.pool_scorer.content_projection.bias())?;
-        let (w_qproj, _, _) = mat2(&self.pool_scorer.query_projection.weight())?;
-        let b_qproj = bias1(self.pool_scorer.query_projection.bias())?;
-        let (w_film, _, _) = mat2(&self.pool_scorer.film.weight())?;
-        let b_film = bias1(self.pool_scorer.film.bias())?;
-        let (w_fo_h, _, _) = mat2(&self.pool_scorer.film_output_hidden.weight())?;
-        let b_fo_h = bias1(self.pool_scorer.film_output_hidden.bias())?;
-        let (w_fo_o, _, _) = mat2(&self.pool_scorer.film_output_out.weight())?;
-        let b_fo_o = bias1(self.pool_scorer.film_output_out.bias())?;
-        let pool_norm = self.pool_scorer.candidate_norm_params()?;
 
         // Span-content pooling: value-project tokens, mean over the span via a
         // running-sum, then LayerNorm (content_soft_max_pool = false).
-        let (w_cv, _, _) = mat2(&self.pair_scorer.content_value_weight())?;
-        let b_cv = bias1(self.pair_scorer.content_value_bias().as_ref())?;
         let (ln_w, ln_b) = self.pair_scorer.content_ln_params()?;
-        let token_values: Vec<Vec<f32>> = text_flat
-            .iter()
-            .map(|x| apply_linear(&w_cv, h, &b_cv, x))
-            .collect();
+        let token_values: Vec<Vec<f32>> = self
+            .pair_scorer
+            .content_value_projection
+            .forward(text_states)?
+            .to_vec2::<f32>()
+            .map_err(|e| GlinerError::inference(format!("{e}")))?;
         // Running sums per content dimension over valid tokens.
         let mut run_sum = vec![vec![0.0f32; c_dim]; n + 1];
         for t in 0..l {
@@ -1508,25 +1474,51 @@ impl BoundaryModel {
                 cand[ri] = acc;
             }
                 {
-                    let (nw, nb) = (&pool_norm.0, &pool_norm.1);
-                    cand = layernorm(&cand, nw, nb)
+                    let (nw, nb) = self.pool_scorer.candidate_norm_params()?;
+                    cand = layernorm(&cand, &nw, &nb)
                         .unwrap_or_else(|e| panic!("candidate norm: {e}"));
                 }
                 candidates.push(cand);
         }
 
-        // Query projection + FiLM conditioning.
-        let qproj: Vec<Vec<f32>> = queries_flat
-            .iter()
-            .map(|x| apply_linear(&w_qproj, h, &b_qproj, x))
-            .collect();
-        let films: Vec<(Vec<f32>, Vec<f32>)> = qproj
-            .iter()
-            .map(|qp| {
-                let fb = apply_linear(&w_film, d, &b_film, qp);
-                (fb[..d].to_vec(), fb[d..].to_vec())
-            })
-            .collect();
+        // Query projection + FiLM conditioning, fully batched.
+        //
+        // conditioned[c, q] = cand[c] * (1 + gamma[q]) + beta[q]; the FiLM MLP
+        // then maps each (C*Q, d) row to a scalar correction. One gemm chain
+        // replaces the previous per-pair scalar loops.
+        let qproj_t = self.pool_scorer.query_projection.forward(query_states)?;
+        let film_fb = self.pool_scorer.film.forward(&qproj_t)?; // (Q, 2d)
+        let gamma = film_fb.narrow(1, 0, d)?.unsqueeze(0)?; // (1, Q, d)
+        let beta = film_fb.narrow(1, d, d)?.unsqueeze(0)?; // (1, Q, d)
+
+        let cand_flat: Vec<f32> = candidates.iter().flat_map(|r| r.iter().copied()).collect();
+        let cand_mat = Tensor::from_vec(cand_flat, (c_count, d), text_states.device())
+            .map_err(|e| GlinerError::inference(format!("{e}")))?; // (C, d)
+
+        let cond = cand_mat
+            .unsqueeze(1)?
+            .broadcast_mul(&(gamma.affine(1.0, 1.0))?)?
+            .broadcast_add(&beta)?; // (C, Q, d)
+        let cond_flat = cond.reshape((c_count * q, d))?;
+
+        let fh = self.pool_scorer.film_output_hidden.forward(&cond_flat)?;
+        let inv_sqrt2 = 1.0 / std::f32::consts::SQRT_2 as f64;
+        let fh_act =
+            (fh.affine(0.5, 0.0)? * (fh.affine(inv_sqrt2, 0.0)?.erf()?.affine(1.0, 1.0))?)?;
+        let fo = self
+            .pool_scorer
+            .film_output_out
+            .forward(&fh_act)?
+            .reshape((c_count, q))?
+            .to_vec2::<f32>()
+            .map_err(|e| GlinerError::inference(format!("{e}")))?;
+
+        // Main dot-product scores: (C, Q) = cand @ qproj^T / sqrt_d.
+        let dots = cand_mat
+            .matmul(&qproj_t.transpose(0, 1)?)?
+            .affine(1.0 / sqrt_d as f64, 0.0)?
+            .to_vec2::<f32>()
+            .map_err(|e| GlinerError::inference(format!("{e}")))?;
 
         let mut scores = vec![vec![MASK_LOGIT; q]; c_count];
         for ci in 0..c_count {
@@ -1536,18 +1528,7 @@ impl BoundaryModel {
             let (s, e) = (sel_s[ci], sel_e[ci]);
             let len_i = (e - s).max(1);
             for qi in 0..q {
-                let mut sc = dot(&candidates[ci], &qproj[qi]) / sqrt_d;
-                let (gamma, beta) = (&films[qi].0, &films[qi].1);
-                let conditioned: Vec<f32> = (0..d)
-                    .map(|k| candidates[ci][k] * (1.0 + gamma[k]) + beta[k])
-                    .collect();
-                let fh = apply_linear(&w_fo_h, d, &b_fo_h, &conditioned);
-                let fh_act: Vec<f32> = fh
-                    .iter()
-                    .map(|v| v * 0.5 * (1.0 + erf(v / std::f32::consts::SQRT_2)))
-                    .collect();
-                let fo = apply_linear(&w_fo_o, c_dim, &b_fo_o, &fh_act);
-                sc += fo[0];
+                let mut sc = dots[ci][qi] + fo[ci][qi];
                 sc += start_logits[qi][s] + end_logits[qi][e];
                 let interval = inside_prefix[qi][(e).min(n)] - inside_prefix[qi][(s).min(n)]
                     + inside_mean[qi] * len_i as f32;
