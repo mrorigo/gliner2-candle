@@ -127,6 +127,7 @@ pub(crate) fn extract_sample(
         .map_err(|e| GlinerError::inference(format!("{e}")))?;
 
     // --- Query states -------------------------------------------------------
+    let t0 = std::time::Instant::now();
     let (specs, relation_specs) = build_queries(batch, sample_idx)?;
     let q = specs.len();
     let mut flat_queries = Vec::with_capacity(q * h);
@@ -145,6 +146,9 @@ pub(crate) fn extract_sample(
 
     // --- Score --------------------------------------------------------------
     let scored = boundary.score_sample(&text_states, text_len, &query_states)?;
+    if std::env::var("GLINER2_PROFILE").is_ok() {
+        eprintln!("PROFILE   score_sample={:?} q={} text_len={}", t0.elapsed(), specs.len(), text_len);
+    }
 
     // --- Decode per group -----------------------------------------------------
     let original_text = batch.original_text(sample_idx).unwrap_or_default();

@@ -182,6 +182,8 @@ impl DebertaV3Attention {
             .transpose(1, 2)?
             .contiguous()?;
 
+        let prof = std::env::var("GLINER2_PROFILE").is_ok();
+        let t_qkv = std::time::Instant::now();
         // Compute scale factor based on pos_att_type
         let mut scale_factor = 1.0f64;
         if self.pos_att_type.iter().any(|s| s == "c2p") {
@@ -196,7 +198,9 @@ impl DebertaV3Attention {
         let mut attention_scores = query_layer.matmul(&key_layer.transpose(2, 3)?)?;
         attention_scores = (attention_scores / scale)?;
 
+        if prof { eprintln!("PROFILE     qkv+qk={:?} seq={seq_len}", t_qkv.elapsed()); }
         // Add disentangled attention bias if relative embeddings are available
+        let t_rel = std::time::Instant::now();
         if let Some(rel_emb) = rel_embeddings {
             let rel_att = self.disentangled_attention_bias(
                 &query_layer,
@@ -208,10 +212,13 @@ impl DebertaV3Attention {
             )?;
             attention_scores = attention_scores.add(&rel_att)?;
         }
+        if prof { eprintln!("PROFILE     rel_bias={:?}", t_rel.elapsed()); }
 
         // Apply attention mask
+        let t_sm = std::time::Instant::now();
         attention_scores = attention_scores.add(attention_mask)?;
         let attention_probs = candle_nn::ops::softmax(&attention_scores, 3)?;
+        if prof { eprintln!("PROFILE     mask+softmax={:?}", t_sm.elapsed()); }
 
         // Context layer: (batch, heads, seq, seq) @ (batch, heads, seq, head_size)
         let context = attention_probs.matmul(&value_layer)?;
@@ -304,12 +311,15 @@ impl DebertaV3Attention {
         };
 
         // Repeat for batch size: (heads, pos_emb_size, head_size) -> (batch, heads, pos_emb_size, head_size)
-        let pos_key_layer = pos_key_layer.unsqueeze(0)?.broadcast_as((
-            batch_size,
-            self.num_attention_heads,
-            pos_key_layer.dims()[1],
-            self.attention_head_size,
-        ))?;
+        let pos_key_layer = pos_key_layer
+            .unsqueeze(0)?
+            .broadcast_as((
+                batch_size,
+                self.num_attention_heads,
+                pos_key_layer.dims()[1],
+                self.attention_head_size,
+            ))?
+            .contiguous()?;
 
         // query @ pos_key^T: (batch, heads, seq, head_size) @ (batch, heads, head_size, pos_emb_size)
         let c2p_att = query_layer.matmul(&pos_key_layer.transpose(2, 3)?)?;
@@ -357,12 +367,15 @@ impl DebertaV3Attention {
         };
 
         // Repeat for batch size
-        let pos_query_layer = pos_query_layer.unsqueeze(0)?.broadcast_as((
-            batch_size,
-            self.num_attention_heads,
-            pos_query_layer.dims()[1],
-            self.attention_head_size,
-        ))?;
+        let pos_query_layer = pos_query_layer
+            .unsqueeze(0)?
+            .broadcast_as((
+                batch_size,
+                self.num_attention_heads,
+                pos_query_layer.dims()[1],
+                self.attention_head_size,
+            ))?
+            .contiguous()?;
 
         // key @ pos_query^T: (batch, heads, seq, head_size) @ (batch, heads, head_size, pos_emb_size)
         let p2c_att = key_layer.matmul(&pos_query_layer.transpose(2, 3)?)?;
@@ -455,10 +468,17 @@ impl DebertaV3Layer {
         attention_mask: &Tensor,
         rel_embeddings: Option<&Tensor>,
     ) -> Result<Tensor> {
+        let t0 = std::time::Instant::now();
         let hidden = self
             .attention
             .forward(hidden_states, attention_mask, rel_embeddings)?;
-        self.intermediate.forward(&hidden)
+        let t_attn = t0.elapsed();
+        let t1 = std::time::Instant::now();
+        let out = self.intermediate.forward(&hidden);
+        if std::env::var("GLINER2_PROFILE").is_ok() {
+            eprintln!("PROFILE     attn={t_attn:?} ffn={:?}", t1.elapsed());
+        }
+        out
     }
 }
 
@@ -487,9 +507,23 @@ impl DebertaV3Encoder {
         attention_mask: &Tensor,
         rel_embeddings: Option<&Tensor>,
     ) -> Result<Tensor> {
+        let profile = std::env::var("GLINER2_PROFILE").is_ok();
+        let t_all = std::time::Instant::now();
         let mut hidden = hidden_states.clone();
-        for layer in &self.layers {
-            hidden = layer.forward(&hidden, attention_mask, rel_embeddings)?;
+        let mut attn_time = std::time::Duration::ZERO;
+        let mut ffn_time = std::time::Duration::ZERO;
+        for (i, layer) in self.layers.iter().enumerate() {
+            if profile && i == 0 || profile && i == self.layers.len() - 1 {
+                let t0 = std::time::Instant::now();
+                hidden = layer.forward(&hidden, attention_mask, rel_embeddings)?;
+                let el = t0.elapsed();
+                eprintln!("PROFILE   layer {i}: {el:?} seq={}", hidden.dims()[1]);
+            } else {
+                hidden = layer.forward(&hidden, attention_mask, rel_embeddings)?;
+            }
+        }
+        if profile {
+            eprintln!("PROFILE   encoder_total={:?} seq={}", t_all.elapsed(), hidden.dims()[1]);
         }
         Ok(hidden)
     }

@@ -846,7 +846,10 @@ impl GLiNER2 {
                     "GLiNER2.5 model weights not loaded (boundary head missing)",
                 )
             })?;
+            let t_enc = std::time::Instant::now();
             let token_embs = model.encoder.forward(&batch.input_ids, &batch.attention_mask)?;
+            let t_enc = t_enc.elapsed();
+            let t_score = std::time::Instant::now();
             let mut results = Vec::with_capacity(batch.batch_size());
             for sample_idx in 0..batch.batch_size() {
                 let states = token_embs.narrow(0, sample_idx, 1)?.squeeze(0)?;
@@ -860,6 +863,9 @@ impl GLiNER2 {
                 )?;
                 let _ = batch.original_texts.get(sample_idx);
                 results.push(sample_result);
+            }
+            if std::env::var("GLINER2_PROFILE").is_ok() {
+                eprintln!("PROFILE encoder={t_enc:?} boundary_total={:?} batch={}", t_score.elapsed(), batch.batch_size());
             }
             return Ok(results);
         }

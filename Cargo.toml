@@ -70,3 +70,9 @@ strip = true
 [profile.dev]
 opt-level = 0
 debug = true
+
+# Optimize dependencies in debug/test builds: candle dispatch overhead in
+# unoptimized builds makes inference ~30-100x slower (scalar-heavy tensor
+# dispatch). Workspace code stays debuggable.
+[profile.dev.package."*"]
+opt-level = 3
