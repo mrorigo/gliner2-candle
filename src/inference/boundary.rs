@@ -84,7 +84,7 @@ fn build_queries(
                 })?;
                 sp += 1;
                 pending = match token.as_str() {
-                    "[E]" | "[L]" | "[R]" => Some((token.clone(), pos)),
+                    "[E]" | "[L]" | "[C]" | "[R]" => Some((token.clone(), pos)),
                     _ => None,
                 };
                 continue;
@@ -358,7 +358,11 @@ pub(crate) fn extract_sample(
             }
             "relations" => {
                 if let Some(rs) = boundary.relation_scorer.as_ref() {
-                    if let Some(bs) = scored.boundary_states.as_ref() {
+                    // The relation scorer reads word-level hidden states
+                    // (H-dim), not the D-dim boundary encoder output.
+                    let word_states: Vec<Vec<f32>> = text_states
+                        .to_vec2::<f32>()
+                        .map_err(|e| GlinerError::inference(format!("{e}")))?;
                         // Find the relation spec for this group.
                         if let Some(rel) = relation_specs.iter().find(|r| r.group == group) {
                             let head_qid = rel.head_qid;
@@ -419,7 +423,7 @@ pub(crate) fn extract_sample(
                                 }
                                 if !pair_heads.is_empty() {
                                     let pair_scores = rs.forward(
-                                        bs,
+                                        &word_states,
                                         &qr,
                                         &pair_heads,
                                         &pair_tails,
@@ -444,24 +448,29 @@ pub(crate) fn extract_sample(
                                             ends_map,
                                             (te - 1).min(text_len - 1),
                                         );
-                                        let mut obj = json!({
-                                            "head": {
-                                                "text": safe_slice(original_text, cs_h, ce_h),
-                                                "start": cs_h,
-                                                "end": ce_h,
-                                            },
-                                            "tail": {
-                                                "text": safe_slice(original_text, cs_t, ce_t),
-                                                "start": cs_t,
-                                                "end": ce_t,
-                                            },
-                                        });
-                                        if include_confidence {
-                                            obj.as_object_mut().unwrap().insert(
-                                                "confidence".into(),
-                                                json!(prob),
-                                            );
-                                        }
+                                        let head_text = safe_slice(original_text, cs_h, ce_h);
+                                        let tail_text = safe_slice(original_text, cs_t, ce_t);
+                                        // Output shape mirrors the Python decoder:
+                                        // spans > confidence-only > bare pairs.
+                                        let obj = if include_spans {
+                                            let mut o = json!({
+                                                "head": {"text": head_text, "start": cs_h, "end": ce_h},
+                                                "tail": {"text": tail_text, "start": cs_t, "end": ce_t},
+                                            });
+                                            if include_confidence {
+                                                let conf = json!(prob);
+                                                o["head"]["confidence"] = conf.clone();
+                                                o["tail"]["confidence"] = conf;
+                                            }
+                                            o
+                                        } else if include_confidence {
+                                            json!({
+                                                "head": {"text": head_text, "confidence": prob},
+                                                "tail": {"text": tail_text, "confidence": prob},
+                                            })
+                                        } else {
+                                            json!([head_text, tail_text])
+                                        };
                                         entries.push(obj);
                                     }
                                     let task_name = rel.relation_name.clone();
@@ -469,7 +478,6 @@ pub(crate) fn extract_sample(
                                 }
                             }
                         }
-                    }
                 }
             }
             _ => {}

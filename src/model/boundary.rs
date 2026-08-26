@@ -478,6 +478,89 @@ impl BoundaryProposer {
     }
 }
 
+impl BoundaryProposer {
+    /// Marginal-free, query-conditioned compatibility for caller-provided
+    /// spans. Port of `SparseBoundaryProposer.score_explicit_pairs`:
+    /// rotary-rotated start/end projections gated per query by
+    /// `sigmoid(start_query_projection(q))`.
+    pub fn score_explicit_pairs(
+        &self,
+        boundary_states: &Tensor,
+        query_states: &Tensor,
+        spans: &[(usize, usize)],
+        enable_rotary: bool,
+        rotary_base: f64,
+    ) -> Result<Vec<Vec<f32>>> {
+        use candle_core::Module;
+        let n = boundary_states.dims()[0];
+        let d = boundary_states.dims()[1];
+        let mut start_all = self.start_pair_projection.forward(boundary_states)?;
+        let mut end_all = self.end_key_projection.forward(boundary_states)?;
+        if enable_rotary {
+            start_all = rotary_rotate(&start_all, rotary_base)?;
+            end_all = rotary_rotate(&end_all, rotary_base)?;
+        }
+        // gate: (q, d/2) -> repeat_interleave 2 -> (q, d)
+        let gate_half = candle_nn::ops::sigmoid(&self.start_query_projection.forward(query_states)?)?;
+        let (q, half) = gate_half.dims2()?;
+        let gate = gate_half
+            .reshape((q, half, 1))?
+            .broadcast_as((q, half, 2))?
+            .reshape((q, half * 2))?
+            .to_vec2::<f32>()
+            .map_err(|e| GlinerError::inference(format!("{e}")))?;
+        let sa = start_all.to_vec2::<f32>().map_err(|e| GlinerError::inference(format!("{e}")))?;
+        let ea = end_all.to_vec2::<f32>().map_err(|e| GlinerError::inference(format!("{e}")))?;
+        let scale = 1.0 / (d as f32).sqrt();
+        let mut out = Vec::with_capacity(spans.len());
+        for &(s, e) in spans {
+            let valid = e > s && e <= n;
+            if !valid {
+                out.push(vec![0.0; q]);
+                continue;
+            }
+            let sr = &sa[s.min(n - 1)];
+            let er = &ea[e.min(n - 1)];
+            let row: Vec<f32> = (0..q)
+                .map(|qi| {
+                    let g = &gate[qi];
+                    let dot: f32 = sr
+                        .iter()
+                        .zip(er)
+                        .zip(g)
+                        .map(|((&a, &b), &g)| a * g * b)
+                        .sum();
+                    dot * scale
+                })
+                .collect();
+            out.push(row);
+        }
+        Ok(out)
+    }
+}
+
+/// Rotary rotation of `(N, d)` endpoint states at positions `0..N`
+/// (`RotaryBoundaryEmbedding`).
+pub(crate) fn rotary_rotate(t: &Tensor, base: f64) -> Result<Tensor> {
+    let (n, d) = t.dims2()?;
+    let vals = t.to_vec2::<f32>().map_err(|e| GlinerError::inference(format!("{e}")))?;
+    let inv_freq: Vec<f32> = (0..d / 2)
+        .map(|i| 1.0f32 / base.powf(2.0 * i as f64 / d as f64) as f32)
+        .collect();
+    let mut out = vec![0f32; n * d];
+    for (p, row) in vals.iter().enumerate() {
+        for k in 0..d / 2 {
+            let angle = p as f32 * inv_freq[k];
+            let (c, sn) = (angle.cos(), angle.sin());
+            let even = row[2 * k];
+            let odd = row[2 * k + 1];
+            out[p * d + 2 * k] = even * c - odd * sn;
+            out[p * d + 2 * k + 1] = even * sn + odd * c;
+        }
+    }
+    Tensor::from_vec(out, (n, d), t.device()).map_err(|e| GlinerError::inference(format!("{e}")))
+}
+
 /// Builds the shared candidate pool from proposed boundaries.
 #[derive(Debug)]
 pub struct SharedPoolBuilder {
@@ -597,6 +680,7 @@ pub struct PairScorer {
     compat_mix: Linear,
     length_query_projection: Linear,
     query_gate: Linear,
+    content_query_projection: Linear,
     content_layer_norm: candle_nn::LayerNorm,
     content_value_projection: Linear,
 }
@@ -612,7 +696,8 @@ impl PairScorer {
             endpoint_difference_projection: linear(2 * d, 1, vb.pp("endpoint_difference_projection"))?,
             inside_weight: linear(hidden_size, 1, vb.pp("inside_weight"))?,
             content_bias: linear(c, 1, vb.pp("content_bias"))?,
-            compat_mix: linear(cfg.pair_dim / 16, 1, vb.pp("compat_mix"))?,
+            content_query_projection: linear(hidden_size, c, vb.pp("content_query_projection"))?,
+            compat_mix: linear(cfg.multihead_pair_compat_heads, 1, vb.pp("compat_mix"))?,
             length_query_projection: linear(hidden_size, 3, vb.pp("length_query_projection"))?,
             query_gate: linear(hidden_size, c, vb.pp("query_gate"))?,
             content_layer_norm: layer_norm(c, BOUNDARY_LAYER_NORM_EPS, vb.pp("content_pooler.layer_norm"))?,
@@ -638,6 +723,166 @@ impl PairScorer {
     /// Span-content LayerNorm parameters (`content_pooler.layer_norm`).
     pub fn content_ln_params(&self) -> Result<(Vec<f32>, Vec<f32>)> {
         ln_params(&self.content_layer_norm)
+    }
+
+    /// Score explicit spans for each query. Port of
+    /// `SparseBoundaryPairScorer.forward` restricted to caller-provided
+    /// half-open spans (the `score_explicit_spans` path).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn score_explicit(
+        &self,
+        boundary_states: &Tensor,
+        text_states: &Tensor,
+        query_states: &Tensor,
+        spans: &[(usize, usize)],
+        start_logits: &[Vec<f32>],
+        end_logits: &[Vec<f32>],
+        inside_prefix: &[Vec<f32>],
+        inside_mean: &[f32],
+        prior: &[Vec<f32>],
+        text_len: usize,
+        cfg: &BoundaryConfig,
+    ) -> Result<Vec<Vec<f32>>> {
+        use candle_core::Module;
+        let d = cfg.boundary_dim;
+        let c = cfg.content_dim;
+        let qn = query_states.dims()[0];
+        let n = boundary_states.dims()[0];
+        let scale = 1.0 / (cfg.pair_dim as f32).sqrt();
+        let heads = cfg.multihead_pair_compat_heads.max(1);
+
+        // Endpoint projections (+rotary).
+        let mut start_all = self.start_endpoint_projection.forward(boundary_states)?;
+        let mut end_all = self.end_endpoint_projection.forward(boundary_states)?;
+        if cfg.enable_rotary_endpoints {
+            start_all = crate::model::boundary::rotary_rotate(&start_all, cfg.rotary_base)?;
+            end_all = crate::model::boundary::rotary_rotate(&end_all, cfg.rotary_base)?;
+        }
+        let sa = start_all.to_vec2::<f32>().map_err(|e| GlinerError::inference(format!("{e}")))?;
+        let ea = end_all.to_vec2::<f32>().map_err(|e| GlinerError::inference(format!("{e}")))?;
+        if std::env::var("GLINER2_DEBUG_TERMS").is_ok() {
+            let (wd, _, wd_in) = mat2(&self.endpoint_difference_projection.weight())?;
+            let bd = bias1(self.endpoint_difference_projection.bias())?;
+            let dv: Vec<f32> = (0..d).flat_map(|k| { let x = sa[0][k]-ea[2][k]; [x, x.abs()] }).collect();
+            let manual: f32 = wd[..wd_in].iter().zip(&dv).map(|(a,b)| a*b).sum::<f32>() + bd[0];
+            let _ = manual;
+        }
+
+        // Per-query gate over endpoint dims.
+        let gate_raw = candle_nn::ops::sigmoid(&self.query_gate.forward(query_states)?)?;
+        let (gh_q, gh) = gate_raw.dims2()?;
+        let gate_w = gh * 2; // repeat_interleave 2 when rotary endpoints are on
+        let _ = gate_w;
+        let gate_rows: Vec<Vec<f32>> = if cfg.enable_rotary_endpoints {
+            let g = gate_raw.to_vec2::<f32>().map_err(|e| GlinerError::inference(format!("{e}")))?;
+            g.into_iter()
+                .map(|row| row.iter().flat_map(|&v| [v, v]).collect::<Vec<f32>>())
+                .collect()
+        } else {
+            gate_raw.to_vec2::<f32>().map_err(|e| GlinerError::inference(format!("{e}")))?
+        };
+
+        // Query-derived coefficients.
+        let qw = query_states
+            .to_vec2::<f32>()
+            .map_err(|e| GlinerError::inference(format!("{e}")))?;
+        let (w_diff, _, diff_in) = mat2(&self.endpoint_difference_projection.weight())?;
+        let b_diff = bias1(self.endpoint_difference_projection.bias())?;
+        let (w_cmix, _, cmix_in) = mat2(&self.compat_mix.weight())?;
+        let b_cmix = bias1(self.compat_mix.bias())?;
+        let (w_cq, _, cq_in) = mat2(&self.content_query_projection.weight())?;
+        let b_cq = bias1(self.content_query_projection.bias())?;
+        let (w_cb, _, cb_in) = mat2(&self.content_bias.weight())?;
+        let b_cb = bias1(self.content_bias.bias())?;
+        let (w_iw, _, iw_in) = mat2(&self.inside_weight.weight())?;
+        let b_iw = bias1(self.inside_weight.bias())?;
+        let (w_lq, _, lq_in) = mat2(&self.length_query_projection.weight())?;
+        let b_lq = bias1(self.length_query_projection.bias())?;
+        let _ = (diff_in, cq_in, cb_in, iw_in, lq_in);
+
+        // Span-content pooling from this scorer's own pooler.
+        let vals = self
+            .content_value_projection
+            .forward(text_states)?
+            .to_vec2::<f32>()
+            .map_err(|e| GlinerError::inference(format!("{e}")))?;
+        let mut run = vec![vec![0.0f32; c]; text_states.dims()[0] + 1];
+        for t in 0..text_states.dims()[0] {
+            for k in 0..c {
+                run[t + 1][k] = run[t][k] + vals[t][k];
+            }
+        }
+        let (cln_w, cln_b) = self.content_ln_params()?;
+
+        let mut out = vec![vec![MASK_LOGIT; qn]; spans.len()];
+        for (ci, &(s, e)) in spans.iter().enumerate() {
+            let valid = e > s && e <= n;
+            if !valid {
+                continue;
+            }
+            let sr = &sa[s.min(n - 1)];
+            let er = &ea[e.min(n - 1)];
+            for qi in 0..qn {
+                let gate = &gate_rows[qi];
+                let mut compat_terms = vec![0.0f32; heads];
+                for k in 0..d {
+                    compat_terms[k * heads / d] += sr[k] * gate[k] * er[k];
+                }
+                let mut sc =
+                    apply_linear(&w_cmix, cmix_in, &b_cmix, &compat_terms)[0] * scale;
+                                // Endpoint difference features: concat(d, |d|).
+                let mut diff: Vec<f32> = Vec::with_capacity(2 * d);
+                for k in 0..d {
+                    diff.push(sr[k] - er[k]);
+                }
+                for k in 0..d {
+                    diff.push((sr[k] - er[k]).abs());
+                }
+                sc += apply_linear(&w_diff, diff_in, &b_diff, &diff)[0];
+                // Marginals gathered once.
+                let a_t = start_logits[qi][s.min(start_logits[qi].len() - 1)];
+                let bm_t = end_logits[qi][e.min(end_logits[qi].len() - 1)];
+                sc += a_t;
+                sc += bm_t;
+                // Proposer prior (query-conditioned).
+                sc += prior.get(ci).and_then(|r| r.get(qi)).copied().unwrap_or(0.0);
+
+                // Content evidence.
+                let len_i = (e - s).max(1);
+                let pooled: Vec<f32> = (0..c)
+                    .map(|k| (run[e.min(run.len() - 1)][k] - run[s.min(run.len() - 1)][k]) / len_i as f32)
+                    .collect();
+                let pooled = layernorm(&pooled, &cln_w, &cln_b)
+                    .unwrap_or_else(|err| panic!("pair-scorer content layernorm: {err}"));
+                let cq = apply_linear(&w_cq, cq_in, &b_cq, &qw[qi]);
+                let csc: f32 =
+                    pooled.iter().zip(&cq).map(|(a, b)| a * b).sum::<f32>() / (c as f32).sqrt();
+                let cbi = apply_linear(&w_cb, cb_in, &b_cb, &pooled)[0];
+                sc += csc + cbi;
+
+                // Inside evidence (query-conditioned weight).
+                let interval = inside_prefix[qi][e.min(inside_prefix[qi].len() - 1)]
+                    - inside_prefix[qi][s.min(inside_prefix[qi].len() - 1)]
+                    + inside_mean[qi] * len_i as f32;
+                let iwv = apply_linear(&w_iw, iw_in, &b_iw, &qw[qi])[0];
+                let inside_term = iwv * interval / (len_i as f32).sqrt();
+                sc += inside_term;
+
+                // Length features.
+                let tl = text_len.max(1) as f32;
+                let lf = [
+                    (1.0f32 + len_i as f32).ln(),
+                    len_i as f32 / tl,
+                    1.0 / (len_i as f32).sqrt(),
+                ];
+                let lcoef = apply_linear(&w_lq, lq_in, &b_lq, &qw[qi]);
+                let len_term: f32 = lf.iter().zip(&lcoef).map(|(a, b)| a * b).sum();
+                sc += len_term;
+
+                out[ci][qi] = sc;
+            }
+        }
+        Ok(out)
     }
 }
 
@@ -710,7 +955,8 @@ impl RelationScorer {
     ///
     /// Pure-Rust forward pass mirroring `SparseRelationScorer.forward()`.
     ///
-    /// * `boundary_states` – `[L+1][d]` from `BoundaryEncoder`
+    /// * `states` – `[L][H]` word-level hidden states (NOT the D-dim boundary
+    ///   encoder output); endpoints and span pooling read from these
     /// * `relation_query` – `[2*hidden]` directional relation query state
     /// * `head_spans`, `tail_spans` – half-open `(start, end)` per pair
     /// * `text_len` – valid sequence length for distance normalisation
@@ -718,7 +964,7 @@ impl RelationScorer {
     /// Returns one logit per pair.
     pub fn forward(
         &self,
-        boundary_states: &[Vec<f32>],
+        states: &[Vec<f32>],
         relation_query: &[f32],
         head_spans: &[(usize, usize)],
         tail_spans: &[(usize, usize)],
@@ -729,8 +975,7 @@ impl RelationScorer {
         if n_pairs == 0 {
             return Ok(Vec::new());
         }
-        let d = boundary_states[0].len(); // boundary_dim
-        let seq_len = boundary_states.len(); // L+1
+        let seq_len = states.len();
 
         // Weight extraction
         let (w_hcp, _, _) = mat2(&self.head_content_projection.weight())?;
@@ -748,7 +993,7 @@ impl RelationScorer {
 
         let gather = |pos: usize| -> Vec<f32> {
             let safe = pos.min(seq_len - 1);
-            boundary_states[safe].clone()
+            states[safe].clone()
         };
 
         let mut scores = Vec::with_capacity(n_pairs);
@@ -777,19 +1022,23 @@ impl RelationScorer {
             feats.push(dist);
 
             let mlp_hidden = apply_linear(&w_mlp0, mlp0_in, &b_mlp0, &feats);
-            let mlp_hidden_gelu: Vec<f32> = mlp_hidden.iter().map(|v| gelu_f32(*v)).collect();
+            // Exact (erf-based) GELU to match python nn.GELU().
+            let mlp_hidden_gelu: Vec<f32> = mlp_hidden
+                .iter()
+                .map(|v| v * 0.5 * (1.0 + erf(v / std::f32::consts::SQRT_2)))
+                .collect();
             let mut score = apply_linear(&w_mlp3, h, &b_mlp3, &mlp_hidden_gelu)[0];
 
             // Biaffine content path
             // Pool span as mean of boundary states in [start, end)
             let pool = |start: usize, end: usize| -> Vec<f32> {
                 let s = start.min(seq_len - 1);
-                let e = end.min(seq_len);
+                let e = end.max(s + 1).min(seq_len);
                 let width = (e - s).max(1);
-                let mut result = vec![0.0f32; d];
+                let mut result = vec![0.0f32; h];
                 for pos in s..e {
-                    for j in 0..d {
-                        result[j] += boundary_states[pos][j];
+                    for j in 0..h {
+                        result[j] += states[pos][j];
                     }
                 }
                 for v in &mut result {
@@ -1314,7 +1563,104 @@ impl BoundaryModel {
         query_states: &Tensor,
         spans: &[(usize, usize)],
     ) -> Result<SharedPoolScores> {
-        self.score_spans(text_states, text_len, query_states, Some(spans))
+        use candle_core::Module;
+        let d = self.config.boundary_dim;
+        let h = query_states.dims()[1];
+        let n = text_len + 1;
+        let qn = query_states.dims()[0];
+
+        // Boundary encoding + marginals (same as the pooled path).
+        let bs = self
+            .encoder
+            .forward(&text_states.unsqueeze(0)?, &[text_len])?
+            .squeeze(0)?;
+        let sqrt_d = 1.0 / (d as f32).sqrt();
+        let sk = self.query_head.start_boundary_projection.forward(&bs)?;
+        let ek = self.query_head.end_boundary_projection.forward(&bs)?;
+        let sq = self.query_head.start_query_projection.forward(query_states)?;
+        let eq = self.query_head.end_query_projection.forward(query_states)?;
+        let start_mm = sq
+            .matmul(&sk.transpose(0, 1)?)?
+            .affine(sqrt_d as f64, 0.0)?
+            .to_vec2::<f32>()
+            .map_err(|e| GlinerError::inference(format!("{e}")))?;
+        let end_mm = eq
+            .matmul(&ek.transpose(0, 1)?)?
+            .affine(sqrt_d as f64, 0.0)?
+            .to_vec2::<f32>()
+            .map_err(|e| GlinerError::inference(format!("{e}")))?;
+        let mut start_logits = vec![vec![MASK_LOGIT; n]; qn];
+        let mut end_logits = vec![vec![MASK_LOGIT; n]; qn];
+        for qi in 0..qn {
+            for i in 0..n {
+                if i <= text_len {
+                    start_logits[qi][i] = start_mm[qi][i];
+                    end_logits[qi][i] = end_mm[qi][i];
+                }
+            }
+        }
+        // Inside prefix (centered, mean restored at scoring time).
+        let itk = self.query_head.inside_text_projection.forward(text_states)?;
+        let iq = self.query_head.inside_query_projection.forward(query_states)?;
+        let inside_mm = iq
+            .matmul(&itk.transpose(0, 1)?)?
+            .affine(sqrt_d as f64, 0.0)?
+            .to_vec2::<f32>()
+            .map_err(|e| GlinerError::inference(format!("{e}")))?;
+        let l = text_states.dims()[0];
+        let mut inside_prefix = vec![vec![0.0f32; n + 1]; qn];
+        let mut inside_mean = vec![0.0f32; qn];
+        for qi in 0..qn {
+            let mut sum = 0.0f32;
+            for t in 0..text_len.min(l) {
+                sum += inside_mm[qi][t];
+            }
+            inside_mean[qi] = sum / (text_len.max(1) as f32);
+            let mut acc = 0.0f32;
+            for i in 0..=n {
+                inside_prefix[qi][i] = acc;
+                if i < l && i < text_len {
+                    acc += inside_mm[qi][i] - inside_mean[qi];
+                }
+            }
+        }
+
+        // Query-conditioned proposer prior.
+        let prior = self.proposer.score_explicit_pairs(
+            &bs,
+            query_states,
+            spans,
+            self.config.enable_rotary_endpoints,
+            self.config.rotary_base,
+        )?;
+
+        let scores = self.pair_scorer.score_explicit(
+            &bs,
+            text_states,
+            query_states,
+            spans,
+            &start_logits,
+            &end_logits,
+            &inside_prefix,
+            &inside_mean,
+            &prior,
+            text_len,
+            &self.config,
+        )?;
+
+        let bs_rows = bs
+            .to_vec2::<f32>()
+            .map_err(|e| GlinerError::inference(format!("{e}")))?;
+        Ok(SharedPoolScores {
+            starts: spans.iter().map(|p| p.0).collect(),
+            ends: spans.iter().map(|p| p.1).collect(),
+            valid: spans.iter().map(|&(s, e)| e > s && e <= n).collect(),
+            scores,
+            candidate_states: None,
+            boundary_states: Some(bs_rows),
+            debug_terms: None,
+            debug_candidates: None,
+        })
     }
 
     fn score_spans(
@@ -1481,11 +1827,16 @@ impl BoundaryModel {
         }
 
         // Candidate composition.
+        let debug_candidates_on = std::env::var("GLINER2_DEBUG_TERMS").is_ok();
+        let mut debug_cand_rows: Vec<Vec<f32>> = Vec::new();
         let tl = text_len.max(1) as f32;
         let mut candidates: Vec<Vec<f32>> = Vec::with_capacity(c_count);
         for i in 0..c_count {
             if !sel_valid[i] {
                 candidates.push(vec![0.0; d]);
+                if debug_candidates_on {
+                    debug_cand_rows.push(vec![0.0; d]);
+                }
                 continue;
             }
             let (s, e) = (sel_s[i], sel_e[i]);
@@ -1501,7 +1852,7 @@ impl BoundaryModel {
 
             let mut cand = vec![0.0f32; d];
             for ri in 0..d {
-                let mut acc = b_ss[ri] + b_se[ri] + b_len[ri] + b_prior[ri] + b_cproj[ri] * 0.0;
+                let mut acc = b_ss[ri] + b_se[ri] + b_len[ri] + b_prior[ri] + b_cproj[ri];
                 let wsr = &w_ss[ri * d..(ri + 1) * d];
                 let wer = &w_se[ri * d..(ri + 1) * d];
                 let wlr = &w_len[ri * 3..(ri + 1) * 3];
@@ -1525,6 +1876,9 @@ impl BoundaryModel {
                         .unwrap_or_else(|e| panic!("candidate norm: {e}"));
                 }
                 candidates.push(cand);
+                if debug_candidates_on {
+                    debug_cand_rows.push(candidates.last().unwrap().clone());
+                }
         }
 
         // Query projection + FiLM conditioning, fully batched.
@@ -1625,6 +1979,7 @@ impl BoundaryModel {
             candidate_states: cand_states,
             boundary_states: Some(bs_rows),
             debug_terms: debug_terms_out,
+            debug_candidates: debug_candidates_on.then_some(debug_cand_rows),
         })
     }
     /// Shared-pool candidate selection (upstream `DocumentCandidatePool`).
@@ -1747,6 +2102,8 @@ pub struct SharedPoolScores {
     /// Per-candidate score components `[dots, film, start_m, end_m, inside]`
     /// when `GLINER2_DEBUG_TERMS` is set (parity tooling).
     pub debug_terms: Option<Vec<[f32; 5]>>,
+    /// Post-normalization candidate vectors when `GLINER2_DEBUG_TERMS` is set.
+    pub debug_candidates: Option<Vec<Vec<f32>>>,
 }
 
 const SQRT_2_OVER_PI: f32 = 0.797_884_6;
@@ -1760,15 +2117,17 @@ fn gelu_f32(x: f32) -> f32 {
 }
 
 fn erf(x: f32) -> f32 {
-    // Abramowitz & Stegun 7.1.26 approximation (|err| < 1.5e-7)
+    // Abramowitz & Stegun 7.1.26 approximation (|err| < 1.5e-7).
+    // NOTE: the polynomial is multiplied by exp(-x^2); omitting that factor
+    // saturates far too slowly and silently corrupts every GELU built on it.
     let sign = if x < 0.0 { -1.0 } else { 1.0 };
     let x = x.abs();
     let t = 1.0 / (1.0 + 0.3275911 * x);
-    let y = 1.0
-        - t * (0.254829592
+    let poly = t
+        * (0.254829592
             - t * (0.284496736
                 - t * (1.421413741 - t * (1.453152027 - t * 1.061405429))));
-    sign * y
+    sign * (1.0 - poly * (-x * x).exp())
 }
 
 fn layernorm(x: &[f32], weight: &[f32], bias: &[f32]) -> Result<Vec<f32>> {

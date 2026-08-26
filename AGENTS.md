@@ -6,19 +6,21 @@ This is a pure Rust implementation of the [GLiNER2](https://github.com/urchade/G
 
 **Key Achievement**: Both GLiNER2 (span-enumeration) and GLiNER2.5 (boundary-prediction) pipelines work end-to-end with real model weights downloaded from HuggingFace Hub.
 
-**Current Status (Phases 1-5 complete)**:
+**Current Status (Phases 1-5 + Phase D complete)**:
 - GLiNER2: Fully functional entity extraction.
 - GLiNER2.5: Full boundary pipeline with numeric parity vs the Python
-  reference on the parity fixture (Tim Cook 0.998 / Apple 0.951 /
-  Cupertino). Entities, classifications, records, and relations decode.
-- Long documents (>384 words) are auto-chunked in `batch_extract` and merged;
-  matches Python recall characteristics (both implementations degrade on long
-  single-window inputs — chunking is required, not optional).
+  reference. All four task types match Python outputs:
+  - Entities: full matrix parity (global=0.0000, relevant=0.0000)
+  - Classifications: exact output match (positive)
+  - Relations: exact format match (bare pairs, no flags)
+  - Attributes (single-label): softmax logits matched to 8 decimals (0.9966161847)
+  - Attributes (multi-label): sigmoid logits matched to 7 decimals (0.5735875)
+- Phase D task parity fixes: endpoint difference vector layout (concat d/|d| not interleaved),
+  relation scorer receives H-dim word states, content pooler weight ownership, classification [C] markers.
+- Long documents (>384 words) are auto-chunked in `batch_extract` and merged.
 - Performance (release, CPU): short inputs at Python parity (~71ms/call).
-  Encoder rel-bias optimized (hoisted shared gather indices, custom row-copy
-  kernels, fused p2c transpose): ~15ms -> ~7ms/layer at seq=465. Boundary
-  scorer tensorized (batched gemm projections + FiLM over all pairs):
-  score_sample ~72ms -> ~27ms/chunk. 2400-word doc: ~3.1s end-to-end.
+  Encoder rel-bias optimized: ~15ms → ~7ms/layer. Boundary scorer tensorized:
+  score_sample ~72ms → ~27ms/chunk. 2400-word doc: ~3.1s end-to-end.
 
 ## 🏗️ Architecture Summary
 
@@ -157,6 +159,13 @@ Always validate the FULL candidate matrix vs Python (`pooled_indices.json`
 + `pair_logits.json` fixtures), not just the top hits. Residual agreement
 after the fix: decision-relevant logits within ~0.25 of Python; extraction
 outputs identical.
+
+### Fixed: endpoint-difference vector layout (Phase D critical bug)
+`torch.cat((d, |d|), dim=-1)` concatenates two halves: first all d values,
+then all abs values. The Rust code used `.flat_map(|k| [d[k], |d[k]|])`
+which interleaves `(d,|d|)` per-dim — identical first few values but
+wrong overall, causing a constant logit shift (~0.27–0.38) on explicit
+scoring calls. Fixed with: push all diffs first, then all abs diffs.
 
 ### Span attributes do NOT need dedicated weights (Phase 3e unblocked)
 Verified against all three checkpoints (334 tensors each, zero attribute
