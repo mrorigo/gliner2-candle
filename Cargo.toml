@@ -2,7 +2,7 @@
 name = "gliner2-rs"
 version = "0.1.0"
 edition = "2024"
-description = "Rust implementation of GLiNER2 for efficient CPU-based information extraction"
+description = "Pure Rust implementation of GLiNER2 and GLiNER2.5 for CPU-based information extraction (entities, classifications, relations, span attributes)"
 license = "Apache-2.0"
 repository = "https://github.com/mrorigo/gliner2-rust"
 keywords = ["nlp", "ner", "information-extraction", "transformer", "gliner"]

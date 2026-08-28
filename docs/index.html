@@ -599,6 +599,9 @@
                         <a href="https://github.com/urchade/GLiNER2"
                             >Python Ref</a
                         >
+                        <a href="https://github.com/urchade/GLiNER2.5"
+                            >GLiNER2.5</a
+                        >
                         <a href="https://github.com/huggingface/candle"
                             >Candle</a
                         >
@@ -608,17 +611,19 @@
 
             <section class="hero">
                 <article class="hero-main reveal">
-                    <span class="eyebrow">Pure Rust · Candle · End-to-End</span>
+                    <span class="eyebrow">Pure Rust · Candle · GLiNER2 + GLiNER2.5</span>
                     <h1>
-                        Production-Grade Information Extraction, Native by
+                        Full Numeric Parity with the Python Reference, Native by
                         Design
                     </h1>
                     <p class="lede">
-                        GLiNER2 Rust ports the full GLiNER2 architecture from
-                        Python/PyTorch into a production-oriented Rust stack. It
+                        GLiNER2 Rust ports both the GLiNER2 (span-enumeration)
+                        and GLiNER2.5 (boundary-prediction) architectures from
+                        Python/PyTorch into a pure-Rust, candle-based stack. It
                         loads real HuggingFace weights, runs the complete
-                        forward path, and exposes a stable extraction API
-                        designed for deployment.
+                        forward path, and matches Python outputs across
+                        entities, classifications, relations, and span
+                        attributes.
                     </p>
                     <div class="cta-row">
                         <a class="btn btn-primary" href="../README.md"
@@ -635,9 +640,9 @@
 
                 <aside class="hero-side reveal">
                     <div class="code" aria-label="Example command">
-                        $ cargo test --test real_inference_test \<br />
-                        &nbsp;&nbsp;test_real_gliner2_model_loading --
-                        --nocapture
+                        $ cargo test --release --test \
+                        real_inference_test_25 test_task_output_parity \
+                        -- --ignored
                     </div>
                     <div class="metrics" id="metrics" aria-live="polite">
                         <div class="metric">
@@ -645,16 +650,16 @@
                             <span>Encoder Layers</span>
                         </div>
                         <div class="metric">
-                            <b data-target="768">0</b>
-                            <span>Hidden Size</span>
+                            <b data-target="148">0</b>
+                            <span>Unit Tests</span>
                         </div>
                         <div class="metric">
-                            <b data-target="20">0</b>
-                            <span>Count Classes</span>
+                            <b data-target="4">0</b>
+                            <span>Task Types Matched</span>
                         </div>
                         <div class="metric">
-                            <b data-target="512">0</b>
-                            <span>RelPos Embeddings</span>
+                            <b data-target="0">0</b>
+                            <span>Pair-Logit Diff (relevant)</span>
                         </div>
                     </div>
                     <div class="readiness" aria-label="Readiness board">
@@ -662,32 +667,33 @@
                         <ul class="readiness-list">
                             <li>
                                 <span class="dot-ok" aria-hidden="true"></span>
-                                <span>Model loading + forward pass</span>
+                                <span>GLiNER2 + GLiNER2.5 loading &amp; forward</span>
                                 <span class="value">100%</span>
                             </li>
                             <li>
                                 <span class="dot-ok" aria-hidden="true"></span>
                                 <span class="track">
                                     <span class="track-label"
-                                        >Schema embedding alignment</span
+                                        >Entity-matrix parity (global /
+                                        relevant)</span
                                     >
                                     <span class="rail"
-                                        ><span data-width="99"></span
+                                        ><span data-width="100"></span
                                     ></span>
                                 </span>
-                                <span class="value">99%</span>
+                                <span class="value">100%</span>
                             </li>
                             <li>
                                 <span class="dot-ok" aria-hidden="true"></span>
                                 <span class="track">
                                     <span class="track-label"
-                                        >Extraction quality validation</span
+                                        >Attribute logit parity (output)</span
                                     >
                                     <span class="rail"
-                                        ><span data-width="97"></span
+                                        ><span data-width="100"></span
                                     ></span>
                                 </span>
-                                <span class="value">97%</span>
+                                <span class="value">100%</span>
                             </li>
                         </ul>
                     </div>
@@ -699,24 +705,27 @@
                 <section class="card stack reveal">
                     <h2>Architecture Highlights</h2>
                     <p>
-                        The implementation mirrors GLiNER2 base-v1 while staying
-                        idiomatic to Rust and Candle internals.
+                        Both GLiNER2 (span-enumeration) and GLiNER2.5
+                        (boundary-prediction) pipelines run end-to-end in Rust,
+                        matching the Python reference numerically.
                     </p>
                     <ul class="list">
                         <li>
-                            DeBERTa-v3 encoder with relative position embeddings
+                            Custom DeBERTa-v3 encoder with relative position
+                            embeddings and sign-flipped rel_pos (matches HF)
                         </li>
                         <li>
-                            markerV0 span representation (Linear + GELU +
-                            Linear)
+                            GLiNER2: markerV0 span representation + classifier /
+                            count heads
                         </li>
                         <li>
-                            Classifier MLP 768 → 1536 → 1 and count head 768 →
-                            1536 → 20
+                            GLiNER2.5: boundary encoder, shared-pool scorer with
+                            relation reranker, and span-attribute scoring
                         </li>
                         <li>
                             HF tokenizer-driven collator with schema + text
-                            batching
+                            batching, and auto-chunking for long documents
+                            (&gt;384 words)
                         </li>
                     </ul>
                 </section>
@@ -732,11 +741,12 @@
                         <span class="chip">Tokenizer</span>
                         <span class="chip">Collator</span>
                         <span class="chip">DeBERTa V3</span>
-                        <span class="chip">Span Rep</span>
-                        <span class="chip">Classifier + Count Heads</span>
+                        <span class="chip">Span / Boundary Head</span>
+                        <span class="chip">Pooled Scoring</span>
                         <span class="chip">Entities</span>
+                        <span class="chip">Classifications</span>
                         <span class="chip">Relations</span>
-                        <span class="chip">Structures</span>
+                        <span class="chip">Attributes</span>
                     </div>
                 </section>
 
@@ -750,28 +760,29 @@
                     <div class="ticker">
                         <span class="pulse"></span>
                         <span id="status-text"
-                            >Core pipeline stable · Strict max_len parity
-                            fixtures passing</span
+                            >All four task types match Python · Phase D parity
+                            complete</span
                         >
                     </div>
                 </section>
 
                 <section class="card status reveal">
-                    <h2>Release Readiness</h2>
+                    <h2>Parity &amp; Release Readiness</h2>
                     <p>
-                        The architecture is complete, integration flow is
-                        running end-to-end, and the parity harness now validates
-                        strict long-context <code>max_len</code> behavior across
-                        entities, relations, and structures. Remaining work is
-                        focused on deeper intermediate-tensor parity and broader
-                        regression coverage.
+                        Every task type validated against the Python reference:
+                        entities full-matrix parity (global and relevant
+                        =&nbsp;0.0000), classifications exact output match,
+                        relations exact bare-pair output, and span attributes
+                        matching to 7–8 decimal places. Long documents are
+                        auto-chunked and merged. Remaining work is release /
+                        CI packaging only.
                     </p>
                 </section>
             </main>
 
             <footer>
-                Built for GLiNER2 Rust · Fast iteration in `cargo`,
-                release-ready reliability in native code.
+                Built for GLiNER2 Rust · GLiNER2 + GLiNER2.5 at full Python
+                numeric parity.
             </footer>
         </div>
 
@@ -817,9 +828,9 @@
             });
 
             const phrases = [
-                "Core pipeline stable · Strict max_len parity fixtures passing",
-                "Tokenizer bridge online · Schema path aligned",
-                "Candle backend loaded · Intermediate-tensor parity hardening ongoing",
+                "All four task types match Python · Phase D parity complete",
+                "Entities full-matrix parity · Relations exact · Attributes 7–8dp",
+                "Long documents auto-chunked + merged · release / CI packaging remains",
             ];
             let idx = 0;
             setInterval(() => {

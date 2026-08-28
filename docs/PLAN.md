@@ -1,10 +1,17 @@
 # GLiNER2 Rust Port - Implementation Plan & Status
 
+> **STATUS: SUPERSEDED — HISTORICAL RECORD.** This was the original Phase 1
+> plan against the **tch/PyTorch** backend. The project was subsequently
+> migrated to **candle** (see [PLAN2.md](./PLAN2.md)) and extended with the
+> GLiNER2.5 boundary pipeline (see [PLAN_2.5.md](./PLAN_2.5.md)). The GLiNER2
+> track is now in **maintenance mode**; new feature work targets GLiNER2.5.
+> The current canonical status lives in the top-level `README.md` and `AGENTS.md`.
+
 ## Overview
 
 This document outlines the plan and current status for porting GLiNER2 inference from Python to Rust. The goal is to enable GLiNER2 inference in Rust while maintaining compatibility with the Python model's behavior and output format. Training, LoRA, and other non-inference features are out of scope.
 
-**Current Status**: ~9,500 lines of foundational code with 115 unit tests. **Builds and compiles successfully** with tch 0.24 / PyTorch 2.11. Tests compile but require runtime libtorch to execute.
+**Historical Status (tch era)**: ~9,500 lines of foundational code with 115 unit tests, building against tch 0.24 / PyTorch 2.11. **The tch backend has since been fully replaced by candle** ([PLAN2.md](./PLAN2.md)); the current test suite is 148 unit tests plus integration/checkpoint suites.
 
 ## Core Architecture
 
@@ -219,6 +226,9 @@ GLiNER2 inference consists of three main stages:
 
 ## File Structure
 
+> Historical (tch-era) layout. The current structure is candle-based and is
+> documented in `AGENTS.md` and `PLAN2.md`.
+
 ```
 gliner2-rs/
 ├── Cargo.toml                      # ✅ Project configuration
@@ -228,7 +238,7 @@ gliner2-rs/
 │   ├── config.rs                   # ✅ ExtractorConfig with builder (724 lines)
 │   ├── error.rs                    # ✅ Error types (395 lines)
 │   ├── tokenizer.rs                # ✅ Whitespace tokenizer (524 lines)
-│   ├── BACK_STORY.md               # ✅ Development history
+│   ├── BACK_STORY.md               # ❌ Removed — see CHANGELOG.md for history
 │   ├── schema/
 │   │   ├── mod.rs                  # ✅ Schema module (35 lines)
 │   │   ├── builder.rs              # ✅ Schema builders (885 lines)
@@ -410,20 +420,25 @@ LIBTORCH_USE_PYTORCH=1 LIBTORCH_BYPASS_VERSION_CHECK=1 PATH=".venv/bin:$PATH" \
 
 ## Milestones
 
+> As a historical document, the M7–M10 items below were completed in the
+> candle migration ([PLAN2.md](./PLAN2.md)) and GLiNER2.5 work
+> ([PLAN_2.5.md](./PLAN_2.5.md)).
+
 1. **M1**: ~~Project setup, dependencies, basic structure~~ ✅ COMPLETE
 2. **M2**: ~~Tokenizer and schema encoding~~ ✅ COMPLETE
 3. **M3**: ~~Model architecture~~ ✅ IMPLEMENTED & COMPILES
 4. **M4**: ~~Inference pipeline~~ ✅ IMPLEMENTED & COMPILES
 5. **M5**: ~~Get project building~~ ✅ BUILD SUCCESSFUL (tch 0.24, PyTorch 2.11)
 6. **M6**: ~~Write test suite~~ ✅ 115 TESTS COMPILE
-7. **M7**: ⚠️ Run tests and fix runtime failures (Current)
-8. **M8**: ❌ Integration testing vs Python
-9. **M9**: ❌ Examples and documentation
-10. **M10**: ❌ Performance optimization and release prep
+7. **M7**: ~~Run tests and fix runtime failures~~ ✅ DONE (in candle migration)
+8. **M8**: ~~Integration testing vs Python~~ ✅ DONE (full numeric parity; see README)
+9. **M9**: ~~Examples and documentation~~ ✅ DONE (README, AGENTS.md, CHANGELOG.md)
+10. **M10**: ~~Performance optimization and release prep~~ ✅ DONE (release CPU ~71ms/call)
 
 ## Development History
 
-See `src/BACK_STORY.md` for the development history and context.
+See `CHANGELOG.md` at the repo root for the full development and release
+history across the tch era, the candle migration, and GLiNER2.5 support.
 
 ## Notes
 

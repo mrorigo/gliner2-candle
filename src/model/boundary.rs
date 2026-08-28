@@ -388,12 +388,12 @@ impl BoundaryEncoder {
         Ok((state * state_mask)?)
     }
 
-    /// The learned [BOS] token embedding used to anchor proposals.
+    /// The learned `[BOS]` token embedding used to anchor proposals.
     pub fn bos_state(&self) -> &Tensor {
         &self.bos_state
     }
 
-    /// The learned [EOS] token embedding used to anchor proposals.
+    /// The learned `[EOS]` token embedding used to anchor proposals.
     pub fn eos_state(&self) -> &Tensor {
         &self.eos_state
     }

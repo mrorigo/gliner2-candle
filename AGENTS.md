@@ -286,7 +286,12 @@ tests/
 ## 🔗 References
 
 - [GLiNER2 Python Implementation](./GLiNER2/) - Reference implementation
-- [PLAN.md](./PLAN.md) - Phase 1 implementation plan
-- [PLAN2.md](./PLAN2.md) - Phase 2 (candle migration) plan
+- [GLiNER2.5 Python Implementation](https://github.com/urchade/GLiNER2.5) - Reference implementation
+- [README.md](./README.md) - Current status, usage, parity table
+- [CHANGELOG.md](./CHANGELOG.md) - Full development history
+- [docs/PLAN.md](./docs/PLAN.md) - Historical Phase 1 plan (tch era, maintenance mode)
+- [docs/PLAN2.md](./docs/PLAN2.md) - Phase 2 (candle migration) plan
+- [docs/PLAN_2.5.md](./docs/PLAN_2.5.md) - GLiNER2.5 boundary pipeline plan (COMPLETE)
+- [docs/index.html](./docs/index.html) - HTML status/parity overview page
 - [Candle Documentation](https://github.com/huggingface/candle)
 - [HuggingFace Tokenizers](https://github.com/huggingface/tokenizers)
