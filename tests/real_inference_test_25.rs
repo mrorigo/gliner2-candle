@@ -447,3 +447,78 @@ fn test_task_output_parity() {
         "expected employee record key in GLiNER2.5 output, got: {r}"
     );
 }
+
+/// Comprehensive relation precision regression test asserting endpoint validation,
+/// suppression of spurious sub-spans, and multi-entity disambiguation.
+#[test]
+#[ignore = "downloads ~500MB; run explicitly with --ignored"]
+fn test_relation_endpoint_precision_and_variants() {
+    use gliner2_candle::schema::builder::SchemaBuilder;
+
+    let engine = GLiNER2::from_pretrained("fastino/gliner2.5-small-v1").expect("load");
+    let schema = SchemaBuilder::new()
+        .entities(vec!["person".to_string(), "company".to_string()])
+        .relation("works_for")
+        .done()
+        .build()
+        .unwrap();
+
+    // 1. Canonical fixture: "Tim Cook works for Apple."
+    let text1 = "Tim Cook works for Apple.";
+    let r1 = engine.extract(text1, &schema, 0.5, false, false, None).unwrap();
+    println!("r1: {r1}");
+    assert_eq!(r1["entities"]["person"], serde_json::json!(["Tim Cook"]));
+    assert_eq!(r1["entities"]["company"], serde_json::json!(["Apple"]));
+    let pairs1 = r1["relation_extraction"]["works_for"].as_array().expect("works_for array");
+    assert_eq!(pairs1.len(), 1, "expected exactly 1 pair, got: {:?}", pairs1);
+    assert_eq!(pairs1[0], serde_json::json!(["Tim Cook", "Apple"]));
+
+    // Repeated inference determinism
+    let r1_repeat = engine.extract(text1, &schema, 0.5, false, false, None).unwrap();
+    assert_eq!(r1, r1_repeat);
+
+    // 2. Variant: "Alice works for Acme."
+    let text2 = "Alice works for Acme.";
+    let r2 = engine.extract(text2, &schema, 0.5, false, false, None).unwrap();
+    println!("r2: {r2}");
+    let pairs2 = r2["relation_extraction"]["works_for"].as_array().expect("works_for array");
+    assert_eq!(pairs2.len(), 1);
+    assert_eq!(pairs2[0], serde_json::json!(["Alice", "Acme"]));
+
+    // 3. Variant: "Alice does not work for Acme."
+    let text_neg = "Alice does not work for Acme.";
+    let r_neg = engine.extract(text_neg, &schema, 0.5, false, false, None).unwrap();
+    println!("r_neg: {r_neg}");
+    assert_eq!(r_neg["entities"]["person"], serde_json::json!(["Alice"]));
+    assert_eq!(r_neg["entities"]["company"], serde_json::json!(["Acme"]));
+    if let Some(pairs_neg) = r_neg.get("relation_extraction").and_then(|re| re.get("works_for")).and_then(|w| w.as_array()) {
+        for p in pairs_neg {
+            assert_eq!(p, &serde_json::json!(["Alice", "Acme"]));
+        }
+    }
+
+    // 4. Variant: "Alice works for Acme and Bob works for Delta."
+    let text3 = "Alice works for Acme and Bob works for Delta.";
+    let r3 = engine.extract(text3, &schema, 0.43, false, false, None).unwrap();
+    println!("r3: {r3}");
+    let pairs3 = r3["relation_extraction"]["works_for"].as_array().expect("works_for array");
+    assert_eq!(pairs3.len(), 2, "expected 2 pairs, got: {:?}", pairs3);
+    assert!(pairs3.contains(&serde_json::json!(["Alice", "Acme"])));
+    assert!(pairs3.contains(&serde_json::json!(["Bob", "Delta"])));
+
+    // 5. Variant with punctuation adjacent to entities: "Tim Cook (CEO) works for 'Apple', Inc."
+    let text4 = "Tim Cook (CEO) works for 'Apple', Inc.";
+    let r4 = engine.extract(text4, &schema, 0.5, false, false, None).unwrap();
+    println!("r4: {r4}");
+    if let Some(pairs4) = r4.get("relation_extraction").and_then(|re| re.get("works_for")).and_then(|w| w.as_array()) {
+        for p in pairs4 {
+            let h = p[0].as_str().unwrap();
+            let t = p[1].as_str().unwrap();
+            assert!(!h.contains("works"), "head should not contain 'works': {h}");
+            assert!(!h.contains("for"), "head should not contain 'for': {h}");
+            assert!(!t.contains("works"), "tail should not contain 'works': {t}");
+            assert!(!t.contains("for"), "tail should not contain 'for': {t}");
+            assert!(!t.ends_with('.'), "tail should not end with sentence period: {t}");
+        }
+    }
+}

@@ -186,104 +186,117 @@ pub(crate) fn extract_sample(
     let task_types = batch.sample_task_types(sample_idx).unwrap_or(&[]);
 
     let mut result = serde_json::Map::new();
+    let mut all_entity_spans_by_type: HashMap<String, Vec<(usize, usize)>> = HashMap::new();
+    let mut all_canonical_entity_spans: HashSet<(usize, usize)> = HashSet::new();
+
+    // First pass: decode all entity groups so relation extraction has access to canonical endpoints
+    for (group, task) in task_types.iter().enumerate() {
+        if task.as_str() == "entities" {
+            let attr_prompts: HashSet<&str> =
+                attrs.map(|a| a.prompt_labels()).unwrap_or_default();
+            let has_attributes = attrs.is_some_and(|a| !a.is_empty());
+
+            // name -> (entries, token coords per entry)
+            #[allow(clippy::type_complexity)]
+            let mut decoded_entities: Vec<(
+                String,
+                Vec<JsonValue>,
+                Vec<(usize, usize)>,
+            )> = Vec::new();
+            for (qi, spec) in specs.iter().enumerate() {
+                if spec.group != group || attr_prompts.contains(spec.name.as_str()) {
+                    continue;
+                }
+                let mut hits: Vec<(usize, usize, f32)> = Vec::new();
+                for ci in 0..scored.valid.len() {
+                    let score = scored.scores[ci][qi];
+                    if scored.valid[ci] && score > MASK_LOGIT / 2.0 {
+                        let prob = sigmoid(score);
+                        if prob >= threshold {
+                            hits.push((scored.starts[ci], scored.ends[ci], prob));
+                        }
+                    }
+                }
+                // Boundary default overlap policy "flat": keep the
+                // maximum-total-score non-overlapping subset.
+                let resolved =
+                    resolve_flat_spans(hits.into_iter().map(|(st, e, p)| (p, st, e)).collect());
+                hits = resolved.into_iter().map(|(p, st, e)| (st, e, p)).collect();
+                if hits.is_empty() {
+                    continue;
+                }
+                let mut entries = Vec::with_capacity(hits.len());
+                let mut coords = Vec::with_capacity(hits.len());
+                for (s, e, conf) in hits {
+                    let char_start = char_offset(starts_map, s.min(text_len.saturating_sub(1)));
+                    let char_end = char_offset(ends_map, (e - 1).min(text_len - 1));
+                    let text = safe_slice(original_text, char_start, char_end);
+                    let entry = if has_attributes {
+                        // Attributed format follows the flags strictly.
+                        let mut obj = serde_json::Map::new();
+                        obj.insert("text".into(), json!(text));
+                        if include_confidence {
+                            obj.insert("confidence".into(), json!(conf));
+                        }
+                        if include_spans {
+                            obj.insert("start".into(), json!(char_start));
+                            obj.insert("end".into(), json!(char_end));
+                        }
+                        JsonValue::Object(obj)
+                    } else if include_spans && include_confidence {
+                        json!({
+                            "text": text,
+                            "start": char_start,
+                            "end": char_end,
+                            "confidence": conf,
+                        })
+                    } else if include_spans {
+                        json!({
+                            "text": text,
+                            "start": char_start,
+                            "end": char_end,
+                        })
+                    } else if include_confidence {
+                        json!({
+                            "text": text,
+                            "confidence": conf,
+                        })
+                    } else {
+                        json!(text)
+                    };
+                    entries.push(entry);
+                    coords.push((s, e));
+                }
+                decoded_entities.push((spec.name.clone(), entries, coords));
+            }
+
+            if has_attributes {
+                attach_entity_attributes(
+                    boundary,
+                    &text_states,
+                    text_len,
+                    &query_states,
+                    &specs,
+                    attrs.expect("attrs"),
+                    &mut decoded_entities,
+                )?;
+            }
+
+            let mut by_type: serde_json::Map<String, JsonValue> = Default::default();
+            for (name, entries, coords) in decoded_entities {
+                all_entity_spans_by_type.entry(name.clone()).or_default().extend(coords.iter().copied());
+                all_canonical_entity_spans.extend(coords.iter().copied());
+                by_type.insert(name, JsonValue::Array(entries));
+            }
+            result.insert("entities".to_string(), JsonValue::Object(by_type));
+        }
+    }
+
+    // Second pass: decode classifications, records, and relations
     for (group, task) in task_types.iter().enumerate() {
         match task.as_str() {
             "entities" => {
-                let attr_prompts: HashSet<&str> =
-                    attrs.map(|a| a.prompt_labels()).unwrap_or_default();
-                let has_attributes = attrs.is_some_and(|a| !a.is_empty());
-
-                // name -> (entries, token coords per entry)
-                #[allow(clippy::type_complexity)]
-                let mut decoded_entities: Vec<(
-                    String,
-                    Vec<JsonValue>,
-                    Vec<(usize, usize)>,
-                )> = Vec::new();
-                for (qi, spec) in specs.iter().enumerate() {
-                    if spec.group != group || attr_prompts.contains(spec.name.as_str()) {
-                        continue;
-                    }
-                    let mut hits: Vec<(usize, usize, f32)> = Vec::new();
-                    for ci in 0..scored.valid.len() {
-                        let score = scored.scores[ci][qi];
-                        if scored.valid[ci] && score > MASK_LOGIT / 2.0 {
-                            let prob = sigmoid(score);
-                            if prob >= threshold {
-                                hits.push((scored.starts[ci], scored.ends[ci], prob));
-                            }
-                        }
-                    }
-                    // Boundary default overlap policy "flat": keep the
-                    // maximum-total-score non-overlapping subset.
-                    let resolved =
-                        resolve_flat_spans(hits.into_iter().map(|(st, e, p)| (p, st, e)).collect());
-                    hits = resolved.into_iter().map(|(p, st, e)| (st, e, p)).collect();
-                    if hits.is_empty() {
-                        continue;
-                    }
-                    let mut entries = Vec::with_capacity(hits.len());
-                    let mut coords = Vec::with_capacity(hits.len());
-                    for (s, e, conf) in hits {
-                        let char_start = char_offset(starts_map, s.min(text_len.saturating_sub(1)));
-                        let char_end = char_offset(ends_map, (e - 1).min(text_len - 1));
-                        let text = safe_slice(original_text, char_start, char_end);
-                        let entry = if has_attributes {
-                            // Attributed format follows the flags strictly.
-                            let mut obj = serde_json::Map::new();
-                            obj.insert("text".into(), json!(text));
-                            if include_confidence {
-                                obj.insert("confidence".into(), json!(conf));
-                            }
-                            if include_spans {
-                                obj.insert("start".into(), json!(char_start));
-                                obj.insert("end".into(), json!(char_end));
-                            }
-                            JsonValue::Object(obj)
-                        } else if include_spans && include_confidence {
-                            json!({
-                                "text": text,
-                                "start": char_start,
-                                "end": char_end,
-                                "confidence": conf,
-                            })
-                        } else if include_spans {
-                            json!({
-                                "text": text,
-                                "start": char_start,
-                                "end": char_end,
-                            })
-                        } else if include_confidence {
-                            json!({
-                                "text": text,
-                                "confidence": conf,
-                            })
-                        } else {
-                            json!(text)
-                        };
-                        entries.push(entry);
-                        coords.push((s, e));
-                    }
-                    decoded_entities.push((spec.name.clone(), entries, coords));
-                }
-
-                if has_attributes {
-                    attach_entity_attributes(
-                        boundary,
-                        &text_states,
-                        text_len,
-                        &query_states,
-                        &specs,
-                        attrs.expect("attrs"),
-                        &mut decoded_entities,
-                    )?;
-                }
-
-                let mut by_type: serde_json::Map<String, JsonValue> = Default::default();
-                for (name, entries, _) in decoded_entities {
-                    by_type.insert(name, JsonValue::Array(entries));
-                }
-                result.insert("entities".to_string(), JsonValue::Object(by_type));
+                // Handled in first pass
             }
             "classifications" => {
                 decode_classification(
@@ -398,41 +411,71 @@ pub(crate) fn extract_sample(
                                 r
                             };
 
-                            // Collect candidate spans for head and tail queries.
-                            let mut head_cands: Vec<(usize, f32)> = Vec::new();
-                            let mut tail_cands: Vec<(usize, f32)> = Vec::new();
-                            for ci in 0..scored.valid.len() {
-                                if !scored.valid[ci] {
-                                    continue;
-                                }
-                                let h_score = scored.scores[ci][h_qid];
-                                if h_score > MASK_LOGIT / 2.0 {
-                                    head_cands.push((ci, h_score));
-                                }
-                                let t_score = scored.scores[ci][t_qid];
-                                if t_score > MASK_LOGIT / 2.0 {
-                                    tail_cands.push((ci, t_score));
-                                }
-                            }
+                            let h_name = &specs[h_qid].name;
+                            let t_name = &specs[t_qid].name;
 
-                            // Sort descending by score, take top-K.
-                            head_cands.sort_by(|a, b| {
-                                b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
-                            });
-                            tail_cands.sort_by(|a, b| {
-                                b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
-                            });
-                            let max_pairs_per_type = 32;
-                            head_cands.truncate(max_pairs_per_type);
-                            tail_cands.truncate(max_pairs_per_type);
+                            let (head_cands, tail_cands) = if !all_canonical_entity_spans.is_empty() {
+                                let mut hc: Vec<(usize, usize)> = if let Some(type_spans) = all_entity_spans_by_type.get(h_name) {
+                                    type_spans.clone()
+                                } else {
+                                    all_canonical_entity_spans.iter().copied().collect()
+                                };
+                                hc.sort_unstable();
+                                let mut tc: Vec<(usize, usize)> = if let Some(type_spans) = all_entity_spans_by_type.get(t_name) {
+                                    type_spans.clone()
+                                } else {
+                                    all_canonical_entity_spans.iter().copied().collect()
+                                };
+                                tc.sort_unstable();
+                                (hc, tc)
+                            } else {
+                                // Fallback when no entity group is in schema: use role query proposals
+                                let mut head_hits: Vec<(usize, usize, f32)> = Vec::new();
+                                for ci in 0..scored.valid.len() {
+                                    if !scored.valid[ci] {
+                                        continue;
+                                    }
+                                    let h_score = scored.scores[ci][h_qid];
+                                    if h_score > MASK_LOGIT / 2.0 {
+                                        let prob = sigmoid(h_score);
+                                        if prob >= threshold {
+                                            head_hits.push((scored.starts[ci], scored.ends[ci], prob));
+                                        }
+                                    }
+                                }
+                                let resolved_heads = resolve_flat_spans(
+                                    head_hits.into_iter().map(|(st, e, p)| (p, st, e)).collect(),
+                                );
+                                let hc: Vec<(usize, usize)> =
+                                    resolved_heads.into_iter().map(|(_, st, e)| (st, e)).collect();
+
+                                let mut tail_hits: Vec<(usize, usize, f32)> = Vec::new();
+                                for ci in 0..scored.valid.len() {
+                                    if !scored.valid[ci] {
+                                        continue;
+                                    }
+                                    let t_score = scored.scores[ci][t_qid];
+                                    if t_score > MASK_LOGIT / 2.0 {
+                                        let prob = sigmoid(t_score);
+                                        if prob >= threshold {
+                                            tail_hits.push((scored.starts[ci], scored.ends[ci], prob));
+                                        }
+                                    }
+                                }
+                                let resolved_tails = resolve_flat_spans(
+                                    tail_hits.into_iter().map(|(st, e, p)| (p, st, e)).collect(),
+                                );
+                                let tc: Vec<(usize, usize)> =
+                                    resolved_tails.into_iter().map(|(_, st, e)| (st, e)).collect();
+
+                                (hc, tc)
+                            };
 
                             // Generate all head×tail pairs, skip self-loops.
                             let mut pair_heads: Vec<(usize, usize)> = Vec::new();
                             let mut pair_tails: Vec<(usize, usize)> = Vec::new();
-                            for &(hi, _) in &head_cands {
-                                for &(ti, _) in &tail_cands {
-                                    let hs = (scored.starts[hi], scored.ends[hi]);
-                                    let ts = (scored.starts[ti], scored.ends[ti]);
+                            for &hs in &head_cands {
+                                for &ts in &tail_cands {
                                     if hs == ts {
                                         continue; // no self-loops
                                     }
@@ -448,8 +491,9 @@ pub(crate) fn extract_sample(
                                     &pair_tails,
                                     text_len,
                                 )?;
-                                // Decode pairs above threshold.
-                                let mut entries: Vec<JsonValue> = Vec::new();
+                                // Decode pairs above threshold, ranked descending by score.
+                                let mut scored_entries: Vec<(f32, JsonValue)> = Vec::new();
+                                let mut seen_pairs: HashSet<((usize, usize), (usize, usize))> = HashSet::new();
                                 for (idx, &score) in pair_scores.iter().enumerate() {
                                     let prob = sigmoid(score);
                                     if prob < threshold {
@@ -457,6 +501,9 @@ pub(crate) fn extract_sample(
                                     }
                                     let (hs, he) = pair_heads[idx];
                                     let (ts, te) = pair_tails[idx];
+                                    if !seen_pairs.insert(((hs, he), (ts, te))) {
+                                        continue;
+                                    }
                                     let cs_h =
                                         char_offset(starts_map, hs.min(text_len.saturating_sub(1)));
                                     let ce_h = char_offset(ends_map, (he - 1).min(text_len - 1));
@@ -486,8 +533,10 @@ pub(crate) fn extract_sample(
                                     } else {
                                         json!([head_text, tail_text])
                                     };
-                                    entries.push(obj);
+                                    scored_entries.push((prob, obj));
                                 }
+                                scored_entries.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+                                let entries: Vec<JsonValue> = scored_entries.into_iter().map(|(_, obj)| obj).collect();
                                 let mut rel_map = match result.remove("relation_extraction") {
                                     Some(JsonValue::Object(m)) => m,
                                     _ => serde_json::Map::new(),

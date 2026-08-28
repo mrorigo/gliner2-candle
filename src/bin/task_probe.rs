@@ -78,7 +78,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .relation("works_for")
         .done()
         .build()?;
-    let rel_res = engine.extract("Tim Cook works for Apple in Cupertino.", &rel_schema, 0.4, false, false, None)?;
+    let rel_res = engine.extract("Tim Cook works for Apple in Cupertino.", &rel_schema, 0.5, false, false, None)?;
     println!("Result: {}\n", serde_json::to_string_pretty(&rel_res)?);
 
     println!("All task probes executed successfully!");
