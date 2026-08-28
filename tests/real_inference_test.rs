@@ -19,7 +19,7 @@ fn download_from_hub(repo_id: &str, filename: &str) -> PathBuf {
     let repo_api = api.repo(repo);
     repo_api
         .get(filename)
-        .expect(&format!("Failed to download {}", filename))
+        .unwrap_or_else(|_| panic!("Failed to download {}", filename))
 }
 
 /// Test that the GLiNER2 tokenizer downloads and produces correct token IDs.

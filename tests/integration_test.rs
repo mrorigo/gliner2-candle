@@ -297,13 +297,13 @@ fn test_structure_str_dtype_pipeline() {
         .cloned()
         .unwrap_or_default();
 
-    if let Some(first) = instances.first().and_then(|v| v.as_object()) {
-        if let Some(name_val) = first.get("name") {
-            assert!(
-                !name_val.is_array(),
-                "Expected dtype=str field to be scalar/null, got array: {name_val:?}"
-            );
-        }
+    if let Some(first) = instances.first().and_then(|v| v.as_object())
+        && let Some(name_val) = first.get("name")
+    {
+        assert!(
+            !name_val.is_array(),
+            "Expected dtype=str field to be scalar/null, got array: {name_val:?}"
+        );
     }
 }
 

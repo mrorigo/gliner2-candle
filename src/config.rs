@@ -5,7 +5,7 @@
 //! for configuring model architecture, inference behavior, and performance settings.
 
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::error::{GlinerError, Result};
 
@@ -163,6 +163,228 @@ impl std::str::FromStr for HiddenActivation {
     }
 }
 
+/// Model architecture family.
+///
+/// GLiNER2 uses span enumeration over a fixed-width grid; GLiNER2.5 replaces
+/// this with boundary prediction (start/end/inside scoring plus a reranker).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+#[derive(Default)]
+pub enum Architecture {
+    /// Original GLiNER2 span-enumeration architecture.
+    #[serde(rename = "gliner2")]
+    #[default]
+    Gliner2,
+    /// GLiNER2.5 boundary-prediction architecture ("boundary" in HF config).
+    #[serde(rename = "gliner2.5")]
+    Gliner25,
+}
+
+impl Architecture {
+    /// Detect the architecture from an HF `config.json` payload.
+    ///
+    /// GLiNER2.5 checkpoints declare `"architecture": "boundary"` and
+    /// `"architectures": ["BoundaryExtractor"]`.
+    pub fn from_hf_config_json(json_str: &str) -> Self {
+        serde_json::from_str::<serde_json::Value>(json_str)
+            .ok()
+            .and_then(|v| {
+                v.get("architecture")
+                    .and_then(|a| a.as_str())
+                    .map(|s| s.to_string())
+            })
+            .map(|s| match s.as_str() {
+                "boundary" => Architecture::Gliner25,
+                _ => Architecture::Gliner2,
+            })
+            .unwrap_or(Architecture::Gliner2)
+    }
+
+    /// Detect the architecture from a model name or local path.
+    ///
+    /// Prefers reading `config.json` when the path exists locally; falls back
+    /// to name matching (`gliner2.5` / `gliner25` prefixes).
+    pub fn detect(model_name_or_path: &str) -> Self {
+        let path = Path::new(model_name_or_path);
+        let config_json = path.join("config.json");
+        if config_json.is_file()
+            && let Ok(content) = std::fs::read_to_string(&config_json)
+        {
+            return Self::from_hf_config_json(&content);
+        }
+        let lower = model_name_or_path.to_lowercase();
+        if lower.contains("gliner2.5") || lower.contains("gliner25") || lower == "boundary" {
+            Self::Gliner25
+        } else {
+            Self::Gliner2
+        }
+    }
+}
+
+/// Inference-relevant settings of the GLiNER2.5 boundary head.
+///
+/// These mirror the `boundary_head` section of the upstream `config.json`;
+/// training-only knobs (loss weights, sampling budgets) are ignored.
+fn default_true() -> bool {
+    true
+}
+
+fn default_rotary_base() -> f64 {
+    10_000.0
+}
+
+fn default_multihead_heads() -> usize {
+    8
+}
+
+/// Inference-relevant settings of the GLiNER2.5 boundary head.
+///
+/// These mirror the `boundary_head` section of the upstream `config.json`;
+/// training-only knobs (loss weights, sampling budgets) are ignored.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BoundaryConfig {
+    /// Boundary representation dimension.
+    pub boundary_dim: usize,
+    /// Span-content representation dimension.
+    pub content_dim: usize,
+    /// Pair-scoring representation dimension.
+    pub pair_dim: usize,
+    /// Number of start boundaries kept per query.
+    pub start_top_k: usize,
+    /// Number of end boundaries kept per query.
+    pub end_top_k: usize,
+    /// Ends considered per proposed start.
+    pub ends_per_start: usize,
+    /// Starts considered per proposed end.
+    pub starts_per_end: usize,
+    /// Size of the shared candidate pool.
+    pub pool_size: usize,
+    /// Maximum number of candidates scored after pooling.
+    pub candidate_budget: usize,
+    /// Whether relation scoring heads are present.
+    pub enable_relations: bool,
+    /// Whether record decoding heads are present.
+    pub enable_records: bool,
+    /// Whether the count head is present.
+    pub enable_count_head: bool,
+    /// Whether inside scores feed the reranker.
+    pub use_inside_evidence: bool,
+    /// Whether span-content features are used.
+    pub enable_span_content: bool,
+    /// Abstention threshold for boundary scores.
+    pub abstention_threshold: f32,
+    /// Rotary endpoint embeddings (explicit-spans / reranker paths).
+    #[serde(default = "default_true")]
+    pub enable_rotary_endpoints: bool,
+    #[serde(default = "default_rotary_base")]
+    pub rotary_base: f64,
+    #[serde(default = "default_true")]
+    pub reranker_endpoint_compat: bool,
+    #[serde(default = "default_true")]
+    pub endpoint_difference_features: bool,
+    #[serde(default = "default_true")]
+    pub query_conditioned_inside_weight: bool,
+    #[serde(default = "default_multihead_heads")]
+    pub multihead_pair_compat_heads: usize,
+}
+
+impl Default for BoundaryConfig {
+    fn default() -> Self {
+        Self {
+            boundary_dim: 128,
+            content_dim: 64,
+            pair_dim: 128,
+            start_top_k: 24,
+            end_top_k: 24,
+            ends_per_start: 12,
+            starts_per_end: 12,
+            pool_size: 192,
+            candidate_budget: 192,
+            enable_relations: true,
+            enable_records: true,
+            enable_count_head: true,
+            use_inside_evidence: true,
+            enable_span_content: true,
+            abstention_threshold: 0.5,
+            enable_rotary_endpoints: true,
+            rotary_base: 10_000.0,
+            reranker_endpoint_compat: true,
+            endpoint_difference_features: true,
+            query_conditioned_inside_weight: true,
+            multihead_pair_compat_heads: 8,
+        }
+    }
+}
+
+impl BoundaryConfig {
+    /// Parse the inference-relevant subset from an HF `config.json`.
+    pub fn from_hf_config_json(json_str: &str) -> Self {
+        let mut config = Self::default();
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(json_str)
+            && let Some(bh) = v.get("boundary_head").and_then(|b| b.as_object())
+        {
+            let get_usize = |key: &str| bh.get(key).and_then(|x| x.as_u64()).map(|x| x as usize);
+            let get_f32 = |key: &str| bh.get(key).and_then(|x| x.as_f64()).map(|x| x as f32);
+            let get_bool = |key: &str| bh.get(key).and_then(|x| x.as_bool());
+            if let Some(x) = get_usize("boundary_dim") {
+                config.boundary_dim = x;
+            }
+            if let Some(x) = get_usize("content_dim") {
+                config.content_dim = x;
+            }
+            if let Some(x) = get_usize("pair_dim") {
+                config.pair_dim = x;
+            }
+            if let Some(x) = get_usize("start_top_k") {
+                config.start_top_k = x;
+            }
+            if let Some(x) = get_usize("end_top_k") {
+                config.end_top_k = x;
+            }
+            if let Some(x) = get_usize("ends_per_start") {
+                config.ends_per_start = x;
+            }
+            if let Some(x) = get_usize("starts_per_end") {
+                config.starts_per_end = x;
+            }
+            if let Some(x) = get_usize("pool_size") {
+                config.pool_size = x;
+            }
+            if let Some(x) = get_usize("candidate_budget") {
+                config.candidate_budget = x;
+            }
+            if let Some(x) = get_bool("enable_relations") {
+                config.enable_relations = x;
+            }
+            if let Some(x) = get_bool("enable_records") {
+                config.enable_records = x;
+            }
+            if let Some(x) = get_bool("enable_count_head") {
+                config.enable_count_head = x;
+            }
+            if let Some(x) = get_bool("use_inside_evidence") {
+                config.use_inside_evidence = x;
+            }
+            if let Some(x) = get_bool("enable_span_content") {
+                config.enable_span_content = x;
+            }
+            if let Some(x) = get_f32("abstention_threshold") {
+                config.abstention_threshold = x;
+            }
+        }
+        config
+    }
+
+    /// Load from a local HF `config.json` file, falling back to defaults.
+    pub fn detect(model_name_or_path: &str) -> Self {
+        let path = Path::new(model_name_or_path).join("config.json");
+        std::fs::read_to_string(&path)
+            .map(|c| Self::from_hf_config_json(&c))
+            .unwrap_or_default()
+    }
+}
+
 /// Configuration for the GLiNER2 Extractor model.
 ///
 /// This struct contains all parameters needed to initialize and configure
@@ -196,6 +418,9 @@ pub struct ExtractorConfig {
     // -------------------------------------------------------------------------
     /// Base model name or path (e.g., "bert-base-uncased").
     pub model_name: String,
+
+    /// Architecture family (GLiNER2 span enumeration vs GLiNER2.5 boundary).
+    pub architecture: Architecture,
 
     /// Hidden size of the transformer model.
     pub hidden_size: usize,
@@ -248,6 +473,9 @@ pub struct ExtractorConfig {
     /// Maximum number of tokens to process (None = no limit).
     pub max_len: Option<usize>,
 
+    /// GLiNER2.5 boundary-head settings (ignored for GLiNER2).
+    pub boundary: BoundaryConfig,
+
     // -------------------------------------------------------------------------
     // Inference Settings
     // -------------------------------------------------------------------------
@@ -284,6 +512,7 @@ impl Default for ExtractorConfig {
         Self {
             // Model Architecture (BERT-base defaults)
             model_name: DEFAULT_MODEL_NAME.to_string(),
+            architecture: Architecture::default(),
             hidden_size: DEFAULT_HIDDEN_SIZE,
             num_hidden_layers: DEFAULT_NUM_HIDDEN_LAYERS,
             num_attention_heads: DEFAULT_NUM_ATTENTION_HEADS,
@@ -302,6 +531,7 @@ impl Default for ExtractorConfig {
             counting_layer: CountingLayerType::CountLstm,
             token_pooling: TokenPoolingStrategy::First,
             max_len: None,
+            boundary: BoundaryConfig::default(),
 
             // Inference Settings
             use_fp16: false,
@@ -393,7 +623,7 @@ impl ExtractorConfig {
                 "hidden_size must be divisible by num_attention_heads",
             ));
         }
-        if self.max_width == 0 {
+        if self.architecture == Architecture::Gliner2 && self.max_width == 0 {
             return Err(GlinerError::config("max_width must be > 0"));
         }
         if self.vocab_size == 0 {
@@ -432,6 +662,12 @@ impl ConfigBuilder {
     /// Set the model name.
     pub fn model_name(mut self, name: impl Into<String>) -> Self {
         self.config.model_name = name.into();
+        self
+    }
+
+    /// Set the architecture family.
+    pub fn architecture(mut self, architecture: Architecture) -> Self {
+        self.config.architecture = architecture;
         self
     }
 
@@ -556,6 +792,7 @@ pub mod presets {
     pub fn gliner2_base() -> ExtractorConfig {
         ExtractorConfig {
             model_name: "fastino/gliner2-base-v1".to_string(),
+            architecture: Architecture::Gliner2,
             hidden_size: 768,
             num_hidden_layers: 12,
             num_attention_heads: 12,
@@ -572,6 +809,7 @@ pub mod presets {
             counting_layer: CountingLayerType::CountLstm,
             token_pooling: TokenPoolingStrategy::First,
             max_len: None,
+            boundary: BoundaryConfig::default(),
             use_fp16: false,
             use_bf16: false,
             device: "cpu".to_string(),
@@ -586,6 +824,7 @@ pub mod presets {
     pub fn gliner2_large() -> ExtractorConfig {
         ExtractorConfig {
             model_name: "fastino/gliner2-large-v1".to_string(),
+            architecture: Architecture::Gliner2,
             hidden_size: 1024,
             num_hidden_layers: 24,
             num_attention_heads: 16,
@@ -602,6 +841,7 @@ pub mod presets {
             counting_layer: CountingLayerType::CountLstm,
             token_pooling: TokenPoolingStrategy::First,
             max_len: None,
+            boundary: BoundaryConfig::default(),
             use_fp16: false,
             use_bf16: false,
             device: "cpu".to_string(),
@@ -610,6 +850,63 @@ pub mod presets {
             tokenizer_path: None,
             config_path: None,
         }
+    }
+
+    /// GLiNER2.5 small model configuration (~74M parameters).
+    ///
+    /// DeBERTa-v3-xsmall-class encoder (hidden 384, 12 layers, vocab 128011)
+    /// with the shared boundary head.
+    pub fn gliner25_small() -> ExtractorConfig {
+        ExtractorConfig {
+            model_name: "fastino/gliner2.5-small-v1".to_string(),
+            architecture: Architecture::Gliner25,
+            hidden_size: 384,
+            num_hidden_layers: 12,
+            num_attention_heads: 6,
+            intermediate_size: 1536,
+            hidden_act: HiddenActivation::Gelu,
+            vocab_size: 128011,
+            max_position_embeddings: 512,
+            type_vocab_size: 0,
+            pad_token_id: 0,
+            layer_norm_eps: 1e-7,
+            hidden_dropout_prob: 0.1,
+            attention_probs_dropout_prob: 0.1,
+            max_width: 0,
+            counting_layer: CountingLayerType::CountLstm,
+            token_pooling: TokenPoolingStrategy::First,
+            max_len: None,
+            boundary: BoundaryConfig::default(),
+            use_fp16: false,
+            use_bf16: false,
+            device: "cpu".to_string(),
+            compile: false,
+            model_path: None,
+            tokenizer_path: None,
+            config_path: None,
+        }
+    }
+
+    /// GLiNER2.5 base model configuration (~0.2B parameters).
+    ///
+    /// DeBERTa-v3-base encoder (hidden 768) with the shared boundary head.
+    pub fn gliner25_base() -> ExtractorConfig {
+        let mut config = gliner25_small();
+        config.model_name = "fastino/gliner2.5-base-v1".to_string();
+        config.hidden_size = 768;
+        config.num_attention_heads = 12;
+        config.intermediate_size = 3072;
+        config
+    }
+
+    /// GLiNER2.5 multilingual model configuration (~0.3B parameters).
+    ///
+    /// Multilingual DeBERTa-v3 encoder with a 250k vocabulary.
+    pub fn gliner25_multi() -> ExtractorConfig {
+        let mut config = gliner25_base();
+        config.model_name = "fastino/gliner2.5-multi-v1".to_string();
+        config.vocab_size = 250112;
+        config
     }
 
     /// GLiNER2 base model with FP16 for faster inference.

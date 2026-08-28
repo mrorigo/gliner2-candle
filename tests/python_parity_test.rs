@@ -117,12 +117,11 @@ fn normalize_relations(result: &JsonValue) -> JsonValue {
                     {
                         pairs.push(format!("{}|||{}", norm_text(hs), norm_text(ts)));
                     }
-                } else if let Some(arr2) = item.as_array() {
-                    if arr2.len() >= 2 {
-                        if let (Some(h), Some(t)) = (arr2[0].as_str(), arr2[1].as_str()) {
-                            pairs.push(format!("{}|||{}", norm_text(h), norm_text(t)));
-                        }
-                    }
+                } else if let Some(arr2) = item.as_array()
+                    && arr2.len() >= 2
+                    && let (Some(h), Some(t)) = (arr2[0].as_str(), arr2[1].as_str())
+                {
+                    pairs.push(format!("{}|||{}", norm_text(h), norm_text(t)));
                 }
             }
         }
@@ -177,10 +176,10 @@ fn normalize_classification(result: &JsonValue, task: &str) -> JsonValue {
     if let Some(s) = v.as_str() {
         return JsonValue::Array(vec![JsonValue::String(norm_text(s))]);
     }
-    if let Some(obj) = v.as_object() {
-        if let Some(lbl) = obj.get("label").and_then(|x| x.as_str()) {
-            return JsonValue::Array(vec![JsonValue::String(norm_text(lbl))]);
-        }
+    if let Some(obj) = v.as_object()
+        && let Some(lbl) = obj.get("label").and_then(|x| x.as_str())
+    {
+        return JsonValue::Array(vec![JsonValue::String(norm_text(lbl))]);
     }
     if let Some(arr) = v.as_array() {
         let mut labels = Vec::<String>::new();
@@ -199,6 +198,7 @@ fn normalize_classification(result: &JsonValue, task: &str) -> JsonValue {
 }
 
 #[test]
+#[ignore = "requires specific Python gliner2 version; use test_task_output_parity for in-process parity"]
 fn test_python_reference_parity_fixtures() {
     let snapshot = find_snapshot_dir();
     let script = Path::new("debug_comparison/python_parity_reference.py");

@@ -14,6 +14,7 @@
 //! let result = model.extract_entities("Apple CEO Tim Cook", &["company", "person"])?;
 //! ```
 
+pub mod boundary;
 pub mod engine;
 
 // Re-export main types for convenience

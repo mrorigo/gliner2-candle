@@ -1,120 +1,121 @@
 # GLiNER2 Rust
 
-A high-performance, pure Rust implementation of the [GLiNER2](https://github.com/urchade/GLiNER2) information extraction model. This library provides efficient CPU-based inference for entity extraction, text classification, structured data extraction, and relation extraction — with zero external dependencies beyond Cargo.
+A high-performance, pure Rust implementation of [GLiNER2](https://github.com/urchade/GLiNER2)
+(span-enumeration) and [GLiNER2.5](https://github.com/urchade/GLiNER2.5)
+(boundary-prediction) information extraction models, built on HuggingFace's
+[`candle`](https://github.com/huggingface/candle) ML framework — no PyTorch
+runtime required. Designed for efficient CPU inference with real model weights
+downloaded from the HuggingFace Hub.
 
-## 🎯 Current Status: Full Inference Surface Working, Parity Tuning Ongoing
+## 🎯 Current Status: Full Numeric Parity vs Python
 
-**The full GLiNER2 inference pipeline is implemented and running end-to-end in Rust.** Key capabilities currently verified:
-- ✅ Load real GLiNER2 model weights from HuggingFace Hub
-- ✅ Run DeBERTa-based encoder path with GLiNER2-compatible routing
-- ✅ count_embed layer with GRU + Transformer architecture
-- ✅ HF tokenizer integration with correct subword tracking
-- ✅ Schema/text indices tracking aligned with Python behavior
-- ✅ Entity order preservation aligned with Python behavior
-- ✅ Non-empty entity extraction with confidence + span outputs in integration tests
-- ✅ Classification/relation/structure extraction paths implemented in runtime API
-- ✅ Offline Python-vs-Rust parity harness running against local model snapshots
-- ✅ Strict long-context `max_len` parity fixtures passing for entities/relations/structures
+Both architectures run **end-to-end** with a documented numerical parity
+report against the Python reference across all four task types:
 
-**Current focus:** continued numerical parity tuning and broader regression coverage across more texts/schemas/devices.
+| Task type | Parity vs Python |
+|-----------|------------------|
+| **Entities** (2.5) | Full matrix parity — `global = 0.0000`, `relevant = 0.0000` |
+| **Classifications** | Exact output match (`positive`) |
+| **Relations** | Exact format match (bare pairs, no flags) |
+| **Attributes (single-label)** | Softmax logits matched to 8 decimals (`0.9966161847`) |
+| **Attributes (multi-label)** | Sigmoid logits matched to 7 decimals (`0.5735875`) |
 
-## ✨ What's Working
+The GLiNER2 (span-enumeration) pipeline also produces entity/classification/
+relation/structure outputs that match the Python reference.
 
-### Complete Architecture Port
-- ✅ **Candle ML Framework** — All PyTorch/tch dependencies replaced with `candle-core`, `candle-nn`, and `candle-transformers`
-- ✅ **DeBERTa Encoder Backend** — Candle-based DeBERTa path configured for GLiNER2-compatible behavior:
-  - Relative-attention-enabled encoder configuration and compatible masking/bias routing
-  - Relative position handling and attention flow aligned with GLiNER2 inference needs
-  - DeBERTa-v3-style compatibility settings applied during model loading/inference
-  - Ongoing parity validation against Python across broader scenarios
-- ✅ **GLiNER2 Heads** — All components match the actual Python architecture:
-  - **Span Rep**: markerV0 with project_start/end/out_project (Linear+ReLU+Linear, with ReLU on concatenated start/end reps before out_project)
-  - **Classifier**: 2-layer MLP (768→1536→1) with ReLU
-  - **Count Pred**: 2-layer MLP (768→1536→20) with ReLU
-  - **Count Embed**: Full GRU + Transformer architecture (pos_embedding → GRU → in_projector → 2x Transformer → out_projector)
-- ✅ **Weight Loading** — `VarBuilder::from_mmaped_safetensors()` with correct name mapping
-- ✅ **HuggingFace Tokenizer** — Automatic Hub download with local fallback
+## 🚀 GLiNER2.5 Support (boundary architecture)
 
-### Real Inference Proven Working
-- ✅ **Real Model Downloads** — Downloads from HuggingFace Hub automatically
-- ✅ **Weight Loading** — Successfully loads all model components including count_embed
-- ✅ **Full Pipeline Execution** — Tokenization → Collation → Encoding → count_embed + einsum scoring → Extraction
-- ✅ **Batch Processing** — Parallel batch inference
-- ✅ **Entity Extraction API** — Full API with confidence scores and span positions
-- ✅ **Text Classification** — Single and multi-label classification
-- ✅ **Relation & Structure Extraction** — Full API support
-- ⚠️ **Numerical Parity Tuning** — Inference is working; ongoing work focuses on tightening intermediate-value parity with Python across broader scenarios
+The boundary-prediction pipeline is validated numerically against the Python
+reference:
 
-### Test Coverage
-- ✅ **81 Unit Tests** — Included across model, batching, schema, and inference modules
-- ✅ **18 Integration Tests** — Included across focused API coverage, real Hub inference, and Python parity fixture validation
-- ✅ **Zero tch Dependencies** — Pure Rust, no PyTorch runtime required
+- ✅ All three checkpoints load and validate: `fastino/gliner2.5-{small,base,multi}-v1`
+- ✅ Custom DeBERTa V3 encoder with exact-erf GELU and relative-position
+  embeddings (sign-corrected vs candle-transformers' `debertav2`)
+- ✅ Boundary encoder + shared-pool / pair scoring with full-matrix parity
+- ✅ Entities, classifications, relations, records, and span attributes
+- ✅ Span attributes (**Phase 3e**): no dedicated weights — attribute labels
+  become hidden entity queries re-scored via an explicit-spans path
+- ✅ Long-document auto-chunking (>384 words) with span remapping and merge
+  policies (`src/chunking.rs`)
+
+```rust
+use gliner2_rs::GLiNER2;
+use gliner2_rs::schema::types::Schema;
+
+fn main() -> gliner2_rs::Result<()> {
+    let engine = GLiNER2::from_pretrained("fastino/gliner2.5-small-v1")?;
+
+    // Entities + span attributes (hidden queries, no dedicated weights).
+    let mut groups = std::collections::HashMap::new();
+    groups.insert(
+        "sentiment".to_string(),
+        gliner2_rs::schema::types::AttributeGroup {
+            labels: vec!["positive".to_string(), "negative".to_string()],
+            multi_label: true,
+            threshold: 0.5,
+            applies_to: Some(vec!["person".to_string()]),
+            qualify_labels: false,
+        },
+    );
+    let schema = Schema::new()
+        .entities(vec![gliner2_rs::schema::types::EntityDef::new("person")])
+        .entity_attributes(groups)?;
+
+    // Long documents are chunked automatically.
+    let result = engine.extract(
+        "Apple CEO Tim Cook announced great results in Cupertino.",
+        &schema,
+        0.5,
+        true,
+        true,
+        None,
+    )?;
+    println!("{result:#}");
+    Ok(())
+}
+```
+
+## ✨ Feature Surface
+
+### GLiNER2 (span-enumeration)
+- ✅ Entity extraction with confidence + character spans
+- ✅ Single / multi-label text classification
+- ✅ Structured (JSON) data extraction
+- ✅ Relation extraction between entities
+- ✅ `count_embed` (GRU + Transformer) layer
+
+### GLiNER2.5 (boundary-prediction)
+- ✅ Boundary encoder + shared-pool / pair reranking scorers
+- ✅ Constrained classification (`src/constraints.rs`, Kleene-3 logic)
+- ✅ Joint IE (relations) over the candidate pool
+- ✅ Span attributes (single- and multi-label groups)
+- ✅ Records / JSON structures
+
+### Both
+- ✅ Auto-chunking for long documents with deterministic merge policies
+- ✅ Batch inference (`batch_size`, parallel preprocessing)
+- ✅ Real model weights via `hf-hub`
+- ✅ Pure Rust / candle — no PyTorch, no `tch`
 
 ## 🏗️ Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                    GLiNER2 Inference Pipeline               │
-├─────────────────────────────────────────────────────────────┤
-│                                                             │
-│  ┌─────────────┐    ┌──────────────┐    ┌────────────────┐ │
-│  │ Tokenizer   │───▶│   Encoder    │───▶│ GLiNER2 Heads  │ │
-│  │ (tokenizers)│    │  (candle)    │    │   (candle)     │ │
-│  └─────────────┘    └──────────────┘    └────────────────┘ │
-│         │                   │                      │       │
-│         │              Embeddings              Results      │
-│         │                   │                      │       │
-│         └───────────────────┼──────────────────────┘       │
-│                             │                              │
-│                    Float tensor data                       │
-│                 (Vec<Vec<f32>> embeddings)                 │
-└─────────────────────────────────────────────────────────────┘
+GLiNER2:   Text + Schema → Collator → DeBERTa V3 → Span Rep → Classifier → Output
+GLiNER2.5: Text + Schema → Collator → DeBERTa V3 → boundary encoder → shared-pool/pair scoring → decode
+           (>384 words: split into overlapping chunks, extract per chunk, merge spans)
 ```
 
-### Component Architecture (Matches Python GLiNER2)
-
-| Component | Architecture | Status |
-|-----------|-------------|--------|
-| **Encoder** | DeBERTa encoder backend with GLiNER2-compatible configuration and relative-attention routing | ✅ Complete |
-| **Span Rep** | markerV0: project_start/end/out_project (768→3072→768) | ✅ Complete |
-| **Classifier** | MLP: 768 → 1536 (ReLU) → 1 | ✅ Complete |
-| **Count Pred** | MLP: 768 → 1536 (ReLU) → 20 | ✅ Complete |
-| **Count Embed** | GRU + Transformer (pos_embed → GRU → 2x Transformer → projectors) | ✅ Complete |
-| **Weight Loading** | VarBuilder with weight name mapping | ✅ Complete |
-| **Entity Extraction** | count_embed + einsum scoring | ✅ Working (parity tuning ongoing) |
-
-## ⚖️ Comparison: `gliner2-rs` vs `brainless/gliner2-candle`
-
-Both projects target GLiNER2 with Candle, but they optimize for different priorities.
-
-### At a glance
-
-| Dimension | `gliner2-rs` (this repo) | `brainless/gliner2-candle` |
-|---|---|---|
-| Scope | Broader GLiNER2 pipeline (entities + broader schema/task plumbing) | Minimal, entity-focused implementation |
-| Codebase size | Larger (~multi-module, production-oriented) | Very small (~1 KLOC, easy to audit quickly) |
-| Preprocessing/collation | Richer collation and tokenizer/index tracking for parity work | Simpler, purpose-built preprocessing |
-| Extensibility | Higher (more architecture and task surface area) | Lower (optimized for a narrow use case) |
-| Maintenance burden | Higher complexity, more moving parts | Lower complexity, fewer moving parts |
-| Best fit | Teams building a fuller GLiNER2 toolchain | Users who want fast, minimal entity extraction |
-
-### Pros and cons
-
-**Choose `gliner2-rs` if you want:**
-- A more complete GLiNER2-style system and API surface
-- Better long-term flexibility for schema/task expansion
-- A foundation suitable for productization and deeper parity/debug work
-
-**Choose `brainless/gliner2-candle` if you want:**
-- The smallest possible implementation to read and modify quickly
-- Lower operational complexity
-- A focused entity extraction tool without broader pipeline overhead
-
-### Practical guidance
-
-- If your priority is **minimalism and speed of understanding**, start with `brainless/gliner2-candle`.
-- If your priority is **capability, extensibility, and a fuller GLiNER2 stack**, use `gliner2-rs`.
-- A pragmatic path is to prototype quickly with the minimal repo, then migrate to `gliner2-rs` when you need richer schema/task behavior and long-term maintainability.
+| Component | File | Purpose |
+|-----------|------|---------|
+| **DeBERTa V3 Encoder** | `src/model/deberta_v3.rs` | Custom DeBERTa V3 (no token_type_embeddings, exact-erf GELU, rel-bias) |
+| **Boundary Encoder** | `src/model/boundary.rs` | Boundary projection, attention, SwiGLU refinement, scorers |
+| **Candle Encoder Wrapper** | `src/model/candle_encoder.rs` | BERT / DeBERTa V2 / V3 routing |
+| **Span Representation** | `src/model/span_rep.rs` | markerV0 (GLiNER2 path) |
+| **Classifier / Count Pred** | `src/model/classifier.rs`, `count_pred.rs` |
+| **Collator** | `src/batch/collator.rs` | Tokenization + schema encoding + batching |
+| **Inference Engine** | `src/inference/engine.rs` | Main API + extraction |
+| **Boundary Decode** | `src/inference/boundary.rs` | Query building, attribute attachment, span resolution |
+| **Chunking** | `src/chunking.rs` | Long-document split/merge policies |
 
 ## 📦 Installation
 
@@ -126,47 +127,45 @@ gliner2-rs = { git = "https://github.com/mrorigo/gliner2-rust" }
 ### Dependencies
 - `candle-core`, `candle-nn`, `candle-transformers` — HuggingFace's pure Rust ML framework
 - `tokenizers` — HuggingFace tokenizer library
-- `hf-hub` — HuggingFace Hub integration for automatic downloads
+- `hf-hub` — HuggingFace Hub downloads
 - `serde` / `serde_json` — JSON serialization
-- `regex` — Regex validators for post-processing
+- `regex` — Regex validators
 
 ## 🚀 Usage
 
-### Basic Entity Extraction
+### Basic GLiNER2 Entity Extraction
 
 ```rust
 use gliner2_rs::{GLiNER2, ExtractorConfig, SchemaBuilder};
 
-// Create config with GLiNER2 model
-let config = ExtractorConfig::builder()
-    .model_name("fastino/gliner2-base-v1")
-    .hidden_size(768)
-    .vocab_size(128011)
-    .num_hidden_layers(12)
-    .num_attention_heads(12)
-    .intermediate_size(3072)
-    .build()?;
+fn main() -> gliner2_rs::Result<()> {
+    let config = ExtractorConfig::builder()
+        .model_name("fastino/gliner2-base-v1")
+        .hidden_size(768)
+        .vocab_size(128011)
+        .num_hidden_layers(12)
+        .num_attention_heads(12)
+        .intermediate_size(3072)
+        .build()?;
 
-// Create engine (tokenizer downloads automatically from Hub)
-let engine = GLiNER2::new(&config)?;
+    // Tokenizer + weights download automatically from the Hub.
+    let engine = GLiNER2::new(&config)?;
 
-// Create schema
-let schema = SchemaBuilder::new()
-    .entities(vec!["person".to_string(), "organization".to_string()])
-    .build()?;
-let labels: Vec<&str> = schema.entities.iter().map(|e| e.name.as_str()).collect();
+    let schema = SchemaBuilder::new()
+        .entities(vec!["person".to_string(), "organization".to_string()])
+        .build()?;
 
-// Extract entities
-let result = engine.extract_entities(
-    "Apple CEO Tim Cook visited Cupertino.",
-    &labels,
-    Some(0.5),  // threshold
-    true,       // include_confidence
-    true,       // include_spans
-    None,       // max_len
-)?;
-
-println!("{:#?}", result);
+    let result = engine.extract(
+        "Apple CEO Tim Cook visited Cupertino.",
+        &schema,
+        0.5,   // threshold
+        true,  // include_confidence
+        true,  // include_spans
+        None,  // max_len
+    )?;
+    println!("{result:#}");
+    Ok(())
+}
 ```
 
 ### Batch Processing
@@ -176,7 +175,6 @@ let texts = vec![
     "Apple CEO Tim Cook".to_string(),
     "Google founder Larry Page".to_string(),
 ];
-
 let results = engine.batch_extract_entities(
     &texts,
     &["person", "organization"],
@@ -189,81 +187,40 @@ let results = engine.batch_extract_entities(
 )?;
 ```
 
+## ⚖️ vs `brainless/gliner2-candle`
+
+Both target GLiNER2 with candle. `gliner2-rs` is a fuller, production-oriented
+stack covering entities **and** broader schema/task plumbing (classifications,
+structures, relations, GLiNER2.5 boundary attributes), at the cost of more
+complexity. `brainless/gliner2-candle` is a minimal, entity-focused
+implementation (~1 KLOC) that is quick to audit and modify. Choose the former
+for a complete task surface and long-term extensibility; the latter for the
+smallest possible entity-extraction footprint.
+
 ## 🧪 Testing
 
-### Run All Tests
 ```bash
-cargo test --lib
+cargo test --lib                      # 148 unit tests
+cargo test --test real_inference_test # GLiNER2 real-hub inference
+cargo test --release --test real_inference_test_25 -- --ignored # GLiNER2.5 checkpoints
+cargo test --release --test gliner25_boundary_test full_matrix_parity -- --ignored
 ```
 
-### Run Integration Tests (Real Hub Downloads)
-```bash
-cargo test --test real_inference_test
-```
+The `test_task_output_parity` test (in `real_inference_test_25.rs`) runs
+classifications, relations, and attributes through both pipelines and asserts
+the numeric matches documented above.
 
-### Run Focused Parity Fixture Test
-```bash
-cargo test --release --test python_parity_test
-```
+## 🔍 Parity & Remaining Work
 
-### Test Results
-- ✅ The project currently includes **81 unit tests** and **18 integration tests**
-- ✅ Integration coverage includes real HuggingFace Hub model/tokenizer downloads
-- ✅ Integration coverage includes an offline Python-vs-Rust fixture parity harness
-- ⏱️ Full integration runs can take ~60–120s due to model initialization and Hub/cache behavior
+### Validated
+- ✅ Encoder final diff `6.68e-6` vs Python; pair logits global / relevant = `0.0000`
+- ✅ All four task types match Python (see table at top)
+- ✅ Full-matrix candidate validation (not just top-1 spans)
 
-## 🔍 Parity Status and Remaining Work
-
-### What is now verified
-- ✅ End-to-end extraction is functioning in real integration tests
-- ✅ Entity extraction returns meaningful outputs with confidence and character spans
-- ✅ Collator/tokenizer routing (including subword position handling) is aligned for GLiNER2 usage
-- ✅ count_embed and span scoring paths are wired and active in inference
-- ✅ Classification, relation, and structure extraction paths are implemented and tested end-to-end
-- ✅ Metadata-aware decoding is wired for relation thresholds and structure field metadata (dtype/threshold/validators)
-- ✅ Offline Python parity fixture comparisons are in place for reproducible Rust-vs-Python output checks
-- ✅ Parity harness coverage now includes threshold-edge fixtures (`0.49/0.50/0.51`) and multi-label classification fixtures
-- ✅ Strict long-context truncation parity is validated via `max_len` fixtures for entities/relations/structures
-
-### What remains
-- ⚠️ Continue improving numerical parity against Python for intermediate tensors/layer outputs
-- ⚠️ Expand parity fixtures to additional long-context and adversarial edge cases across more schema compositions
-- ⚠️ Expand regression coverage across diverse schemas, longer texts, and additional model variants
-- ⚠️ Validate behavior on additional hardware backends/devices as part of performance hardening
-
-### Next steps
-1. Add targeted parity snapshots for intermediate tensors in selected layers
-2. Add more deterministic fixture pairs to the offline Python-vs-Rust parity harness (including multi-task mixed schemas)
-3. Benchmark and tune CPU/GPU execution paths with parity checks enabled
-4. Keep tightening confidence calibration consistency across edge cases
-
-## 🏆 Credits
-
-### Coding Work
-This project was developed collaboratively across multiple AI coding sessions.
-
-**Qwen 3.6 Plus Preview (free)** contributed major foundational implementation work, including:
-- Core architecture port from PyTorch/tch to candle
-- Initial DeBERTa/GLiNER2 component implementations
-- Weight loading infrastructure and early end-to-end wiring
-- Early debugging and project scaffolding/tests
-
-**GPT-5.3-Codex** contributed substantial follow-up implementation and debugging work, including:
-- Collator parity fixes for HuggingFace tokenizer IDs and subword index tracking
-- DeBERTa encoder parity improvements (masking, relative position/bias handling, backend alignment)
-- Count-aware scoring pipeline fixes in `count_embed` (GRU/math/shape/transformer behavior)
-- Span representation parity fixes (activation path and projection behavior)
-- Entity extraction/scoring parity fixes (count-slot handling, overlap suppression, calibration debugging)
-- Classification/relation/structure inference path implementation and metadata-aware decoding
-- Runtime `max_len` handling fixes and schema embedding gather corrections
-- Runtime API parity updates for `max_len` in classification/relation convenience methods
-- Strict long-context `max_len` fixture parity restoration for entities/relations/structures
-- Focused `--release` integration coverage for relation/structure metadata behavior
-- Offline Python parity harness (`debug_comparison/python_parity_reference.py`) and fixture-based Rust/Python comparisons
-- Integration validation with real model tests and cleanup of debug output
-
-### Guidance & Support
-**The Operator** — Cheering on, guiding decisions, and providing crucial feedback throughout the development process. Your encouragement and direction made this achievement possible.
+### Remaining / non-goals
+- 📦 Release / CI packaging and crates.io publish (semver stays 0.x; additive)
+- 🧹 Broader cross-device (GPU) performance hardening
+- Pre-1.0 API stabilization
 
 ## 📄 License
 
@@ -272,5 +229,6 @@ Apache-2.0
 ## 🔗 Links
 
 - [GLiNER2 Python Implementation](https://github.com/fastino-ai/GLiNER2)
+- [GLiNER2.5 Python Implementation](https://github.com/urchade/GLiNER2.5)
 - [Candle Documentation](https://github.com/huggingface/candle)
 - [HuggingFace Tokenizers](https://github.com/huggingface/tokenizers)

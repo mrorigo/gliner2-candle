@@ -142,6 +142,7 @@ pub struct CandleEncoder {
 enum EncoderModel {
     Bert(Box<bert::BertModel>),
     DebertaV2(Box<debertav2::DebertaV2Model>),
+    DebertaV3(Box<crate::model::deberta_v3::DebertaV3Model>),
 }
 
 impl CandleEncoder {
@@ -307,12 +308,11 @@ impl CandleEncoder {
             }
             EncoderType::DebertaV3 => {
                 let deberta_config = Self::build_deberta_v3_config(config);
-                let model = debertav2::DebertaV2Model::load(vb, &deberta_config).map_err(|e| {
-                    GlinerError::model_loading(format!(
-                        "Failed to load DeBERTa V3-compatible DeBERTa V2 model: {e}"
-                    ))
-                })?;
-                Ok(EncoderModel::DebertaV2(Box::new(model)))
+                let model = crate::model::deberta_v3::DebertaV3Model::load(vb, &deberta_config)
+                    .map_err(|e| {
+                        GlinerError::model_loading(format!("Failed to load DeBERTa V3 model: {e}"))
+                    })?;
+                Ok(EncoderModel::DebertaV3(Box::new(model)))
             }
         }
     }
@@ -345,6 +345,43 @@ impl CandleEncoder {
                 .map_err(|e| {
                     GlinerError::model_loading(format!("DeBERTa V2 forward pass failed: {e}"))
                 }),
+            EncoderModel::DebertaV3(model) => model
+                .forward(input_ids, &token_type_ids, Some(attention_mask))
+                .map_err(|e| {
+                    GlinerError::model_loading(format!("DeBERTa V3 forward pass failed: {e}"))
+                }),
+        }
+    }
+
+    /// Debug staged forward: [embeddings, layer0, .., final].
+    /// Per-layer sub-stages for parity bisection (DeBERTa V3 only).
+    pub fn forward_substages(
+        &self,
+        input_ids: &Tensor,
+        attention_mask: &Tensor,
+    ) -> Result<Vec<(Tensor, Tensor, Tensor, Tensor)>> {
+        match &self.model {
+            EncoderModel::DebertaV3(model) => model
+                .forward_substages(input_ids, Some(attention_mask))
+                .map_err(|e| GlinerError::model_loading(format!("{e}"))),
+            _ => Err(GlinerError::model_loading(
+                "forward_substages only supports DebertaV3",
+            )),
+        }
+    }
+
+    pub fn forward_debug(
+        &self,
+        input_ids: &Tensor,
+        attention_mask: &Tensor,
+    ) -> Result<Vec<Tensor>> {
+        match &self.model {
+            EncoderModel::DebertaV3(model) => model
+                .forward_debug(input_ids, Some(attention_mask))
+                .map_err(|e| GlinerError::model_loading(format!("debug forward failed: {e}"))),
+            _ => Err(GlinerError::model_loading(
+                "forward_debug only supports DebertaV3",
+            )),
         }
     }
 
@@ -394,6 +431,7 @@ impl CandleEncoder {
         let encoder_type = match &self.model {
             EncoderModel::Bert(_) => EncoderType::Bert,
             EncoderModel::DebertaV2(_) => EncoderType::DebertaV2,
+            EncoderModel::DebertaV3(_) => EncoderType::DebertaV3,
         };
 
         // Rebuild config from current state
@@ -431,39 +469,24 @@ impl CandleEncoder {
     }
 
     /// Build a DeBERTa V3 config from the extractor config.
-    fn build_deberta_v3_config(config: &ExtractorConfig) -> debertav2::Config {
-        debertav2::Config {
+    fn build_deberta_v3_config(
+        config: &ExtractorConfig,
+    ) -> crate::model::deberta_v3::DebertaV3Config {
+        crate::model::deberta_v3::DebertaV3Config {
             vocab_size: config.vocab_size,
             hidden_size: config.hidden_size,
             num_hidden_layers: config.num_hidden_layers,
             num_attention_heads: config.num_attention_heads,
             intermediate_size: config.intermediate_size,
-            hidden_act: Self::map_deberta_act(config.hidden_act),
             hidden_dropout_prob: config.hidden_dropout_prob as f64,
-            attention_probs_dropout_prob: config.attention_probs_dropout_prob as f64,
             max_position_embeddings: config.max_position_embeddings,
-            type_vocab_size: 0,
-            initializer_range: 0.02,
             layer_norm_eps: 1e-7,
+            pad_token_id: config.pad_token_id,
+            share_att_key: true,
             relative_attention: true,
-            max_relative_positions: 512,
-            pad_token_id: Some(config.pad_token_id),
-            position_biased_input: false,
+            max_relative_positions: -1,
             pos_att_type: vec!["p2c".to_string(), "c2p".to_string()],
-            position_buckets: Some(256),
-            share_att_key: Some(true),
-            attention_head_size: None,
-            embedding_size: None,
-            norm_rel_ebd: None,
-            conv_kernel_size: None,
-            conv_groups: None,
-            conv_act: None,
-            id2label: None,
-            label2id: None,
-            pooler_dropout: None,
-            pooler_hidden_act: None,
-            pooler_hidden_size: None,
-            cls_dropout: None,
+            position_buckets: 256,
         }
     }
 

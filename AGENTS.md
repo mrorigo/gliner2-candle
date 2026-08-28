@@ -2,29 +2,47 @@
 
 ## 🎯 Project Overview
 
-This is a pure Rust implementation of the [GLiNER2](https://github.com/urchade/GLiNER2) information extraction model. The entire PyTorch/Python codebase has been ported to Rust using HuggingFace's `candle` ML framework.
+This is a pure Rust implementation of the [GLiNER2](https://github.com/urchade/GLiNER2) and [GLiNER2.5](https://github.com/urchade/GLiNER2.5) information extraction models. The entire PyTorch/Python codebase has been ported to Rust using HuggingFace's `candle` ML framework.
 
-**Key Achievement**: The full pipeline works end-to-end with real GLiNER2 model weights downloaded from HuggingFace Hub. The model loads, runs forward pass, and produces valid output structure.
+**Key Achievement**: Both GLiNER2 (span-enumeration) and GLiNER2.5 (boundary-prediction) pipelines work end-to-end with real model weights downloaded from HuggingFace Hub.
 
-**Current Status**: Entity extraction returns empty results (debugging in progress). The architecture is complete; the issue is in schema embedding extraction and span scoring logic.
+**Current Status (Phases 1-5 + Phase D complete)**:
+- GLiNER2: Fully functional entity extraction.
+- GLiNER2.5: Full boundary pipeline with numeric parity vs the Python
+  reference. All four task types match Python outputs:
+  - Entities: full matrix parity (global=0.0000, relevant=0.0000)
+  - Classifications: exact output match (positive)
+  - Relations: exact format match (bare pairs, no flags)
+  - Attributes (single-label): softmax logits matched to 8 decimals (0.9966161847)
+  - Attributes (multi-label): sigmoid logits matched to 7 decimals (0.5735875)
+- Phase D task parity fixes: endpoint difference vector layout (concat d/|d| not interleaved),
+  relation scorer receives H-dim word states, content pooler weight ownership, classification [C] markers.
+- Long documents (>384 words) are auto-chunked in `batch_extract` and merged.
+- Performance (release, CPU): short inputs at Python parity (~71ms/call).
+  Encoder rel-bias optimized: ~15ms → ~7ms/layer. Boundary scorer tensorized:
+  score_sample ~72ms → ~27ms/chunk. 2400-word doc: ~3.1s end-to-end.
 
 ## 🏗️ Architecture Summary
 
 ### Pipeline Flow
 ```
-Text + Schema → Tokenizer → Collator → DeBERTa V3 Encoder → Span Rep → Classifier → Output
+GLiNER2:   Text + Schema → Tokenizer → Collator → DeBERTa V3 → Span Rep → Classifier → Output
+GLiNER2.5: Text + Schema → Tokenizer → Collator → DeBERTa V3 (custom deberta_v3.rs) → gather word/marker states → BoundaryEncoder → shared-pool scoring → decode
+           (>384 words: split into overlapping chunks, extract per chunk, merge spans)
 ```
 
 ### Key Components
 | Component | File | Purpose |
 |-----------|------|---------|
 | **DeBERTa V3 Encoder** | `src/model/deberta_v3.rs` | Custom DeBERTa V3 implementation (no token_type_embeddings) |
+| **Boundary Encoder** | `src/model/boundary.rs` | Boundary projection, attention, SwiGLU refinement + score_sample |
 | **Span Representation** | `src/model/span_rep.rs` | markerV0: project_start/end/out_project (Linear+GELU+Linear) |
 | **Classifier** | `src/model/classifier.rs` | 2-layer MLP: 768→1536→1 with ReLU |
 | **Count Prediction** | `src/model/count_pred.rs` | 2-layer MLP: 768→1536→20 with ReLU |
 | **Candle Encoder** | `src/model/candle_encoder.rs` | Wrapper supporting BERT/DeBERTa V2/V3 |
 | **Collator** | `src/batch/collator.rs` | Tokenization + schema encoding + batching |
-| **Inference Engine** | `src/inference/engine.rs` | Main GLiNER2 API + entity extraction logic |
+| **Inference Engine** | `src/inference/engine.rs` | Main GLiNER2/2.5 API + entity extraction logic |
+| **Boundary Decode** | `src/inference/boundary.rs` | GLiNER2.5 boundary-path query building + entity decoding |
 
 ### Model Architecture (GLiNER2 base-v1)
 - **Encoder**: DeBERTa-v3-base (128011 vocab, 768 hidden, 12 layers, 12 heads)
@@ -107,29 +125,67 @@ All projectors are Linear+GELU+Linear (no LayerNorm).
 5. Filter by threshold (default 0.5)
 6. Extract text spans using character position mappings
 
-## 🐛 Current Debugging Focus
+## 🐛 Debugging Notes (resolved — keep for reference)
 
-### Issue: Entity Extraction Returns Empty Results
-The model loads and runs successfully, but no entities are extracted. Debug output shows:
-- `schema_special_indices=[[0, 2, 5, 7, 9]]` - These are schema token POSITIONS, not subword positions
-- `text_word_indices=[]` - Empty! This is a problem
-- `input_ids.len()=33`
+### Fixed: Wrong/merged entity extraction (GLiNER2.5)
+Root causes, in the order they were found and fixed:
+1. **Relative-position sign flip**: candle-transformers' `debertav2` computes
+   `rel_pos = k - q`; HF uses `q - k`. This corrupts c2p/p2c attention gathers.
+   Fix: GLiNER2.5 uses the custom `src/model/deberta_v3.rs`.
+2. **Missing rel-embedding LayerNorm**: HF applies `norm_rel_ebd=layer_norm`
+   (`encoder.LayerNorm`) to rel_embeddings before attention. Do not also apply
+   it as an output LayerNorm — DeBERTa has no output LN.
+3. **Boundary scorer omissions** (`src/model/boundary.rs`): candidate_norm
+   must be applied to pool candidates; content LayerNorm applies to the pooled
+   span mean (not per-token); FiLM GELU is exact erf, not tanh.
 
-### Root Cause
-When using the HF tokenizer path in `collator.rs`:
-1. `schema_special_indices` tracks schema token positions (0, 2, 5, 7, 9) but needs SUBWORD positions
-2. `text_word_indices` is empty because the text token tracking logic isn't working
-3. Schema embeddings are extracted from wrong positions in encoder output
+Parity fixtures live in `/tmp/g25diag/*.json` (regenerate via Python dumps);
+tests: `test_encoder_parity`, `test_staged_parity`, `test_numeric_parity`
+(ignored; require the fixture files).
 
-### Files to Fix
-1. **`src/batch/collator.rs`** - Lines 300-400: Fix `schema_special_indices` and `text_word_indices` tracking
-2. **`src/inference/engine.rs`** - Lines 850-1050: Entity extraction logic (has debug output)
+### Perf pitfalls
+- Never benchmark unoptimized builds: candle dispatch overhead in debug is
+  ~30-100x. `[profile.dev.package."*"] opt-level = 3` handles this for tests.
+- Profile with `GLINER2_PROFILE=1` (stage timings: encoder / boundary head /
+  per-layer attn+ffn / rel-bias / softmax).
 
-### Debug Command
-```bash
-cargo test --test real_inference_test test_real_gliner2_model_loading -- --nocapture
-```
-This shows debug output from collator and entity extraction.
+### Fixed: two distinct span-content poolers (critical parity bug)
+The checkpoint has BOTH `boundary_head.shared_pool_scorer.content_pooler.*`
+AND `boundary_head.pair_scorer.content_pooler.*` (same shapes, DIFFERENT
+weights). The shared-pool scorer must use its own; borrowing the pair
+scorer's inflated score errors up to 8 logits on non-top candidates while
+top-1 still looked fine — easy to miss if you only compare top spans.
+Always validate the FULL candidate matrix vs Python (`pooled_indices.json`
++ `pair_logits.json` fixtures), not just the top hits. Residual agreement
+after the fix: decision-relevant logits within ~0.25 of Python; extraction
+outputs identical.
+
+### Fixed: endpoint-difference vector layout (Phase D critical bug)
+`torch.cat((d, |d|), dim=-1)` concatenates two halves: first all d values,
+then all abs values. The Rust code used `.flat_map(|k| [d[k], |d[k]|])`
+which interleaves `(d,|d|)` per-dim — identical first few values but
+wrong overall, causing a constant logit shift (~0.27–0.38) on explicit
+scoring calls. Fixed with: push all diffs first, then all abs diffs.
+
+### Span attributes do NOT need dedicated weights (Phase 3e unblocked)
+Verified against all three checkpoints (334 tensors each, zero attribute
+keys) AND the Python runtime:
+- `Schema.entity_attributes()` registers attribute labels as HIDDEN entity
+  queries in the prompt (excluded from public entity order)
+- After decoding, retained spans are re-scored against those queries via
+  `score_explicit_spans(text_states, text_mask, query_states, query_mask,
+  indices[B,Q,C,2])` — bypasses proposal top-k but reuses compat prior +
+  pair reranker (`models/boundary/model.py`)
+- `_attach_entity_attributes` then applies per-group sigmoid (multi_label)
+  or softmax and attaches results to each span dict
+- Rust port needs: schema AttributeGroup + hidden queries, an
+  explicit-spans scoring path in boundary.rs, post-decode attachment
+
+### Checkpoint facts (verified from Hub configs)
+- All three 2.5 checkpoints declare `max_len: 4096`;
+  `gliner2.5-multi-v1` vocab is 250112 (others 128011).
+- Encoder `max_position_embeddings: 512` is NOT an input cap — DeBERTa uses
+  relative positions (`position_buckets: 256` → rel table 512 rows).
 
 ## 🧪 Testing
 
@@ -230,7 +286,12 @@ tests/
 ## 🔗 References
 
 - [GLiNER2 Python Implementation](./GLiNER2/) - Reference implementation
-- [PLAN.md](./PLAN.md) - Phase 1 implementation plan
-- [PLAN2.md](./PLAN2.md) - Phase 2 (candle migration) plan
+- [GLiNER2.5 Python Implementation](https://github.com/urchade/GLiNER2.5) - Reference implementation
+- [README.md](./README.md) - Current status, usage, parity table
+- [CHANGELOG.md](./CHANGELOG.md) - Full development history
+- [docs/PLAN.md](./docs/PLAN.md) - Historical Phase 1 plan (tch era, maintenance mode)
+- [docs/PLAN2.md](./docs/PLAN2.md) - Phase 2 (candle migration) plan
+- [docs/PLAN_2.5.md](./docs/PLAN_2.5.md) - GLiNER2.5 boundary pipeline plan (COMPLETE)
+- [docs/index.html](./docs/index.html) - HTML status/parity overview page
 - [Candle Documentation](https://github.com/huggingface/candle)
 - [HuggingFace Tokenizers](https://github.com/huggingface/tokenizers)

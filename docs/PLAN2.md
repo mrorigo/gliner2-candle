@@ -1,5 +1,9 @@
 # GLiNER2 Rust Port - Phase 2: All-Candle Implementation Plan
 
+> **STATUS: COMPLETE — HISTORICAL RECORD.** The tch→candle migration described
+> in this document is finished. See the top-level `README.md` and `AGENTS.md`
+> for current status; `PLAN_2.5.md` covers the GLiNER2.5 boundary pipeline.
+
 ## Overview
 
 This document details the plan for migrating the entire GLiNER2 Rust port from `tch` (PyTorch bindings) to `candle` (HuggingFace's pure Rust ML framework). This eliminates the dual-backend complexity, removes the ~2GB libtorch runtime dependency, and creates a clean, maintainable, truly portable Rust library.
@@ -585,20 +589,21 @@ gliner2-rs/
 ## Success Criteria
 
 1. **Functional**: ✅ Can load a real GLiNER2 model and run meaningful inference
-2. **Correct**: ⏳ Output matches Python within numerical tolerance (1e-5) - pending integration tests
-3. **Performant**: ⏳ Inference speed within 2x of Python CPU inference - pending benchmarks
+2. **Correct**: ✅ Output matches Python within numerical tolerance — full parity
+   achieved (see README parity table; encoder diff 6.68e-6, pair logits 0.0000)
+3. **Performant**: ✅ Inference speed at parity with Python CPU (~71ms/call)
 4. **Maintainable**: ✅ Clean code, good tests, no placeholder code
 5. **Portable**: ✅ No external dependencies beyond cargo, pure Rust binary (candle only)
-6. **Tested**: ✅ All 106 unit tests pass, integration tests pending
+6. **Tested**: ✅ 148 unit tests pass plus integration/checkpoint suites
 
 ## Next Steps After Completion
 
-1. **Examples**: Create usage examples demonstrating real inference
-2. **Documentation**: Update API docs with working examples
-3. **Performance**: Profile and optimize critical paths
-4. **CI/CD**: Set up automated testing pipeline (simple now!)
-5. **Release**: Package for crates.io distribution
-6. **GPU Support**: Verify CUDA acceleration with candle
+1. **Examples**: ✅ README shows GLiNER2 + GLiNER2.5 usage
+2. **Documentation**: ✅ Updated (README, AGENTS.md, CHANGELOG.md)
+3. **Performance**: ✅ Profiled and optimized (rel-bias, tensorized boundary scorer)
+4. **CI/CD**: ⏳ Automated pipeline (not yet set up)
+5. **Release**: ⏳ crates.io packaging (semver stays 0.x; additive)
+6. **GPU Support**: ⏳ Verify CUDA acceleration with candle (not yet validated)
 
 ## References
 

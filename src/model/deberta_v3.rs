@@ -7,7 +7,7 @@
 //! - Relative position embeddings (rel_embeddings)
 //! - No token_type_embeddings
 
-use candle_core::{D, DType, Device, Result, Tensor};
+use candle_core::{DType, Device, Result, Tensor};
 use candle_nn::{Embedding, LayerNorm, Linear, Module, VarBuilder};
 
 #[derive(Clone)]
@@ -88,8 +88,8 @@ struct DebertaV3Attention {
     output_layer_norm: LayerNorm,
     num_attention_heads: usize,
     attention_head_size: usize,
-    max_relative_positions: isize,
-    position_buckets: usize,
+    _max_relative_positions: isize,
+    _position_buckets: usize,
     share_att_key: bool,
     pos_att_type: Vec<String>,
 }
@@ -132,19 +132,21 @@ impl DebertaV3Attention {
             output_layer_norm,
             num_attention_heads: config.num_attention_heads,
             attention_head_size,
-            max_relative_positions: config.max_relative_positions,
-            position_buckets: config.position_buckets,
+            _max_relative_positions: config.max_relative_positions,
+            _position_buckets: config.position_buckets,
             share_att_key: config.share_att_key,
             pos_att_type: config.pos_att_type.clone(),
         })
     }
 
-    fn forward(
+    #[allow(clippy::type_complexity)]
+    fn forward_dbg(
         &self,
         hidden_states: &Tensor,
         attention_mask: &Tensor,
         rel_embeddings: Option<&Tensor>,
-    ) -> Result<Tensor> {
+        rel_idx: Option<&RelPositionIndex>,
+    ) -> Result<(Tensor, Tensor)> {
         let input_tensor = hidden_states.clone();
         let (batch_size, seq_len, hidden_size) = hidden_states.dims3()?;
 
@@ -161,7 +163,8 @@ impl DebertaV3Attention {
                 self.num_attention_heads,
                 self.attention_head_size,
             ))?
-            .transpose(1, 2)?;
+            .transpose(1, 2)?
+            .contiguous()?;
         let key_layer = key_states
             .reshape((
                 batch_size,
@@ -169,7 +172,8 @@ impl DebertaV3Attention {
                 self.num_attention_heads,
                 self.attention_head_size,
             ))?
-            .transpose(1, 2)?;
+            .transpose(1, 2)?
+            .contiguous()?;
         let value_layer = value_states
             .reshape((
                 batch_size,
@@ -177,8 +181,11 @@ impl DebertaV3Attention {
                 self.num_attention_heads,
                 self.attention_head_size,
             ))?
-            .transpose(1, 2)?;
+            .transpose(1, 2)?
+            .contiguous()?;
 
+        let prof = std::env::var("GLINER2_PROFILE").is_ok();
+        let t_qkv = std::time::Instant::now();
         // Compute scale factor based on pos_att_type
         let mut scale_factor = 1.0f64;
         if self.pos_att_type.iter().any(|s| s == "c2p") {
@@ -193,22 +200,42 @@ impl DebertaV3Attention {
         let mut attention_scores = query_layer.matmul(&key_layer.transpose(2, 3)?)?;
         attention_scores = (attention_scores / scale)?;
 
+        if prof {
+            eprintln!("PROFILE     qkv+qk={:?} seq={seq_len}", t_qkv.elapsed());
+        }
         // Add disentangled attention bias if relative embeddings are available
-        if let Some(rel_emb) = rel_embeddings {
-            let rel_att = self.disentangled_attention_bias(
-                &query_layer,
-                &key_layer,
-                rel_emb,
-                scale,
-                batch_size,
-                seq_len,
-            )?;
-            attention_scores = attention_scores.add(&rel_att)?;
+        let t_rel = std::time::Instant::now();
+        match (rel_embeddings, rel_idx) {
+            (Some(rel_emb), Some(idx)) => {
+                let rel_att =
+                    self.disentangled_attention_bias(&query_layer, &key_layer, rel_emb, idx)?;
+                attention_scores = attention_scores.add(&rel_att)?;
+            }
+            (Some(rel_emb), None) => {
+                let idx = RelPositionIndex::build(
+                    batch_size,
+                    seq_len,
+                    self.num_attention_heads,
+                    rel_emb.dims()[0] / 2,
+                    query_layer.device(),
+                )?;
+                let rel_att =
+                    self.disentangled_attention_bias(&query_layer, &key_layer, rel_emb, &idx)?;
+                attention_scores = attention_scores.add(&rel_att)?;
+            }
+            _ => {}
+        }
+        if prof {
+            eprintln!("PROFILE     rel_bias={:?}", t_rel.elapsed());
         }
 
         // Apply attention mask
+        let t_sm = std::time::Instant::now();
         attention_scores = attention_scores.add(attention_mask)?;
         let attention_probs = candle_nn::ops::softmax(&attention_scores, 3)?;
+        if prof {
+            eprintln!("PROFILE     mask+softmax={:?}", t_sm.elapsed());
+        }
 
         // Context layer: (batch, heads, seq, seq) @ (batch, heads, seq, head_size)
         let context = attention_probs.matmul(&value_layer)?;
@@ -218,171 +245,138 @@ impl DebertaV3Attention {
         // Output projection + residual + layer norm
         let output = self.output_dense.forward(&context)?;
         let output = output.add(&input_tensor)?;
-        self.output_layer_norm.forward(&output)
+        let out = self.output_layer_norm.forward(&output)?;
+        Ok((out, context))
+    }
+
+    /// Standard forward (drops the raw context).
+    #[allow(dead_code)]
+    fn forward(
+        &self,
+        hidden_states: &Tensor,
+        attention_mask: &Tensor,
+        rel_embeddings: Option<&Tensor>,
+        rel_idx: Option<&RelPositionIndex>,
+    ) -> Result<Tensor> {
+        self.forward_dbg(hidden_states, attention_mask, rel_embeddings, rel_idx)
+            .map(|(out, _)| out)
+    }
+
+    fn scale(&self) -> f64 {
+        let mut scale_factor = 1.0f64;
+        if self.pos_att_type.iter().any(|s| s == "c2p") {
+            scale_factor += 1.0;
+        }
+        if self.pos_att_type.iter().any(|s| s == "p2c") {
+            scale_factor += 1.0;
+        }
+        (self.attention_head_size as f64 * scale_factor).sqrt()
     }
 
     /// Compute disentangled attention bias with c2p and p2c components.
+    ///
+    /// `idx` holds pre-broadcast U32 gather indices shared across all layers.
     fn disentangled_attention_bias(
         &self,
         query_layer: &Tensor,
         key_layer: &Tensor,
         rel_embeddings: &Tensor,
-        scale: f64,
+        idx: &RelPositionIndex,
+    ) -> Result<Tensor> {
+        let inv_scale = 1.0 / self.scale();
+        let batch_size = query_layer.dims()[0];
+        let mut score: Option<Tensor> = None;
+
+        // Content-to-Position (c2p): out[i, j] = q[i] . pk[idx[i, j]] / scale
+        if self.pos_att_type.iter().any(|s| s == "c2p") {
+            let pos_key = if self.share_att_key {
+                self.key_proj.forward(rel_embeddings)?
+            } else {
+                candle_core::bail!("share_att_key=false not implemented")
+            };
+            let pk = (self.pos_proj(pos_key, batch_size)? * inv_scale)?;
+            let att = query_layer.matmul(&pk.transpose(2, 3)?)?;
+            let part = gather_along_last_dim(&att, &idx.idx)?;
+            score = Some(match score {
+                Some(s) => s.add(&part)?,
+                None => part,
+            });
+        }
+
+        // Position-to-Content (p2c): out[i, j] = k[j] . pq[idx[i, j]] / scale
+        if self.pos_att_type.iter().any(|s| s == "p2c") {
+            let pos_query = if self.share_att_key {
+                self.query_proj.forward(rel_embeddings)?
+            } else {
+                candle_core::bail!("share_att_key=false not implemented")
+            };
+            let pq = (self.pos_proj(pos_query, batch_size)? * inv_scale)?;
+            let att = key_layer.matmul(&pq.transpose(2, 3)?)?;
+            let part = gather_last_dim_transposed(&att, &idx.idx)?;
+            score = Some(match score {
+                Some(s) => s.add(&part)?,
+                None => part,
+            });
+        }
+
+        match score {
+            Some(s) => Ok(s),
+            None => candle_core::bail!("pos_att_type must contain c2p or p2c"),
+        }
+    }
+
+    /// Project position embeddings to per-head layout (batch, heads, head_size, P).
+    fn pos_proj(&self, proj: Tensor, batch_size: usize) -> Result<Tensor> {
+        let p = proj.dims()[0];
+        proj.reshape((p, self.num_attention_heads, self.attention_head_size))?
+            .transpose(0, 1)?
+            .unsqueeze(0)?
+            .broadcast_as((
+                batch_size,
+                self.num_attention_heads,
+                p,
+                self.attention_head_size,
+            ))?
+            .contiguous()
+    }
+}
+
+/// Precomputed relative-position gather indices shared across all layers.
+///
+/// `idx[i, j] = clamp(i - j + span)` in `[0, 2*span)`, shape
+/// `(batch, heads, seq, seq)`, dtype U32, contiguous.
+///
+/// This single tensor serves both attention directions:
+/// - c2p: `out[i, j] = q[i] . pk[idx[i, j]]` (direct last-dim gather)
+/// - p2c: `out[i, j] = k[j] . pq[idx[i, j]]` (gather + transpose fused)
+pub(crate) struct RelPositionIndex {
+    pub idx: Tensor,
+}
+
+impl RelPositionIndex {
+    fn build(
         batch_size: usize,
         seq_len: usize,
-    ) -> Result<Tensor> {
-        // Apply dropout to relative embeddings (simplified: skip dropout in inference)
-        let rel_embeddings = rel_embeddings.clone();
+        num_heads: usize,
+        att_span: usize,
+        device: &Device,
+    ) -> Result<Self> {
+        let q_ids = Tensor::arange(0i64, seq_len as i64, device)?.unsqueeze(1)?;
+        let k_ids = Tensor::arange(0i64, seq_len as i64, device)?.unsqueeze(0)?;
+        let rel_pos_f = q_ids.broadcast_sub(&k_ids)?.to_dtype(DType::F32)?;
 
-        // Build relative position matrix: (1, seq, seq)
-        let relative_pos = build_relative_position(
-            seq_len,
-            seq_len,
-            self.position_buckets,
-            self.max_relative_positions,
-            query_layer.device(),
-        )?;
-
-        let mut score = Tensor::zeros(
-            (batch_size, self.num_attention_heads, seq_len, seq_len),
-            DType::F32,
-            query_layer.device(),
-        )?;
-
-        // Content-to-Position (c2p): query @ pos_key^T
-        if self.pos_att_type.iter().any(|s| s == "c2p") {
-            let c2p_att = self.content_to_position(
-                query_layer,
-                &rel_embeddings,
-                &relative_pos,
-                scale,
-                batch_size,
-            )?;
-            score = score.add(&c2p_att)?;
-        }
-
-        // Position-to-Content (p2c): key @ pos_query^T
-        if self.pos_att_type.iter().any(|s| s == "p2c") {
-            let p2c_att = self.position_to_content(
-                key_layer,
-                &rel_embeddings,
-                &relative_pos,
-                scale,
-                batch_size,
-            )?;
-            score = score.add(&p2c_att)?;
-        }
-
-        Ok(score)
-    }
-
-    /// Content-to-Position attention: query @ pos_key^T, gathered by relative positions
-    fn content_to_position(
-        &self,
-        query_layer: &Tensor,
-        rel_embeddings: &Tensor,
-        relative_pos: &Tensor,
-        scale: f64,
-        batch_size: usize,
-    ) -> Result<Tensor> {
-        // Compute position key projections
-        let pos_key_layer = if self.share_att_key {
-            // Reuse key_proj weights
-            let pos_key = self.key_proj.forward(rel_embeddings)?;
-            pos_key
-                .reshape((
-                    rel_embeddings.dims()[0],
-                    self.num_attention_heads,
-                    self.attention_head_size,
-                ))?
-                .transpose(0, 1)?
-        } else {
-            candle_core::bail!("share_att_key=false not implemented")
-        };
-
-        // Repeat for batch size: (heads, pos_emb_size, head_size) -> (batch, heads, pos_emb_size, head_size)
-        let pos_key_layer = pos_key_layer.unsqueeze(0)?.broadcast_as((
-            batch_size,
-            self.num_attention_heads,
-            pos_key_layer.dims()[1],
-            self.attention_head_size,
-        ))?;
-
-        // query @ pos_key^T: (batch, heads, seq, head_size) @ (batch, heads, head_size, pos_emb_size)
-        let c2p_att = query_layer.matmul(&pos_key_layer.transpose(2, 3)?)?;
-
-        // Gather using relative positions
-        let att_span = rel_embeddings.dims()[0] / 2;
-        let relative_pos_f = relative_pos.to_dtype(DType::F32)?;
-        let att_span_tensor = Tensor::full(
-            att_span as f32,
-            relative_pos_f.dims(),
-            relative_pos_f.device(),
-        )?;
-        let shifted_pos = relative_pos_f.add(&att_span_tensor)?;
+        let span_t = Tensor::full(att_span as f32, (seq_len, seq_len), device)?;
         let max_val = (att_span * 2 - 1) as f32;
-        let shifted_pos = shifted_pos.clamp(0.0, max_val)?;
+        let dims = (batch_size, num_heads, seq_len, seq_len);
 
-        // Gather along last dim
-        let gathered = gather_along_last_dim(&c2p_att, &shifted_pos)?;
+        let idx = rel_pos_f
+            .add(&span_t)?
+            .clamp(0.0, max_val)?
+            .to_dtype(DType::U32)?
+            .broadcast_as(dims)?
+            .contiguous()?;
 
-        gathered / scale
-    }
-
-    /// Position-to-Content attention: key @ pos_query^T, gathered by relative positions
-    fn position_to_content(
-        &self,
-        key_layer: &Tensor,
-        rel_embeddings: &Tensor,
-        relative_pos: &Tensor,
-        scale: f64,
-        batch_size: usize,
-    ) -> Result<Tensor> {
-        // Compute position query projections
-        let pos_query_layer = if self.share_att_key {
-            // Reuse query_proj weights
-            let pos_query = self.query_proj.forward(rel_embeddings)?;
-            pos_query
-                .reshape((
-                    rel_embeddings.dims()[0],
-                    self.num_attention_heads,
-                    self.attention_head_size,
-                ))?
-                .transpose(0, 1)?
-        } else {
-            candle_core::bail!("share_att_key=false not implemented")
-        };
-
-        // Repeat for batch size
-        let pos_query_layer = pos_query_layer.unsqueeze(0)?.broadcast_as((
-            batch_size,
-            self.num_attention_heads,
-            pos_query_layer.dims()[1],
-            self.attention_head_size,
-        ))?;
-
-        // key @ pos_query^T: (batch, heads, seq, head_size) @ (batch, heads, head_size, pos_emb_size)
-        let p2c_att = key_layer.matmul(&pos_query_layer.transpose(2, 3)?)?;
-
-        // For p2c, we need to gather with negated relative positions
-        let att_span = rel_embeddings.dims()[0] / 2;
-        let relative_pos_f = relative_pos.to_dtype(DType::F32)?;
-        let neg_one = Tensor::full(-1.0f32, relative_pos_f.dims(), relative_pos_f.device())?;
-        let neg_rel_pos = relative_pos_f.mul(&neg_one)?;
-        let att_span_tensor = Tensor::full(
-            att_span as f32,
-            relative_pos_f.dims(),
-            relative_pos_f.device(),
-        )?;
-        let shifted_pos = neg_rel_pos.add(&att_span_tensor)?;
-        let max_val = (att_span * 2 - 1) as f32;
-        let shifted_pos = shifted_pos.clamp(0.0, max_val)?;
-
-        // Gather along last dim, then transpose last two dims to match HF/candle p2c path
-        let gathered = gather_along_last_dim(&p2c_att, &shifted_pos)?;
-        let gathered = gathered.transpose(2, 3)?;
-
-        gathered / scale
+        Ok(Self { idx })
     }
 }
 
@@ -420,13 +414,22 @@ impl DebertaV3Intermediate {
         })
     }
 
+    #[allow(dead_code)]
     fn forward(&self, hidden_states: &Tensor) -> Result<Tensor> {
+        self.forward_dbg(hidden_states).map(|(_, out)| out)
+    }
+
+    /// Returns `(gelu_output, layer_output)`.
+    fn forward_dbg(&self, hidden_states: &Tensor) -> Result<(Tensor, Tensor)> {
         let input_tensor = hidden_states.clone();
         let hidden = self.dense.forward(hidden_states)?;
-        let hidden = hidden.gelu()?;
+        // Exact (erf-based) GELU to match HF DebertaV2's `hidden_act="gelu"`;
+        // candle's built-in `gelu` is a tanh approximation.
+        let hidden = gelu_erf(&hidden)?;
         let output = self.output_dense.forward(&hidden)?;
         let output = output.add(&input_tensor)?;
-        self.output_layer_norm.forward(&output)
+        let out = self.output_layer_norm.forward(&output)?;
+        Ok((hidden, out))
     }
 }
 
@@ -451,18 +454,38 @@ impl DebertaV3Layer {
         hidden_states: &Tensor,
         attention_mask: &Tensor,
         rel_embeddings: Option<&Tensor>,
+        rel_idx: Option<&RelPositionIndex>,
     ) -> Result<Tensor> {
-        let hidden = self
-            .attention
-            .forward(hidden_states, attention_mask, rel_embeddings)?;
-        self.intermediate.forward(&hidden)
+        self.forward_dbg(hidden_states, attention_mask, rel_embeddings, rel_idx)
+            .map(|x| x.3)
+    }
+
+    /// Returns `(selfattn_context, attn_out, ffn_gelu, layer_out)`.
+    #[allow(clippy::type_complexity)]
+    fn forward_dbg(
+        &self,
+        hidden_states: &Tensor,
+        attention_mask: &Tensor,
+        rel_embeddings: Option<&Tensor>,
+        rel_idx: Option<&RelPositionIndex>,
+    ) -> Result<(Tensor, Tensor, Tensor, Tensor)> {
+        let t0 = std::time::Instant::now();
+        let (attn_out, ctx) =
+            self.attention
+                .forward_dbg(hidden_states, attention_mask, rel_embeddings, rel_idx)?;
+        let t_attn = t0.elapsed();
+        let t1 = std::time::Instant::now();
+        let (gelu, out) = self.intermediate.forward_dbg(&attn_out)?;
+        if std::env::var("GLINER2_PROFILE").is_ok() {
+            eprintln!("PROFILE     attn={t_attn:?} ffn={:?}", t1.elapsed());
+        }
+        Ok((ctx, attn_out, gelu, out))
     }
 }
 
 /// DeBERTa V3 encoder
 struct DebertaV3Encoder {
     layers: Vec<DebertaV3Layer>,
-    final_layer_norm: LayerNorm,
     num_attention_heads: usize,
 }
 
@@ -473,14 +496,8 @@ impl DebertaV3Encoder {
             let layer = DebertaV3Layer::load(vb.pp("layer").pp(i.to_string()), config)?;
             layers.push(layer);
         }
-        let final_layer_norm = candle_nn::layer_norm(
-            config.hidden_size,
-            config.layer_norm_eps,
-            vb.pp("LayerNorm"),
-        )?;
         Ok(Self {
             layers,
-            final_layer_norm,
             num_attention_heads: config.num_attention_heads,
         })
     }
@@ -491,11 +508,46 @@ impl DebertaV3Encoder {
         attention_mask: &Tensor,
         rel_embeddings: Option<&Tensor>,
     ) -> Result<Tensor> {
+        let profile = std::env::var("GLINER2_PROFILE").is_ok();
+        let t_all = std::time::Instant::now();
         let mut hidden = hidden_states.clone();
-        for layer in &self.layers {
-            hidden = layer.forward(&hidden, attention_mask, rel_embeddings)?;
+
+        // Relative-position gather indices depend only on shapes: build once
+        // and share across all layers instead of rebuilding per layer.
+        let rel_idx = match rel_embeddings {
+            Some(rel) => {
+                let (batch_size, seq_len, _) = hidden_states.dims3()?;
+                Some(RelPositionIndex::build(
+                    batch_size,
+                    seq_len,
+                    self.num_attention_heads,
+                    rel.dims()[0] / 2,
+                    hidden_states.device(),
+                )?)
+            }
+            None => None,
+        };
+
+        for (i, layer) in self.layers.iter().enumerate() {
+            if profile && (i == 0 || i == self.layers.len() - 1) {
+                let t0 = std::time::Instant::now();
+                hidden =
+                    layer.forward(&hidden, attention_mask, rel_embeddings, rel_idx.as_ref())?;
+                let el = t0.elapsed();
+                eprintln!("PROFILE   layer {i}: {el:?} seq={}", hidden.dims()[1]);
+            } else {
+                hidden =
+                    layer.forward(&hidden, attention_mask, rel_embeddings, rel_idx.as_ref())?;
+            }
         }
-        self.final_layer_norm.forward(&hidden)
+        if profile {
+            eprintln!(
+                "PROFILE   encoder_total={:?} seq={}",
+                t_all.elapsed(),
+                hidden.dims()[1]
+            );
+        }
+        Ok(hidden)
     }
 }
 
@@ -504,6 +556,7 @@ pub struct DebertaV3Model {
     embeddings: DebertaV3Embeddings,
     encoder: DebertaV3Encoder,
     rel_embeddings: Option<Embedding>,
+    rel_layer_norm: Option<LayerNorm>,
     device: Device,
 }
 
@@ -536,11 +589,21 @@ impl DebertaV3Model {
         } else {
             None
         };
+        let rel_layer_norm = if vb.contains_tensor("encoder.LayerNorm.weight") {
+            Some(candle_nn::layer_norm(
+                config.hidden_size,
+                config.layer_norm_eps,
+                vb.pp("encoder").pp("LayerNorm"),
+            )?)
+        } else {
+            None
+        };
 
         Ok(Self {
             embeddings,
             encoder,
             rel_embeddings,
+            rel_layer_norm,
             device: vb.device().clone(),
         })
     }
@@ -607,105 +670,218 @@ impl DebertaV3Model {
         let attention_mask = (attention_mask.ones_like()? - &attention_mask)?
             .broadcast_mul(&Tensor::try_from(f32::MIN)?.to_device(attention_mask.device())?)?;
 
-        let rel_embeddings = self.rel_embeddings.as_ref().map(|e| e.embeddings());
-        self.encoder.forward(
-            &embedding_output,
-            &attention_mask,
-            rel_embeddings.as_ref().map(|t| *t),
-        )
+        let rel_embeddings = self.rel_states();
+        self.encoder
+            .forward(&embedding_output, &attention_mask, rel_embeddings.as_ref())
+    }
+
+    fn rel_states(&self) -> Option<Tensor> {
+        let raw = self.rel_embeddings.as_ref()?.embeddings();
+        match &self.rel_layer_norm {
+            Some(ln) => Some(ln.forward(raw).expect("rel LayerNorm forward")),
+            None => Some(raw.clone()),
+        }
     }
 
     pub fn device(&self) -> &Device {
         &self.device
     }
-}
 
-/// Build relative position matrix (aligned with HF/candle DeBERTa implementation).
-/// Returns tensor of shape (1, query_size, key_size), dtype i64.
-fn build_relative_position(
-    query_size: usize,
-    key_size: usize,
-    position_buckets: usize,
-    max_relative_positions: isize,
-    device: &Device,
-) -> Result<Tensor> {
-    // Match candle-transformers/debertav2:
-    // q_ids: (1, query), k_ids: (key, 1), rel_pos = k - q
-    let q_ids = Tensor::arange(0i64, query_size as i64, device)?.unsqueeze(0)?;
-    let k_ids = Tensor::arange(0i64, key_size as i64, device)?.unsqueeze(1)?;
-    let mut rel_pos = k_ids.broadcast_sub(&q_ids)?;
+    /// Debug forward returning per-layer stages for parity testing:
+    /// `[l0_in(=embeddings), l0_out(=l1_in), ..., l11_out]` — 13 entries.
+    pub fn forward_debug(
+        &self,
+        input_ids: &Tensor,
+        attention_mask: Option<&Tensor>,
+    ) -> Result<Vec<Tensor>> {
+        let embedding_output = self.embeddings.forward(input_ids)?;
+        let mut stages = vec![embedding_output.clone()];
 
-    if position_buckets > 0 && max_relative_positions > 0 {
-        rel_pos =
-            make_log_bucket_position(&rel_pos, position_buckets, max_relative_positions as usize)?;
+        let attention_mask = match attention_mask {
+            Some(mask) => mask.clone(),
+            None => input_ids.ones_like()?,
+        };
+        let extended_attention_mask = attention_mask.unsqueeze(1)?.unsqueeze(2)?;
+        let pairwise_attention_mask = extended_attention_mask
+            .broadcast_mul(&extended_attention_mask.squeeze(2)?.unsqueeze(3)?)?;
+        let pairwise_attention_mask = pairwise_attention_mask.broadcast_as((
+            pairwise_attention_mask.dims()[0],
+            self.encoder.num_attention_heads,
+            pairwise_attention_mask.dims()[2],
+            pairwise_attention_mask.dims()[3],
+        ))?;
+        let attention_mask = pairwise_attention_mask.to_dtype(DType::F32)?;
+        let attention_mask = (attention_mask.ones_like()? - &attention_mask)?
+            .broadcast_mul(&Tensor::try_from(f32::MIN)?.to_device(attention_mask.device())?)?;
+
+        let rel_embeddings = self.rel_states();
+        let mut hidden = embedding_output;
+        // stages[i] alternates: layer input, layer output (inputs reused).
+        let rel_idx = match rel_embeddings.as_ref() {
+            Some(rel) => {
+                let (batch_size, seq_len, _) = hidden.dims3()?;
+                Some(RelPositionIndex::build(
+                    batch_size,
+                    seq_len,
+                    self.encoder.num_attention_heads,
+                    rel.dims()[0] / 2,
+                    input_ids.device(),
+                )?)
+            }
+            None => None,
+        };
+        for layer in &self.encoder.layers {
+            hidden = layer.forward(
+                &hidden,
+                &attention_mask,
+                rel_embeddings.as_ref(),
+                rel_idx.as_ref(),
+            )?;
+            stages.push(hidden.clone()); // layer output (== next layer input)
+        }
+        Ok(stages)
     }
-
-    rel_pos = rel_pos.to_dtype(DType::I64)?;
-    rel_pos = rel_pos.narrow(0, 0, query_size)?;
-    rel_pos.unsqueeze(0)
 }
 
-/// Apply log bucketing to relative positions (aligned with HF/candle DeBERTa).
-fn make_log_bucket_position(
-    rel_pos: &Tensor,
-    bucket_size: usize,
-    max_position: usize,
-) -> Result<Tensor> {
-    let sign = rel_pos.to_dtype(DType::F32)?.sign()?;
-    let mid = (bucket_size / 2) as i64;
+impl DebertaV3Model {
+    /// Per-layer sub-stages for parity bisection:
+    /// `[(selfattn_context, attn_out, ffn_gelu, layer_out); num_layers]`.
+    pub fn forward_substages(
+        &self,
+        input_ids: &Tensor,
+        attention_mask: Option<&Tensor>,
+    ) -> Result<Vec<(Tensor, Tensor, Tensor, Tensor)>> {
+        let embedding_output = self.embeddings.forward(input_ids)?;
 
-    let lt_mid = rel_pos.lt(mid)?;
-    let gt_neg_mid = rel_pos.gt(-mid)?;
-    let condition = lt_mid
-        .to_dtype(DType::F32)?
-        .mul(&gt_neg_mid.to_dtype(DType::F32)?)?
-        .to_dtype(DType::U8)?;
+        let attention_mask = match attention_mask {
+            Some(mask) => mask.clone(),
+            None => input_ids.ones_like()?,
+        };
+        let extended_attention_mask = attention_mask.unsqueeze(1)?.unsqueeze(2)?;
+        let pairwise_attention_mask = extended_attention_mask
+            .broadcast_mul(&extended_attention_mask.squeeze(2)?.unsqueeze(3)?)?;
+        let pairwise_attention_mask = pairwise_attention_mask.broadcast_as((
+            pairwise_attention_mask.dims()[0],
+            self.encoder.num_attention_heads,
+            pairwise_attention_mask.dims()[2],
+            pairwise_attention_mask.dims()[3],
+        ))?;
+        let attention_mask = pairwise_attention_mask.to_dtype(DType::F32)?;
+        let attention_mask = (attention_mask.ones_like()? - &attention_mask)?
+            .broadcast_mul(&Tensor::try_from(f32::MIN)?.to_device(attention_mask.device())?)?;
 
-    let on_true = Tensor::new(&[(mid - 1) as u32], rel_pos.device())?
-        .broadcast_as(rel_pos.dims())?
-        .to_dtype(rel_pos.dtype())?;
-    let on_false = rel_pos.to_dtype(DType::F32)?.abs()?.to_dtype(DType::I64)?;
-    let abs_pos = condition.where_cond(&on_true, &on_false)?;
-
-    let mid_f = mid as f32;
-    let mid_tensor = Tensor::from_slice(&[mid_f], (1,), rel_pos.device())?;
-
-    let first_log = abs_pos
-        .to_dtype(DType::F32)?
-        .broadcast_div(&mid_tensor)?
-        .log()?;
-    let second_log = Tensor::from_slice(
-        &[((max_position as f32 - 1.0) / mid_f)],
-        (1,),
-        rel_pos.device(),
-    )?
-    .log()?;
-    let first_div_second = first_log.broadcast_div(&second_log)?;
-    let to_ceil = first_div_second
-        .broadcast_mul(Tensor::from_slice(&[(mid_f - 1.0)], (1,), rel_pos.device())?.as_ref())?;
-    let ceil = to_ceil.ceil()?;
-    let log_pos = ceil.broadcast_add(&mid_tensor)?;
-
-    let abs_pos_lte_mid = abs_pos.to_dtype(DType::F32)?.broadcast_le(&mid_tensor)?;
-    let rel_pos_f = rel_pos.to_dtype(DType::F32)?;
-    let log_pos_mul_sign = log_pos.broadcast_mul(&sign.to_dtype(DType::F32)?)?;
-    abs_pos_lte_mid.where_cond(&rel_pos_f, &log_pos_mul_sign)
+        let rel_embeddings = self.rel_states();
+        let mut hidden = embedding_output;
+        let rel_idx = match rel_embeddings.as_ref() {
+            Some(rel) => {
+                let (batch_size, seq_len, _) = hidden.dims3()?;
+                Some(RelPositionIndex::build(
+                    batch_size,
+                    seq_len,
+                    self.encoder.num_attention_heads,
+                    rel.dims()[0] / 2,
+                    input_ids.device(),
+                )?)
+            }
+            None => None,
+        };
+        let mut stages = Vec::with_capacity(self.encoder.layers.len());
+        for layer in &self.encoder.layers {
+            let st = layer.forward_dbg(
+                &hidden,
+                &attention_mask,
+                rel_embeddings.as_ref(),
+                rel_idx.as_ref(),
+            )?;
+            hidden = st.3.clone();
+            stages.push(st);
+        }
+        Ok(stages)
+    }
 }
 
-/// Gather value along the last dimension using indices
-/// input: (batch, heads, seq, vocab_size)
-/// indices: (1, seq, seq) with values in [0, vocab_size)
-/// output: (batch, heads, seq, seq)
+/// Exact (erf-based) GELU, matching `torch.nn.functional.gelu` and HF's
+/// `ACT2FN["gelu"]`.
+fn gelu_erf(x: &Tensor) -> Result<Tensor> {
+    let half = x.affine(0.5, 0.0)?;
+    let inner = x.affine(std::f64::consts::FRAC_1_SQRT_2, 0.0)?.erf()?;
+    half * (inner.affine(1.0, 1.0)?)
+}
+
+/// Gather along the last dimension with the output written transposed.
+///
+/// `input`: contiguous `(b, h, l, P)` f32.
+/// `indices`: contiguous `(b, h, l, o)` U32 with values `< P`.
+/// Result: `out[b, h, i, j] = input[b, h, j, indices[b, h, i, j]]`.
+///
+/// Fuses the gather and the `transpose(2, 3)` of the p2c path into a single
+/// pass with contiguous output.
+fn gather_last_dim_transposed(input: &Tensor, indices: &Tensor) -> Result<Tensor> {
+    let (b, h, l, p) = input.dims4()?;
+    let o = indices.dims()[3];
+
+    let src = input
+        .to_dtype(DType::F32)?
+        .contiguous()?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
+    let idx = indices
+        .to_dtype(DType::U32)?
+        .contiguous()?
+        .flatten_all()?
+        .to_vec1::<u32>()?;
+
+    let mut out = vec![0f32; b * h * l * o];
+    for bh in 0..b * h {
+        let base_in = bh * l;
+        let base_out = base_in * o;
+        for i in 0..l {
+            let dst = &mut out[base_out + i * o..base_out + (i + 1) * o];
+            let idx_row = &idx[base_out + i * o..base_out + (i + 1) * o];
+            for (j, k) in idx_row.iter().enumerate() {
+                dst[j] = src[(base_in + j) * p + *k as usize];
+            }
+        }
+    }
+    Tensor::from_vec(out, (b, h, l, o), input.device())
+}
+
+/// Gather values along the last dimension using per-row indices.
+///
+/// `input`: contiguous `(batch, heads, seq, P)` f32.
+/// `indices`: contiguous `(batch, heads, seq, out)` U32 with values `< P`.
+///
+/// Direct row-copy kernel: candle's generic `gather` carries significant
+/// per-element dispatch overhead on CPU; here each output element is a plain
+/// indexed copy from a source row of length `P` (64), which runs near memory
+/// bandwidth.
 fn gather_along_last_dim(input: &Tensor, indices: &Tensor) -> Result<Tensor> {
-    let input_dims = input.dims();
-    let batch_size = input_dims[0];
-    let num_heads = input_dims[1];
-    let seq_len = input_dims[2];
+    let (b, h, l, p) = input.dims4()?;
+    let o = indices.dims()[3];
 
-    // indices shape: (1, seq, seq) -> expand to (batch, heads, seq, seq)
-    let indices_expanded = indices.broadcast_as((batch_size, num_heads, seq_len, seq_len))?;
-    let gather_indices = indices_expanded.to_dtype(DType::U32)?;
+    let src = input
+        .to_dtype(DType::F32)?
+        .contiguous()?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
+    let idx = indices
+        .to_dtype(DType::U32)?
+        .contiguous()?
+        .flatten_all()?
+        .to_vec1::<u32>()?;
 
-    // Native gather along last dimension (matches candle DeBERTa implementation)
-    input.gather(&gather_indices, D::Minus1)
+    let mut out = vec![0f32; b * h * l * o];
+    for bh in 0..b * h {
+        let base_in = bh * l;
+        let base_out = base_in * o;
+        for i in 0..l {
+            let src_row = &src[(base_in + i) * p..(base_in + i + 1) * p];
+            let dst = &mut out[base_out + i * o..base_out + (i + 1) * o];
+            let idx_row = &idx[base_out + i * o..base_out + (i + 1) * o];
+            for (j, k) in idx_row.iter().enumerate() {
+                dst[j] = src_row[*k as usize];
+            }
+        }
+    }
+    Tensor::from_vec(out, (b, h, l, o), input.device())
 }

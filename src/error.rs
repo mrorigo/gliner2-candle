@@ -328,6 +328,15 @@ impl GlinerError {
 
 // Convenience conversions
 
+impl From<candle_core::Error> for GlinerError {
+    fn from(err: candle_core::Error) -> Self {
+        Self::Tensor {
+            message: format!("candle error: {err}"),
+            source: Some(Box::new(err)),
+        }
+    }
+}
+
 impl From<std::io::Error> for GlinerError {
     fn from(err: std::io::Error) -> Self {
         Self::Other {

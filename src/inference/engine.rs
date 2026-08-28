@@ -145,7 +145,45 @@ impl GLiNER2 {
         let input = model_name_or_path.as_ref();
         let input_str = input.to_string_lossy().to_string();
         let is_local = input.exists();
-        let config = ExtractorConfig::new(input_str.clone());
+        let mut config = ExtractorConfig::new(input_str.clone());
+
+        // Detect the architecture family (GLiNER2 vs GLiNER2.5 boundary).
+        config.architecture = crate::config::Architecture::detect(&input_str);
+
+        // For remote models, download and parse config.json for encoder dimensions.
+        if !is_local {
+            if let Some(hf_config_path) = Self::download_hf_config(&input_str)
+                && let Ok(hf_config_str) = std::fs::read_to_string(&hf_config_path)
+            {
+                // Parse boundary config for GLiNER2.5
+                config.boundary =
+                    crate::config::BoundaryConfig::from_hf_config_json(&hf_config_str);
+            }
+            // Encoder dims are in a separate encoder_config/config.json
+            if let Some(enc_path) = Self::download_encoder_config(&input_str)
+                && let Ok(enc_str) = std::fs::read_to_string(&enc_path)
+                && let Ok(enc) = serde_json::from_str::<serde_json::Value>(&enc_str)
+            {
+                if let Some(vs) = enc.get("vocab_size").and_then(|v| v.as_u64()) {
+                    config.vocab_size = vs as usize;
+                }
+                if let Some(hs) = enc.get("hidden_size").and_then(|v| v.as_u64()) {
+                    config.hidden_size = hs as usize;
+                }
+                if let Some(nl) = enc.get("num_hidden_layers").and_then(|v| v.as_u64()) {
+                    config.num_hidden_layers = nl as usize;
+                }
+                if let Some(nh) = enc.get("num_attention_heads").and_then(|v| v.as_u64()) {
+                    config.num_attention_heads = nh as usize;
+                }
+                if let Some(is) = enc.get("intermediate_size").and_then(|v| v.as_u64()) {
+                    config.intermediate_size = is as usize;
+                }
+            }
+        } else {
+            config.boundary =
+                crate::config::BoundaryConfig::detect(input.to_string_lossy().as_ref());
+        }
 
         let mut model = Extractor::new(&config)?;
 
@@ -203,6 +241,38 @@ impl GLiNER2 {
             Ok(path) => Some(path),
             Err(e) => {
                 tracing::warn!("Failed to download model weights for '{}': {}", model_id, e);
+                None
+            }
+        }
+    }
+
+    /// Download `config.json` from HuggingFace Hub for a remote model.
+    fn download_hf_config(model_id: &str) -> Option<std::path::PathBuf> {
+        use hf_hub::{Repo, RepoType, api::sync::ApiBuilder};
+
+        let repo = Repo::with_revision(model_id.to_string(), RepoType::Model, "main".to_string());
+        let api = ApiBuilder::new().with_progress(false).build().ok()?;
+        let repo_api = api.repo(repo);
+        match repo_api.get("config.json") {
+            Ok(path) => Some(path),
+            Err(e) => {
+                tracing::warn!("Failed to download config.json for '{}': {}", model_id, e);
+                None
+            }
+        }
+    }
+
+    /// Download `encoder_config/config.json` from HuggingFace Hub.
+    fn download_encoder_config(model_id: &str) -> Option<std::path::PathBuf> {
+        use hf_hub::{Repo, RepoType, api::sync::ApiBuilder};
+
+        let repo = Repo::with_revision(model_id.to_string(), RepoType::Model, "main".to_string());
+        let api = ApiBuilder::new().with_progress(false).build().ok()?;
+        let repo_api = api.repo(repo);
+        match repo_api.get("encoder_config/config.json") {
+            Ok(path) => Some(path),
+            Err(e) => {
+                tracing::debug!("No encoder_config/config.json for '{}': {}", model_id, e);
                 None
             }
         }
@@ -703,29 +773,118 @@ impl GLiNER2 {
         // Note: eval() requires mutable access, but we use immutable reference here
         // The is_training flag is only used internally and doesn't affect inference
 
-        // Convert schema to dict format
-        let schema_dict = schema.to_dict();
+        // Convert schema to dict format; on the boundary path, attribute
+        // labels become hidden entity queries in the collated prompt.
+        let is_boundary = model.architecture == crate::config::Architecture::Gliner25;
+        let (schema_dict, attrs_runtime) = if is_boundary {
+            match schema.expanded_with_attributes() {
+                Ok((expanded, prompts)) => {
+                    let runtime = (!prompts.is_empty()).then(|| {
+                        crate::inference::boundary::AttributesRuntime {
+                            prompt_by_label: prompts,
+                            groups: schema
+                                .entity_attribute_groups
+                                .iter()
+                                .map(|(k, v)| (k.clone(), v.clone()))
+                                .collect(),
+                        }
+                    });
+                    (expanded.to_dict(), runtime)
+                }
+                Err(e) => return Err(e),
+            }
+        } else {
+            (schema.to_dict(), None)
+        };
+        let attrs_ref = attrs_runtime.as_ref();
+        // Match the Python reference: chunk documents beyond the default chunk
+        // size (384 words) rather than waiting for the full encoder window —
+        // boundary-model recall collapses on long single-window inputs.
+        const MAX_ENCODER_WORDS: usize = 4096usize.saturating_sub(64);
+        let context_words = crate::chunking::DEFAULT_CHUNK_SIZE
+            .min(
+                max_len
+                    .or(self.config().max_len)
+                    .map_or(MAX_ENCODER_WORDS, |m| m.saturating_sub(64).max(32)),
+            )
+            .max(32);
 
-        // Create samples
-        let samples: Vec<(String, JsonValue)> = texts
-            .iter()
-            .map(|text| (text.clone(), schema_dict.clone()))
-            .collect();
+        // Expand long documents into overlapping chunks (boundary path only).
+        // Each entry maps to (original_text_index, Option<&[TextChunk]>, chunk_idx).
+        struct Expanded {
+            _original: usize,
+            text: String,
+        }
+        let mut expanded: Vec<Expanded> = Vec::new();
+        let mut chunk_lists: Vec<Option<Vec<crate::chunking::TextChunk>>> =
+            Vec::with_capacity(texts.len());
+        for (i, text) in texts.iter().enumerate() {
+            let needs_chunk = is_boundary && text.split_whitespace().count() > context_words;
+            if needs_chunk {
+                let chunks = crate::chunking::split_text_into_chunks(
+                    text,
+                    context_words,
+                    crate::chunking::DEFAULT_CHUNK_OVERLAP.min(context_words / 2),
+                )?;
+                for chunk in chunks.iter() {
+                    expanded.push(Expanded {
+                        _original: i,
+                        text: chunk.text.clone(),
+                    });
+                }
+                chunk_lists.push(Some(chunks));
+            } else {
+                expanded.push(Expanded {
+                    _original: i,
+                    text: text.clone(),
+                });
+                chunk_lists.push(None);
+            }
+        }
 
         // Process in batches
-        let mut all_results = Vec::with_capacity(texts.len());
-
-        // Sequential processing (Tensor is not Sync in tch 0.24)
-        for chunk in samples.chunks(batch_size) {
+        let mut all_expanded_results: Vec<JsonValue> = Vec::with_capacity(expanded.len());
+        for group in expanded.chunks(batch_size.max(1)) {
+            let samples: Vec<(String, JsonValue)> = group
+                .iter()
+                .map(|e| (e.text.clone(), schema_dict.clone()))
+                .collect();
             let results = self.process_batch(
-                chunk,
+                &samples,
                 model,
                 threshold,
                 include_confidence,
                 include_spans,
                 max_len,
+                attrs_ref,
             )?;
-            all_results.extend(results);
+            all_expanded_results.extend(results);
+        }
+
+        // Regroup chunk results back to their original documents.
+        let mut all_results: BatchExtractionResult = Vec::with_capacity(texts.len());
+        let mut cursor = 0usize;
+        for (i, text) in texts.iter().enumerate() {
+            match &chunk_lists[i] {
+                None => {
+                    all_results.push(all_expanded_results[cursor].clone());
+                    cursor += 1;
+                }
+                Some(chunks) => {
+                    let chunk_results: Vec<JsonValue> =
+                        all_expanded_results[cursor..cursor + chunks.len()].to_vec();
+                    cursor += chunks.len();
+                    let merged = crate::chunking::merge_chunk_results(
+                        text,
+                        chunks,
+                        chunk_results,
+                        include_confidence,
+                        include_spans,
+                        crate::chunking::MergePolicy::Allow,
+                    )?;
+                    all_results.push(merged);
+                }
+            }
         }
 
         Ok(all_results)
@@ -749,6 +908,7 @@ impl GLiNER2 {
     /// # Returns
     ///
     /// Extraction results for the batch.
+    #[allow(clippy::too_many_arguments)]
     fn process_batch(
         &self,
         samples: &[(String, JsonValue)],
@@ -757,6 +917,7 @@ impl GLiNER2 {
         include_confidence: bool,
         include_spans: bool,
         max_len: Option<usize>,
+        attrs: Option<&crate::inference::boundary::AttributesRuntime>,
     ) -> Result<Vec<ExtractionResult>> {
         // Collate batch
         let collator = match max_len {
@@ -767,6 +928,43 @@ impl GLiNER2 {
 
         // Move to device
         let batch = batch.to(self.device.clone(), None)?;
+
+        // GLiNER2.5 boundary path.
+        if model.architecture == crate::config::Architecture::Gliner25 {
+            let boundary = model.boundary.as_ref().ok_or_else(|| {
+                GlinerError::inference("GLiNER2.5 model weights not loaded (boundary head missing)")
+            })?;
+            let t_enc = std::time::Instant::now();
+            let token_embs = model
+                .encoder
+                .forward(&batch.input_ids, &batch.attention_mask)?;
+            let t_enc = t_enc.elapsed();
+            let t_score = std::time::Instant::now();
+            let mut results = Vec::with_capacity(batch.batch_size());
+            for sample_idx in 0..batch.batch_size() {
+                let states = token_embs.narrow(0, sample_idx, 1)?.squeeze(0)?;
+                let sample_result = crate::inference::boundary::extract_sample(
+                    boundary,
+                    &states,
+                    &batch,
+                    sample_idx,
+                    threshold,
+                    include_confidence,
+                    include_spans,
+                    attrs,
+                )?;
+                let _ = batch.original_texts.get(sample_idx);
+                results.push(sample_result);
+            }
+            if std::env::var("GLINER2_PROFILE").is_ok() {
+                eprintln!(
+                    "PROFILE encoder={t_enc:?} boundary_total={:?} batch={}",
+                    t_score.elapsed(),
+                    batch.batch_size()
+                );
+            }
+            return Ok(results);
+        }
 
         // Run forward pass
         let output = model.forward(&batch)?;
@@ -2148,7 +2346,7 @@ mod tests {
 
         // With valid regex
         let validator = RegexValidator::new(r"^\d+$").unwrap();
-        assert!(engine.apply_validators("123", &[validator.clone()]));
+        assert!(engine.apply_validators("123", std::slice::from_ref(&validator)));
         assert!(!engine.apply_validators("abc", &[validator]));
     }
 
