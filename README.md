@@ -11,8 +11,7 @@ downloaded from the HuggingFace Hub.
 > `gliner2` / `gliner2-rs` crates on [crates.io](https://crates.io), which are
 > built on the **ONNX Runtime** backend. `gliner2-candle` is the pure-Rust,
 > candle-native implementation — no ONNX Runtime, no libtorch, just `cargo
-> build`. (The repository itself keeps the name `gliner2-rust` to retain its
-> history.)
+> build`.
 
 ## 🎯 Current Status: Full Numeric Parity vs Python
 
@@ -128,7 +127,7 @@ GLiNER2.5: Text + Schema → Collator → DeBERTa V3 → boundary encoder → sh
 
 ```toml
 [dependencies]
-gliner2-candle = { git = "https://github.com/mrorigo/gliner2-rust" }
+gliner2-candle = { git = "https://github.com/mrorigo/gliner2-candle" }
 ```
 
 ### Dependencies
