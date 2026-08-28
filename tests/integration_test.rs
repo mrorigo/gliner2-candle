@@ -8,7 +8,7 @@
 /// This test verifies the basic setup works without requiring model weights.
 #[test]
 fn test_gliner2_engine_creation() {
-    use gliner2_rs::{ExtractorConfig, GLiNER2};
+    use gliner2_candle::{ExtractorConfig, GLiNER2};
 
     // Create config with bert-base-uncased for proper tokenizer compatibility
     let config = ExtractorConfig::new("bert-base-uncased");
@@ -33,7 +33,7 @@ fn test_gliner2_engine_creation() {
 /// Test that schema building works correctly.
 #[test]
 fn test_schema_building() {
-    use gliner2_rs::SchemaBuilder;
+    use gliner2_candle::SchemaBuilder;
 
     let schema = SchemaBuilder::new()
         .entities(vec!["person".to_string(), "company".to_string()])
@@ -54,7 +54,7 @@ fn test_schema_building() {
 /// initialization, but the pipeline should complete without errors.
 #[test]
 fn test_entity_extraction_pipeline() {
-    use gliner2_rs::{ExtractorConfig, GLiNER2};
+    use gliner2_candle::{ExtractorConfig, GLiNER2};
 
     // Use bert-base-uncased for proper tokenizer compatibility
     let config = ExtractorConfig::new("bert-base-uncased");
@@ -79,7 +79,7 @@ fn test_entity_extraction_pipeline() {
 /// Test batch entity extraction.
 #[test]
 fn test_batch_entity_extraction() {
-    use gliner2_rs::{ExtractorConfig, GLiNER2};
+    use gliner2_candle::{ExtractorConfig, GLiNER2};
 
     // Use bert-base-uncased for proper tokenizer compatibility
     let config = ExtractorConfig::new("bert-base-uncased");
@@ -113,7 +113,7 @@ fn test_batch_entity_extraction() {
 /// Test classification pipeline.
 #[test]
 fn test_classification_pipeline() {
-    use gliner2_rs::{ExtractorConfig, GLiNER2};
+    use gliner2_candle::{ExtractorConfig, GLiNER2};
 
     // Use bert-base-uncased for proper tokenizer compatibility
     let config = ExtractorConfig::new("bert-base-uncased");
@@ -144,7 +144,7 @@ fn test_classification_pipeline() {
 /// Test relation extraction pipeline returns relation_extraction payload.
 #[test]
 fn test_relation_extraction_pipeline() {
-    use gliner2_rs::{ExtractorConfig, GLiNER2};
+    use gliner2_candle::{ExtractorConfig, GLiNER2};
 
     let config = ExtractorConfig::new("bert-base-uncased");
     let engine = GLiNER2::new(&config).expect("Failed to create engine");
@@ -173,7 +173,7 @@ fn test_relation_extraction_pipeline() {
 /// Test structure extraction pipeline returns named structure payload.
 #[test]
 fn test_structure_extraction_pipeline() {
-    use gliner2_rs::{ExtractorConfig, GLiNER2, SchemaBuilder};
+    use gliner2_candle::{ExtractorConfig, GLiNER2, SchemaBuilder};
 
     let config = ExtractorConfig::new("bert-base-uncased");
     let engine = GLiNER2::new(&config).expect("Failed to create engine");
@@ -212,8 +212,8 @@ fn test_structure_extraction_pipeline() {
 /// Test relation-level threshold metadata influences decoding.
 #[test]
 fn test_relation_threshold_metadata_pipeline() {
-    use gliner2_rs::schema::builder::SchemaBuilder;
-    use gliner2_rs::{ExtractorConfig, GLiNER2};
+    use gliner2_candle::schema::builder::SchemaBuilder;
+    use gliner2_candle::{ExtractorConfig, GLiNER2};
 
     let config = ExtractorConfig::new("bert-base-uncased");
     let engine = GLiNER2::new(&config).expect("Failed to create engine");
@@ -258,9 +258,9 @@ fn test_relation_threshold_metadata_pipeline() {
 /// Test structure dtype='str' returns a single value (or null), not a list.
 #[test]
 fn test_structure_str_dtype_pipeline() {
-    use gliner2_rs::schema::builder::SchemaBuilder;
-    use gliner2_rs::schema::types::FieldDtype;
-    use gliner2_rs::{ExtractorConfig, GLiNER2};
+    use gliner2_candle::schema::builder::SchemaBuilder;
+    use gliner2_candle::schema::types::FieldDtype;
+    use gliner2_candle::{ExtractorConfig, GLiNER2};
 
     let config = ExtractorConfig::new("bert-base-uncased");
     let engine = GLiNER2::new(&config).expect("Failed to create engine");
@@ -310,7 +310,7 @@ fn test_structure_str_dtype_pipeline() {
 /// Test that the tokenizer produces valid token IDs.
 #[test]
 fn test_tokenizer_produces_valid_ids() {
-    use gliner2_rs::tokenizer::WhitespaceTokenizer;
+    use gliner2_candle::tokenizer::WhitespaceTokenizer;
 
     let tokenizer = WhitespaceTokenizer::new();
     let tokens = tokenizer.tokenize("Hello world, this is a test.");
@@ -329,8 +329,8 @@ fn test_tokenizer_produces_valid_ids() {
 /// Test that the collator produces valid batches.
 #[test]
 fn test_collator_produces_valid_batch() {
-    use gliner2_rs::batch::ExtractorCollator;
-    use gliner2_rs::tokenizer::WhitespaceTokenizer;
+    use gliner2_candle::batch::ExtractorCollator;
+    use gliner2_candle::tokenizer::WhitespaceTokenizer;
     use serde_json::json;
 
     let tokenizer = WhitespaceTokenizer::new();
@@ -359,7 +359,7 @@ fn test_collator_produces_valid_batch() {
 /// Test model configuration validation.
 #[test]
 fn test_config_validation() {
-    use gliner2_rs::ExtractorConfig;
+    use gliner2_candle::ExtractorConfig;
 
     // Default config should be valid
     let config = ExtractorConfig::default();
@@ -378,9 +378,9 @@ fn test_config_validation() {
 #[test]
 fn test_extractor_forward_pass() {
     use candle_core::{Device, Tensor};
-    use gliner2_rs::batch::PreprocessedBatchBuilder;
-    use gliner2_rs::config::ExtractorConfig;
-    use gliner2_rs::model::Extractor;
+    use gliner2_candle::batch::PreprocessedBatchBuilder;
+    use gliner2_candle::config::ExtractorConfig;
+    use gliner2_candle::model::Extractor;
 
     let config = ExtractorConfig::default();
     let extractor = Extractor::new(&config).expect("Failed to create extractor");

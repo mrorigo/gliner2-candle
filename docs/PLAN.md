@@ -230,7 +230,7 @@ GLiNER2 inference consists of three main stages:
 > documented in `AGENTS.md` and `PLAN2.md`.
 
 ```
-gliner2-rs/
+gliner2-candle/
 ├── Cargo.toml                      # ✅ Project configuration
 ├── PLAN.md                         # ✅ This file
 ├── src/

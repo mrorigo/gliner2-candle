@@ -7,6 +7,13 @@ A high-performance, pure Rust implementation of [GLiNER2](https://github.com/urc
 runtime required. Designed for efficient CPU inference with real model weights
 downloaded from the HuggingFace Hub.
 
+> **The `-candle` suffix** sets this crate apart from the existing
+> `gliner2` / `gliner2-rs` crates on [crates.io](https://crates.io), which are
+> built on the **ONNX Runtime** backend. `gliner2-candle` is the pure-Rust,
+> candle-native implementation — no ONNX Runtime, no libtorch, just `cargo
+> build`. (The repository itself keeps the name `gliner2-rust` to retain its
+> history.)
+
 ## 🎯 Current Status: Full Numeric Parity vs Python
 
 Both architectures run **end-to-end** with a documented numerical parity
@@ -39,17 +46,17 @@ reference:
   policies (`src/chunking.rs`)
 
 ```rust
-use gliner2_rs::GLiNER2;
-use gliner2_rs::schema::types::Schema;
+use gliner2_candle::GLiNER2;
+use gliner2_candle::schema::types::Schema;
 
-fn main() -> gliner2_rs::Result<()> {
+fn main() -> gliner2_candle::Result<()> {
     let engine = GLiNER2::from_pretrained("fastino/gliner2.5-small-v1")?;
 
     // Entities + span attributes (hidden queries, no dedicated weights).
     let mut groups = std::collections::HashMap::new();
     groups.insert(
         "sentiment".to_string(),
-        gliner2_rs::schema::types::AttributeGroup {
+        gliner2_candle::schema::types::AttributeGroup {
             labels: vec!["positive".to_string(), "negative".to_string()],
             multi_label: true,
             threshold: 0.5,
@@ -58,7 +65,7 @@ fn main() -> gliner2_rs::Result<()> {
         },
     );
     let schema = Schema::new()
-        .entities(vec![gliner2_rs::schema::types::EntityDef::new("person")])
+        .entities(vec![gliner2_candle::schema::types::EntityDef::new("person")])
         .entity_attributes(groups)?;
 
     // Long documents are chunked automatically.
@@ -121,7 +128,7 @@ GLiNER2.5: Text + Schema → Collator → DeBERTa V3 → boundary encoder → sh
 
 ```toml
 [dependencies]
-gliner2-rs = { git = "https://github.com/mrorigo/gliner2-rust" }
+gliner2-candle = { git = "https://github.com/mrorigo/gliner2-rust" }
 ```
 
 ### Dependencies
@@ -136,9 +143,9 @@ gliner2-rs = { git = "https://github.com/mrorigo/gliner2-rust" }
 ### Basic GLiNER2 Entity Extraction
 
 ```rust
-use gliner2_rs::{GLiNER2, ExtractorConfig, SchemaBuilder};
+use gliner2_candle::{GLiNER2, ExtractorConfig, SchemaBuilder};
 
-fn main() -> gliner2_rs::Result<()> {
+fn main() -> gliner2_candle::Result<()> {
     let config = ExtractorConfig::builder()
         .model_name("fastino/gliner2-base-v1")
         .hidden_size(768)
@@ -189,7 +196,7 @@ let results = engine.batch_extract_entities(
 
 ## ⚖️ vs `brainless/gliner2-candle`
 
-Both target GLiNER2 with candle. `gliner2-rs` is a fuller, production-oriented
+Both target GLiNER2 with candle. `gliner2-candle` is a fuller, production-oriented
 stack covering entities **and** broader schema/task plumbing (classifications,
 structures, relations, GLiNER2.5 boundary attributes), at the cost of more
 complexity. `brainless/gliner2-candle` is a minimal, entity-focused

@@ -29,7 +29,7 @@ pub type TokenMapping = (String, usize, usize);
 /// # Example
 ///
 /// ```ignore
-/// use gliner2_rs::batch::PreprocessedBatch;
+/// use gliner2_candle::batch::PreprocessedBatch;
 /// use candle_core::{Tensor, Device};
 ///
 /// let batch = PreprocessedBatch::new(

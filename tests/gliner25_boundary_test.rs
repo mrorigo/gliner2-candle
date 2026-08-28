@@ -3,7 +3,7 @@
 //! Downloads the small checkpoint (~440MB) and runs entity extraction through
 //! the boundary scoring path to verify non-empty results.
 
-use gliner2_rs::config::{BoundaryConfig, presets::gliner25_small};
+use gliner2_candle::config::{BoundaryConfig, presets::gliner25_small};
 use std::path::PathBuf;
 
 fn download_from_hub(repo_id: &str, filename: &str) -> PathBuf {
@@ -32,15 +32,15 @@ fn test_gliner25_small_boundary_scoring() {
     let mut config = gliner25_small();
     config.boundary = BoundaryConfig::from_hf_config_json(&hf_config);
 
-    let mut model = gliner2_rs::model::Extractor::new(&config).expect("construct extractor");
+    let mut model = gliner2_candle::model::Extractor::new(&config).expect("construct extractor");
     let weights_path = download_from_hub(model_id, "model.safetensors");
     model.load_weights(&weights_path).expect("load weights");
     assert!(model.boundary.is_some());
 
-    let ws_tok = gliner2_rs::tokenizer::WhitespaceTokenizer::new();
+    let ws_tok = gliner2_candle::tokenizer::WhitespaceTokenizer::new();
     let tok_path = download_from_hub(model_id, "tokenizer.json");
     let hf_tok = tokenizers::Tokenizer::from_file(&tok_path).expect("load tokenizer");
-    let collator = gliner2_rs::batch::ExtractorCollator::with_hf_tokenizer(
+    let collator = gliner2_candle::batch::ExtractorCollator::with_hf_tokenizer(
         ws_tok,
         hf_tok,
         false,
@@ -169,7 +169,7 @@ fn test_gliner25_small_boundary_scoring() {
 fn test_gliner25_engine_extract_entities() {
     let model_id = "fastino/gliner2.5-small-v1";
 
-    let engine = gliner2_rs::inference::engine::GLiNER2::from_pretrained(model_id)
+    let engine = gliner2_candle::inference::engine::GLiNER2::from_pretrained(model_id)
         .expect("from_pretrained failed");
 
     let result = engine.extract_entities(
@@ -199,15 +199,15 @@ fn test_collation_comparison() {
     let model_id = "fastino/gliner2.5-small-v1";
     let hf_config_path = download_from_hub(model_id, "config.json");
     let hf_config = std::fs::read_to_string(&hf_config_path).expect("read config.json");
-    let mut config = gliner2_rs::config::presets::gliner25_small();
-    config.boundary = gliner2_rs::config::BoundaryConfig::from_hf_config_json(&hf_config);
+    let mut config = gliner2_candle::config::presets::gliner25_small();
+    config.boundary = gliner2_candle::config::BoundaryConfig::from_hf_config_json(&hf_config);
 
     // Load HF tokenizer
     let tok_path = download_from_hub(model_id, "tokenizer.json");
     let hf_tok = tokenizers::Tokenizer::from_file(&tok_path).expect("load tokenizer");
 
-    let ws_tok = gliner2_rs::tokenizer::WhitespaceTokenizer::new();
-    let collator = gliner2_rs::batch::ExtractorCollator::with_hf_tokenizer(
+    let ws_tok = gliner2_candle::tokenizer::WhitespaceTokenizer::new();
+    let collator = gliner2_candle::batch::ExtractorCollator::with_hf_tokenizer(
         ws_tok,
         hf_tok,
         false,
@@ -253,15 +253,15 @@ fn test_numeric_parity() {
     let mut config = gliner25_small();
     config.boundary = BoundaryConfig::from_hf_config_json(&hf_config);
 
-    let mut model = gliner2_rs::model::Extractor::new(&config).expect("construct extractor");
+    let mut model = gliner2_candle::model::Extractor::new(&config).expect("construct extractor");
     let weights_path = download_from_hub(model_id, "model.safetensors");
     model.load_weights(&weights_path).expect("load weights");
     let boundary = model.boundary.as_ref().expect("boundary present");
 
     let tok_path = download_from_hub(model_id, "tokenizer.json");
     let hf_tok = tokenizers::Tokenizer::from_file(&tok_path).expect("load tokenizer");
-    let ws_tok = gliner2_rs::tokenizer::WhitespaceTokenizer::new();
-    let collator = gliner2_rs::batch::ExtractorCollator::with_hf_tokenizer(
+    let ws_tok = gliner2_candle::tokenizer::WhitespaceTokenizer::new();
+    let collator = gliner2_candle::batch::ExtractorCollator::with_hf_tokenizer(
         ws_tok,
         hf_tok,
         false,
@@ -380,14 +380,14 @@ fn test_layerwise_parity() {
     let mut config = gliner25_small();
     config.boundary = BoundaryConfig::from_hf_config_json(&hf_config);
 
-    let mut model = gliner2_rs::model::Extractor::new(&config).expect("construct extractor");
+    let mut model = gliner2_candle::model::Extractor::new(&config).expect("construct extractor");
     let weights_path = download_from_hub(model_id, "model.safetensors");
     model.load_weights(&weights_path).expect("load weights");
 
     let tok_path = download_from_hub(model_id, "tokenizer.json");
     let hf_tok = tokenizers::Tokenizer::from_file(&tok_path).expect("load tokenizer");
-    let ws_tok = gliner2_rs::tokenizer::WhitespaceTokenizer::new();
-    let collator = gliner2_rs::batch::ExtractorCollator::with_hf_tokenizer(
+    let ws_tok = gliner2_candle::tokenizer::WhitespaceTokenizer::new();
+    let collator = gliner2_candle::batch::ExtractorCollator::with_hf_tokenizer(
         ws_tok,
         hf_tok,
         false,
@@ -456,15 +456,15 @@ fn test_substage_parity() {
     let hf_config = std::fs::read_to_string(download_from_hub(model_id, "config.json")).unwrap();
     let mut config = gliner25_small();
     config.boundary = BoundaryConfig::from_hf_config_json(&hf_config);
-    let mut model = gliner2_rs::model::Extractor::new(&config).unwrap();
+    let mut model = gliner2_candle::model::Extractor::new(&config).unwrap();
     model
         .load_weights(download_from_hub(model_id, "model.safetensors"))
         .unwrap();
 
     let tok =
         tokenizers::Tokenizer::from_file(download_from_hub(model_id, "tokenizer.json")).unwrap();
-    let collator = gliner2_rs::batch::ExtractorCollator::with_hf_tokenizer(
-        gliner2_rs::tokenizer::WhitespaceTokenizer::new(),
+    let collator = gliner2_candle::batch::ExtractorCollator::with_hf_tokenizer(
+        gliner2_candle::tokenizer::WhitespaceTokenizer::new(),
         tok,
         false,
         config.max_len,
@@ -536,7 +536,7 @@ fn test_full_matrix_parity() {
     let hf_config = std::fs::read_to_string(download_from_hub(model_id, "config.json")).unwrap();
     let mut config = gliner25_small();
     config.boundary = BoundaryConfig::from_hf_config_json(&hf_config);
-    let mut model = gliner2_rs::model::Extractor::new(&config).unwrap();
+    let mut model = gliner2_candle::model::Extractor::new(&config).unwrap();
     model
         .load_weights(download_from_hub(model_id, "model.safetensors"))
         .unwrap();
@@ -544,8 +544,8 @@ fn test_full_matrix_parity() {
 
     let tok =
         tokenizers::Tokenizer::from_file(download_from_hub(model_id, "tokenizer.json")).unwrap();
-    let collator = gliner2_rs::batch::ExtractorCollator::with_hf_tokenizer(
-        gliner2_rs::tokenizer::WhitespaceTokenizer::new(),
+    let collator = gliner2_candle::batch::ExtractorCollator::with_hf_tokenizer(
+        gliner2_candle::tokenizer::WhitespaceTokenizer::new(),
         tok,
         false,
         config.max_len,
@@ -705,14 +705,14 @@ fn test_encoder_parity() {
     let mut config = gliner25_small();
     config.boundary = BoundaryConfig::from_hf_config_json(&hf_config);
 
-    let mut model = gliner2_rs::model::Extractor::new(&config).expect("construct extractor");
+    let mut model = gliner2_candle::model::Extractor::new(&config).expect("construct extractor");
     let weights_path = download_from_hub(model_id, "model.safetensors");
     model.load_weights(&weights_path).expect("load weights");
 
     let tok_path = download_from_hub(model_id, "tokenizer.json");
     let hf_tok = tokenizers::Tokenizer::from_file(&tok_path).expect("load tokenizer");
-    let ws_tok = gliner2_rs::tokenizer::WhitespaceTokenizer::new();
-    let collator = gliner2_rs::batch::ExtractorCollator::with_hf_tokenizer(
+    let ws_tok = gliner2_candle::tokenizer::WhitespaceTokenizer::new();
+    let collator = gliner2_candle::batch::ExtractorCollator::with_hf_tokenizer(
         ws_tok,
         hf_tok,
         false,
@@ -782,14 +782,14 @@ fn test_staged_parity() {
     let mut config = gliner25_small();
     config.boundary = BoundaryConfig::from_hf_config_json(&hf_config);
 
-    let mut model = gliner2_rs::model::Extractor::new(&config).expect("construct extractor");
+    let mut model = gliner2_candle::model::Extractor::new(&config).expect("construct extractor");
     let weights_path = download_from_hub(model_id, "model.safetensors");
     model.load_weights(&weights_path).expect("load weights");
 
     let tok_path = download_from_hub(model_id, "tokenizer.json");
     let hf_tok = tokenizers::Tokenizer::from_file(&tok_path).expect("load tokenizer");
-    let ws_tok = gliner2_rs::tokenizer::WhitespaceTokenizer::new();
-    let collator = gliner2_rs::batch::ExtractorCollator::with_hf_tokenizer(
+    let ws_tok = gliner2_candle::tokenizer::WhitespaceTokenizer::new();
+    let collator = gliner2_candle::batch::ExtractorCollator::with_hf_tokenizer(
         ws_tok,
         hf_tok,
         false,

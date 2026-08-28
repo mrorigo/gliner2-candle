@@ -6,7 +6,7 @@
 //!
 //! Gated behind the `hub` feature / env var like the other hub tests.
 
-use gliner2_rs::config::{Architecture, BoundaryConfig};
+use gliner2_candle::config::{Architecture, BoundaryConfig};
 use std::path::PathBuf;
 
 fn download_from_hub(repo_id: &str, filename: &str) -> PathBuf {
@@ -66,14 +66,14 @@ fn test_gliner25_base_checkpoint_loads() {
         "upstream config.json must declare the boundary architecture"
     );
 
-    let mut config = gliner2_rs::config::presets::gliner25_base();
+    let mut config = gliner2_candle::config::presets::gliner25_base();
     config.boundary = BoundaryConfig::from_hf_config_json(&hf_config);
     assert_eq!(config.boundary.start_top_k, 24);
     assert_eq!(config.boundary.pool_size, 192);
 
     // Build model and load weights (shape validation happens eagerly).
     let _device = candle_core::Device::Cpu;
-    let mut model = gliner2_rs::model::Extractor::new(&config)
+    let mut model = gliner2_candle::model::Extractor::new(&config)
         .expect("failed to construct extractor for GLiNER2.5");
     assert!(
         model.boundary.is_none(),

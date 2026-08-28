@@ -394,7 +394,7 @@ impl BoundaryConfig {
 /// # Example
 ///
 /// ```
-/// use gliner2_rs::config::ExtractorConfig;
+/// use gliner2_candle::config::ExtractorConfig;
 ///
 /// // Create config with defaults for base model
 /// let config = ExtractorConfig::default();

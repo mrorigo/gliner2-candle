@@ -73,7 +73,7 @@ impl Token {
 /// # Example
 ///
 /// ```
-/// use gliner2_rs::tokenizer::WhitespaceTokenizer;
+/// use gliner2_candle::tokenizer::WhitespaceTokenizer;
 ///
 /// let tokenizer = WhitespaceTokenizer::new();
 /// let tokens = tokenizer.tokenize("Hello, world! Visit https://example.com");
@@ -150,7 +150,7 @@ impl WhitespaceTokenizer {
     /// # Example
     ///
     /// ```
-    /// use gliner2_rs::tokenizer::WhitespaceTokenizer;
+    /// use gliner2_candle::tokenizer::WhitespaceTokenizer;
     ///
     /// let tokenizer = WhitespaceTokenizer::new();
     /// let tokens = tokenizer.tokenize("Apple Inc.");

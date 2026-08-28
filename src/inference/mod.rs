@@ -8,7 +8,7 @@
 //! # Example
 //!
 //! ```ignore
-//! use gliner2_rs::inference::GLiNER2;
+//! use gliner2_candle::inference::GLiNER2;
 //!
 //! let model = GLiNER2::from_pretrained("fastino/gliner2-base-v1")?;
 //! let result = model.extract_entities("Apple CEO Tim Cook", &["company", "person"])?;

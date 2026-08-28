@@ -10,8 +10,8 @@
 //! # Quick Start (GLiNER2)
 //!
 //! ```ignore
-//! use gliner2_rs::GLiNER2;
-//! use gliner2_rs::schema::SchemaBuilder;
+//! use gliner2_candle::GLiNER2;
+//! use gliner2_candle::schema::SchemaBuilder;
 //!
 //! // Load model (sync; downloads weights from HuggingFace Hub on first run)
 //! let model = GLiNER2::from_pretrained("fastino/gliner2-base-v1")?;

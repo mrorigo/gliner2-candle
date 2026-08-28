@@ -9,8 +9,8 @@
 //! # Example
 //!
 //! ```
-//! use gliner2_rs::schema::builder::SchemaBuilder;
-//! use gliner2_rs::schema::types::{EntityDef, ClassificationDef, FieldDef, RelationDef, FieldDtype};
+//! use gliner2_candle::schema::builder::SchemaBuilder;
+//! use gliner2_candle::schema::types::{EntityDef, ClassificationDef, FieldDef, RelationDef, FieldDtype};
 //!
 //! let schema = SchemaBuilder::new()
 //!     .entity("person").description("Names of people").done()
@@ -93,7 +93,7 @@ impl SchemaBuilder {
     /// # Example
     ///
     /// ```
-    /// use gliner2_rs::schema::builder::SchemaBuilder;
+    /// use gliner2_candle::schema::builder::SchemaBuilder;
     ///
     /// let schema = SchemaBuilder::new()
     ///     .entity("person")
@@ -126,7 +126,7 @@ impl SchemaBuilder {
     /// # Example
     ///
     /// ```
-    /// use gliner2_rs::schema::builder::SchemaBuilder;
+    /// use gliner2_candle::schema::builder::SchemaBuilder;
     ///
     /// let schema = SchemaBuilder::new()
     ///     .entities(vec!["person".to_string(), "company".to_string(), "location".to_string()])
@@ -152,7 +152,7 @@ impl SchemaBuilder {
     /// # Example
     ///
     /// ```
-    /// use gliner2_rs::schema::builder::SchemaBuilder;
+    /// use gliner2_candle::schema::builder::SchemaBuilder;
     /// use std::collections::HashMap;
     ///
     /// let mut entities = HashMap::new();
@@ -195,7 +195,7 @@ impl SchemaBuilder {
     /// # Example
     ///
     /// ```
-    /// use gliner2_rs::schema::builder::SchemaBuilder;
+    /// use gliner2_candle::schema::builder::SchemaBuilder;
     ///
     /// let schema = SchemaBuilder::new()
     ///     .classification("sentiment", vec!["positive".to_string(), "negative".to_string(), "neutral".to_string()])
@@ -239,8 +239,8 @@ impl SchemaBuilder {
     /// # Example
     ///
     /// ```
-    /// use gliner2_rs::schema::builder::SchemaBuilder;
-    /// use gliner2_rs::schema::types::FieldDtype;
+    /// use gliner2_candle::schema::builder::SchemaBuilder;
+    /// use gliner2_candle::schema::types::FieldDtype;
     ///
     /// let schema = SchemaBuilder::new()
     ///     .structure("product")
@@ -279,7 +279,7 @@ impl SchemaBuilder {
     /// # Example
     ///
     /// ```
-    /// use gliner2_rs::schema::builder::SchemaBuilder;
+    /// use gliner2_candle::schema::builder::SchemaBuilder;
     ///
     /// let schema = SchemaBuilder::new()
     ///     .relation("works_for")

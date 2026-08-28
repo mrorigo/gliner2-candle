@@ -1,14 +1,14 @@
 //! GLiNER2.5 performance smoke benchmark.
 
-use gliner2_rs::schema::types::Schema;
+use gliner2_candle::schema::types::Schema;
 
 #[test]
 #[ignore = "benchmark; run with --ignored"]
 fn bench_gliner25_latency() {
     let model_id = "fastino/gliner2.5-small-v1";
     let t0 = std::time::Instant::now();
-    let engine =
-        gliner2_rs::inference::engine::GLiNER2::from_pretrained(model_id).expect("from_pretrained");
+    let engine = gliner2_candle::inference::engine::GLiNER2::from_pretrained(model_id)
+        .expect("from_pretrained");
     println!("load time: {:?}", t0.elapsed());
 
     let schema = Schema::from_dict(&serde_json::json!({
@@ -63,9 +63,9 @@ fn bench_gliner25_latency() {
 #[ignore = "long-context benchmark"]
 fn bench_long_context() {
     let engine =
-        gliner2_rs::inference::engine::GLiNER2::from_pretrained("fastino/gliner2.5-small-v1")
+        gliner2_candle::inference::engine::GLiNER2::from_pretrained("fastino/gliner2.5-small-v1")
             .expect("from_pretrained");
-    let schema = gliner2_rs::schema::types::Schema::from_dict(&serde_json::json!({
+    let schema = gliner2_candle::schema::types::Schema::from_dict(&serde_json::json!({
         "entities": ["person", "organization", "location", "date", "product"]
     }))
     .expect("schema");

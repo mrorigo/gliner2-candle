@@ -8,8 +8,8 @@
 //! # Example
 //!
 //! ```ignore
-//! use gliner2_rs::GLiNER2;
-//! use gliner2_rs::schema::SchemaBuilder;
+//! use gliner2_candle::GLiNER2;
+//! use gliner2_candle::schema::SchemaBuilder;
 //!
 //! // Load model
 //! let model = GLiNER2::from_pretrained("fastino/gliner2-base-v1")?;
@@ -58,7 +58,7 @@ pub type BatchExtractionResult = Vec<ExtractionResult>;
 /// # Example
 ///
 /// ```ignore
-/// use gliner2_rs::GLiNER2;
+/// use gliner2_candle::GLiNER2;
 ///
 /// let model = GLiNER2::from_pretrained("fastino/gliner2-base-v1")?;
 /// let result = model.extract_entities(

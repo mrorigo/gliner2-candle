@@ -65,7 +65,7 @@ fn test_gliner2_tokenizer_download() {
 /// 4. Verifies the pipeline completes successfully
 #[test]
 fn test_gliner2_pipeline_with_real_tokenizer() {
-    use gliner2_rs::{ExtractorConfig, GLiNER2};
+    use gliner2_candle::{ExtractorConfig, GLiNER2};
 
     let model_id = "bert-base-uncased";
     println!(
@@ -143,7 +143,7 @@ fn test_gliner2_pipeline_with_real_tokenizer() {
 /// Test batch entity extraction with real tokenizer.
 #[test]
 fn test_gliner2_batch_extraction_with_real_tokenizer() {
-    use gliner2_rs::{ExtractorConfig, GLiNER2};
+    use gliner2_candle::{ExtractorConfig, GLiNER2};
 
     let model_id = "bert-base-uncased";
     println!("Setting up GLiNER2 batch extraction with: {}", model_id);
@@ -209,7 +209,7 @@ fn test_gliner2_batch_extraction_with_real_tokenizer() {
 /// loads them, and runs entity extraction to prove real inference works.
 #[test]
 fn test_real_gliner2_model_loading() {
-    use gliner2_rs::{ExtractorConfig, GLiNER2};
+    use gliner2_candle::{ExtractorConfig, GLiNER2};
 
     let model_id = "fastino/gliner2-base-v1";
     println!(

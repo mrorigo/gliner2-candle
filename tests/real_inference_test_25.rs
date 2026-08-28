@@ -4,7 +4,7 @@
 //! end-to-end entity extraction quality on the shared parity fixture.
 //! Gated behind `--ignored` like the other hub tests.
 
-use gliner2_rs::inference::engine::GLiNER2;
+use gliner2_candle::inference::engine::GLiNER2;
 use std::path::PathBuf;
 
 #[allow(dead_code)]
@@ -33,7 +33,7 @@ fn check_checkpoint(model_id: &str) {
     let schema_json = serde_json::json!({
         "entities": ["person", "organization", "location"]
     });
-    let schema = gliner2_rs::schema::types::Schema::from_dict(&schema_json).expect("schema");
+    let schema = gliner2_candle::schema::types::Schema::from_dict(&schema_json).expect("schema");
     let result = engine
         .extract(FIXTURE_TEXT, &schema, 0.5, true, true, None)
         .expect("extract");
@@ -93,7 +93,7 @@ fn test_gliner25_multi_checkpoint() {
 #[ignore = "perf smoke; downloads ~500MB"]
 fn test_perf_linear_scaling() {
     let engine = GLiNER2::from_pretrained("fastino/gliner2.5-small-v1").expect("load");
-    let schema = gliner2_rs::schema::types::Schema::from_dict(&serde_json::json!({
+    let schema = gliner2_candle::schema::types::Schema::from_dict(&serde_json::json!({
         "entities": ["person", "organization"]
     }))
     .expect("schema");
@@ -140,7 +140,7 @@ fn test_perf_linear_scaling() {
 #[test]
 #[ignore = "downloads ~500MB; run explicitly with --ignored"]
 fn test_gliner25_entity_attributes() {
-    use gliner2_rs::schema::types::{AttributeGroup, EntityDef, Schema};
+    use gliner2_candle::schema::types::{AttributeGroup, EntityDef, Schema};
     use std::collections::HashMap;
 
     let engine = GLiNER2::from_pretrained("fastino/gliner2.5-small-v1").expect("load");
@@ -207,7 +207,7 @@ fn test_gliner25_entity_attributes() {
 /// Attribute prompt labels must not leak into the public entity output.
 #[test]
 fn test_attribute_schema_expansion() {
-    use gliner2_rs::schema::types::{AttributeGroup, EntityDef, Schema};
+    use gliner2_candle::schema::types::{AttributeGroup, EntityDef, Schema};
     use std::collections::HashMap;
 
     let mut groups = HashMap::new();
@@ -265,8 +265,8 @@ fn test_attribute_schema_expansion() {
 #[test]
 #[ignore = "downloads ~500MB; run explicitly with --ignored"]
 fn test_task_output_parity() {
-    use gliner2_rs::schema::builder::SchemaBuilder;
-    use gliner2_rs::schema::types::{AttributeGroup, EntityDef, Schema};
+    use gliner2_candle::schema::builder::SchemaBuilder;
+    use gliner2_candle::schema::types::{AttributeGroup, EntityDef, Schema};
     use std::collections::HashMap;
 
     let py: serde_json::Value = serde_json::from_str(

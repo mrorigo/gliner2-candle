@@ -9,11 +9,18 @@ versions remain `0.x` (pre-1.0, additive-only semver policy).
 
 ### Changed
 
+- **Rebrand: crate renamed `gliner2-rs` → `gliner2-candle`** (crate namespace
+  `gliner2_rs` → `gliner2_candle`). The repository keeps the name `gliner2-rust`
+  to retain history; `gliner2` / `gliner2-rs` on crates.io are already taken by
+  ONNX-Runtime-based crates, so `-candle` signals the pure-Rust backend. Version
+  stays `0.1.0`.
 - Docs: full refresh — rewritten `README.md`, `CHANGELOG.md`,
   `docs/index.html`, and status banners on the historical plans
   (`docs/PLAN.md`, `docs/PLAN2.md`, `docs/PLAN_2.5.md`).
 - `Cargo.toml` and `src/lib.rs` now describe GLiNER2.5 support; the `lib.rs`
   quick-start example is corrected to the synchronous API.
+- `docs/index.html` rewritten with a refreshed "candle flame" design, task
+  parity matrix, animated pipeline, and a backend-comparison table.
 
 ## 2026-08-27 — Phase D task parity + hygiene
 

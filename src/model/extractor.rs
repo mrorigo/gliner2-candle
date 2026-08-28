@@ -17,9 +17,9 @@
 //! # Example
 //!
 //! ```ignore
-//! use gliner2_rs::model::Extractor;
-//! use gliner2_rs::config::ExtractorConfig;
-//! use gliner2_rs::batch::PreprocessedBatch;
+//! use gliner2_candle::model::Extractor;
+//! use gliner2_candle::config::ExtractorConfig;
+//! use gliner2_candle::batch::PreprocessedBatch;
 //!
 //! let config = ExtractorConfig::default();
 //! let mut model = Extractor::new(&config)?;

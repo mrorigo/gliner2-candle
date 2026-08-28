@@ -2,9 +2,9 @@
 #[ignore = "long input quality bisect"]
 fn long_quality_bisect() {
     let engine =
-        gliner2_rs::inference::engine::GLiNER2::from_pretrained("fastino/gliner2.5-small-v1")
+        gliner2_candle::inference::engine::GLiNER2::from_pretrained("fastino/gliner2.5-small-v1")
             .unwrap();
-    let schema = gliner2_rs::schema::types::Schema::from_dict(&serde_json::json!({
+    let schema = gliner2_candle::schema::types::Schema::from_dict(&serde_json::json!({
         "entities": ["person", "organization", "location", "date"]
     }))
     .unwrap();

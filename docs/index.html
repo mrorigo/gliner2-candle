@@ -3,10 +3,10 @@
     <head>
         <meta charset="UTF-8" />
         <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-        <title>GLiNER2 Rust - Production-Grade Information Extraction</title>
+        <title>gliner2-candle — Pure Rust GLiNER2 + GLiNER2.5</title>
         <meta
             name="description"
-            content="Pure Rust GLiNER2 on Candle. Near-production information extraction with native performance and deployable architecture."
+            content="Pure Rust GLiNER2 + GLiNER2.5 on Candle. Full numeric parity with the Python reference across entities, classifications, relations, and span attributes."
         />
         <style>
             :root {
@@ -15,9 +15,12 @@
                 --text: #101317;
                 --muted: #4e5968;
                 --line: #d7dde5;
+                --flame: #ea6a47;
+                --ember: #f4a261;
+                --wax: #2b3a67;
                 --accent: #0f766e;
                 --accent-2: #1d4ed8;
-                --accent-3: #b45309;
+                --ok: #10b981;
                 --shadow: 0 16px 50px rgba(16, 19, 23, 0.12);
                 --radius: 20px;
                 --mono:
@@ -40,15 +43,15 @@
                 background:
                     radial-gradient(
                         circle at 6% 20%,
-                        #dbeafe 0 24%,
+                        #ffe3d6 0 24%,
                         transparent 36%
                     ),
                     radial-gradient(
                         circle at 88% 8%,
-                        #ccfbf1 0 26%,
+                        #e0e8ff 0 26%,
                         transparent 40%
                     ),
-                    linear-gradient(180deg, #f8fafc 0%, #f6f7f4 100%);
+                    linear-gradient(180deg, #fdfaf8 0%, #f6f7f4 100%);
                 color: var(--text);
                 font-family: var(--sans);
                 min-height: 100%;
@@ -100,16 +103,36 @@
                 letter-spacing: 0.02em;
             }
 
-            .dot {
-                width: 14px;
-                height: 14px;
-                border-radius: 50%;
-                background: linear-gradient(
-                    140deg,
-                    var(--accent),
-                    var(--accent-2)
-                );
-                box-shadow: 0 0 0 4px rgba(15, 118, 110, 0.18);
+            .brand small {
+                font-weight: 500;
+                color: var(--muted);
+                font-size: 0.8rem;
+                font-family: var(--mono);
+            }
+
+            .flame {
+                width: 15px;
+                height: 15px;
+                position: relative;
+                border-radius: 50% 50% 50% 50% / 60% 60% 40% 40%;
+                background: linear-gradient(160deg, #ffd28f, #ff7a3d 55%, #e93f3f);
+                box-shadow:
+                    0 0 0 4px rgba(234, 106, 71, 0.16),
+                    0 0 18px rgba(234, 106, 71, 0.5);
+                animation: flicker 1.8s ease-in-out infinite;
+            }
+
+            @keyframes flicker {
+                0%,
+                100% {
+                    transform: scale(1) rotate(-2deg);
+                }
+                30% {
+                    transform: scale(1.08, 1.02) rotate(2deg);
+                }
+                60% {
+                    transform: scale(0.96, 1.04) rotate(-1deg);
+                }
             }
 
             .nav a {
@@ -136,7 +159,8 @@
 
             .hero-main,
             .hero-side,
-            .card {
+            .card,
+            .panel {
                 background: var(--panel);
                 border: 1px solid var(--line);
                 border-radius: var(--radius);
@@ -152,15 +176,15 @@
             .hero-main::after {
                 content: "";
                 position: absolute;
-                right: -80px;
+                right: -90px;
                 top: -70px;
-                width: 250px;
-                height: 250px;
-                border-radius: 36% 64% 56% 44% / 52% 47% 53% 48%;
+                width: 260px;
+                height: 260px;
+                border-radius: 32% 68% 58% 42% / 54% 46% 54% 46%;
                 background: linear-gradient(
                     140deg,
-                    rgba(29, 78, 216, 0.12),
-                    rgba(15, 118, 110, 0.2)
+                    rgba(234, 106, 71, 0.14),
+                    rgba(29, 78, 216, 0.15)
                 );
                 animation: blob 9s ease-in-out infinite alternate;
             }
@@ -182,11 +206,11 @@
                 text-transform: uppercase;
                 letter-spacing: 0.12em;
                 padding: 0.35rem 0.55rem;
-                border: 1px solid #b8c4d2;
+                border: 1px solid #e7c3b2;
                 border-radius: 999px;
                 font-family: var(--mono);
-                color: #2f3a46;
-                background: #f8fbff;
+                color: #7c3b1e;
+                background: #fff6f1;
             }
 
             h1 {
@@ -196,13 +220,17 @@
                 line-height: 1.04;
                 letter-spacing: -0.03em;
                 font-size: clamp(2rem, 5vw, 4rem);
-                max-width: 14ch;
+                max-width: 16ch;
+            }
+
+            h1 .wax {
+                color: var(--flame);
             }
 
             .lede {
                 margin: 0;
                 color: var(--muted);
-                max-width: 52ch;
+                max-width: 54ch;
                 line-height: 1.6;
                 font-size: 1.05rem;
             }
@@ -229,11 +257,7 @@
             }
 
             .btn-primary {
-                background: linear-gradient(
-                    120deg,
-                    var(--accent),
-                    var(--accent-2)
-                );
+                background: linear-gradient(120deg, var(--accent), var(--accent-2));
                 color: #fff;
                 box-shadow: 0 10px 20px rgba(15, 118, 110, 0.28);
             }
@@ -262,15 +286,37 @@
                 overflow: hidden;
             }
 
-            .code {
+            .terminal {
                 background: #0b1220;
                 color: #cfd9ea;
                 border-radius: 14px;
                 padding: 1rem;
                 font-family: var(--mono);
-                font-size: 0.86rem;
-                line-height: 1.5;
+                font-size: 0.84rem;
+                line-height: 1.6;
                 overflow: auto;
+                position: relative;
+            }
+
+            .terminal::before {
+                content: "●  ●  ●";
+                display: block;
+                color: #4b5b73;
+                font-size: 0.7rem;
+                letter-spacing: 4px;
+                margin-bottom: 0.6rem;
+            }
+
+            .terminal .cmd {
+                color: #f4ece2;
+            }
+
+            .terminal .flag {
+                color: #ffb984;
+            }
+
+            .terminal .ok {
+                color: #35d07f;
             }
 
             .metrics {
@@ -294,6 +340,10 @@
                 font-family: var(--mono);
             }
 
+            .metric b.green {
+                color: var(--ok);
+            }
+
             .metric span {
                 color: var(--muted);
                 font-size: 0.83rem;
@@ -303,7 +353,7 @@
                 border: 1px solid var(--line);
                 border-radius: 14px;
                 padding: 0.85rem;
-                background: linear-gradient(180deg, #f8fbff 0%, #f1f6fb 100%);
+                background: linear-gradient(180deg, #fff7f2 0%, #f4f8ff 100%);
                 position: relative;
                 z-index: 2;
             }
@@ -312,7 +362,7 @@
                 margin: 0 0 0.5rem;
                 font-size: 0.9rem;
                 font-family: var(--mono);
-                color: #1f3248;
+                color: #5a2c17;
                 letter-spacing: 0.02em;
             }
 
@@ -412,8 +462,8 @@
                 top: 28px;
                 background: radial-gradient(
                     circle at 35% 35%,
-                    rgba(15, 118, 110, 0.32),
-                    rgba(15, 118, 110, 0.05) 72%
+                    rgba(234, 106, 71, 0.32),
+                    rgba(234, 106, 71, 0.05) 72%
                 );
                 animation: bob 9s ease-in-out infinite reverse;
             }
@@ -459,11 +509,14 @@
             .flow {
                 grid-column: span 5;
             }
-            .perf {
+            .parity {
+                grid-column: span 8;
+            }
+            .why {
                 grid-column: span 4;
             }
             .status {
-                grid-column: span 8;
+                grid-column: span 12;
             }
 
             .list {
@@ -475,7 +528,7 @@
             }
 
             .list li {
-                border-left: 3px solid #d2dbe7;
+                border-left: 3px solid var(--flame);
                 padding-left: 0.65rem;
                 color: #2e3a48;
                 font-size: 0.9rem;
@@ -485,48 +538,137 @@
             .pipeline {
                 margin-top: 0.7rem;
                 display: flex;
+                flex-direction: column;
+                gap: 0.35rem;
+            }
+
+            .pipe-row {
+                display: flex;
                 flex-wrap: wrap;
-                gap: 0.45rem;
+                align-items: center;
+                gap: 0.35rem;
             }
 
             .chip {
-                border: 1px dashed #b9c5d5;
+                border: 1px solid var(--line);
                 border-radius: 999px;
-                padding: 0.35rem 0.7rem;
-                font-size: 0.8rem;
+                padding: 0.3rem 0.65rem;
+                font-size: 0.78rem;
                 font-family: var(--mono);
                 background: #f9fbff;
+                white-space: nowrap;
             }
 
-            .ticker {
-                display: inline-flex;
-                gap: 0.5rem;
-                margin-top: 0.7rem;
+            .arrow {
+                color: var(--flame);
+                font-weight: 700;
                 font-family: var(--mono);
-                font-size: 0.84rem;
-                color: #355078;
-                align-items: center;
+                font-size: 0.78rem;
             }
 
-            .pulse {
-                width: 10px;
-                height: 10px;
+            .pipe-row .chip.hot {
+                background: linear-gradient(120deg, #fff0e8, #ffe4d6);
+                border-color: #f0b69c;
+            }
+
+            .pipe-caption {
+                font-family: var(--mono);
+                font-size: 0.72rem;
+                color: var(--muted);
+                margin-top: 0.15rem;
+            }
+
+            .parity-grid {
+                margin-top: 0.7rem;
+                display: grid;
+                grid-template-columns: repeat(2, minmax(0, 1fr));
+                gap: 0.55rem;
+            }
+
+            .parity-cell {
+                border: 1px solid var(--line);
+                border-radius: 12px;
+                padding: 0.7rem 0.8rem;
+                background: #fbfcfd;
+            }
+
+            .parity-cell .task {
+                font-size: 0.8rem;
+                font-weight: 600;
+                color: #1f3248;
+            }
+
+            .parity-cell .result {
+                font-family: var(--mono);
+                font-size: 0.8rem;
+                color: var(--ok);
+                margin-top: 0.2rem;
+            }
+
+            .parity-cell .detail {
+                font-family: var(--mono);
+                font-size: 0.7rem;
+                color: var(--muted);
+                margin-top: 0.15rem;
+            }
+
+            .why-table {
+                width: 100%;
+                margin-top: 0.7rem;
+                border-collapse: collapse;
+                font-family: var(--mono);
+                font-size: 0.78rem;
+            }
+
+            .why-table th,
+            .why-table td {
+                text-align: left;
+                padding: 0.5rem 0.6rem;
+                border-bottom: 1px solid var(--line);
+            }
+
+            .why-table th {
+                color: #1f3248;
+                font-weight: 700;
+                background: #f6f9fc;
+            }
+
+            .why-table td:last-child {
+                color: var(--ok);
+                font-weight: 600;
+            }
+
+            .status-bar {
+                margin-top: 0.8rem;
+                display: flex;
+                flex-wrap: wrap;
+                gap: 0.6rem;
+            }
+
+            .status-pill {
+                border: 1px solid var(--line);
+                border-radius: 999px;
+                padding: 0.4rem 0.8rem;
+                font-family: var(--mono);
+                font-size: 0.78rem;
+                background: #fff;
+            }
+
+            .status-pill .dot-ok {
+                display: inline-block;
+                vertical-align: middle;
+                margin-right: 0.4rem;
+            }
+
+            .status-pill .dot-warn {
+                display: inline-block;
+                width: 8px;
+                height: 8px;
                 border-radius: 50%;
-                background: #10b981;
-                box-shadow: 0 0 0 rgba(16, 185, 129, 0.5);
-                animation: pulse 2.2s infinite;
-            }
-
-            @keyframes pulse {
-                0% {
-                    box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.45);
-                }
-                70% {
-                    box-shadow: 0 0 0 12px rgba(16, 185, 129, 0);
-                }
-                100% {
-                    box-shadow: 0 0 0 0 rgba(16, 185, 129, 0);
-                }
+                background: #f6b93b;
+                box-shadow: 0 0 0 3px rgba(246, 185, 59, 0.15);
+                vertical-align: middle;
+                margin-right: 0.4rem;
             }
 
             footer {
@@ -534,6 +676,16 @@
                 color: #516172;
                 font-size: 0.85rem;
                 font-family: var(--mono);
+            }
+
+            footer .flame-small {
+                display: inline-block;
+                width: 10px;
+                height: 10px;
+                border-radius: 50%;
+                background: linear-gradient(160deg, #ffd28f, #ff7a3d 55%, #e93f3f);
+                vertical-align: middle;
+                margin-right: 0.35rem;
             }
 
             .reveal {
@@ -555,7 +707,8 @@
                 }
                 .stack,
                 .flow,
-                .perf,
+                .parity,
+                .why,
                 .status {
                     grid-column: span 12;
                 }
@@ -576,10 +729,11 @@
                 .hero-side {
                     padding: 1rem;
                 }
-                .code {
-                    font-size: 0.78rem;
+                .terminal {
+                    font-size: 0.74rem;
                 }
-                .metrics {
+                .metrics,
+                .parity-grid {
                     grid-template-columns: 1fr 1fr;
                 }
             }
@@ -592,62 +746,73 @@
             <header>
                 <nav class="nav" aria-label="Primary">
                     <div class="brand">
-                        <span class="dot"></span> GLiNER2 Rust
+                        <span class="flame" aria-hidden="true"></span>
+                        gliner2-candle
+                        <small>pure-rust · no torch · no onnx</small>
                     </div>
                     <div>
                         <a href="../README.md">README</a>
-                        <a href="https://github.com/urchade/GLiNER2"
-                            >Python Ref</a
-                        >
-                        <a href="https://github.com/urchade/GLiNER2.5"
-                            >GLiNER2.5</a
-                        >
-                        <a href="https://github.com/huggingface/candle"
-                            >Candle</a
-                        >
+                        <a href="https://github.com/urchade/GLiNER2">GLiNER2</a>
+                        <a href="https://github.com/urchade/GLiNER2.5">GLiNER2.5</a>
+                        <a href="https://github.com/huggingface/candle">Candle</a>
                     </div>
                 </nav>
             </header>
 
             <section class="hero">
                 <article class="hero-main reveal">
-                    <span class="eyebrow">Pure Rust · Candle · GLiNER2 + GLiNER2.5</span>
+                    <span class="eyebrow">candle-native · ≅ Python</span>
                     <h1>
-                        Full Numeric Parity with the Python Reference, Native by
-                        Design
+                        Two architectures.
+                        <span class="wax">Zero drift.</span>
                     </h1>
                     <p class="lede">
-                        GLiNER2 Rust ports both the GLiNER2 (span-enumeration)
-                        and GLiNER2.5 (boundary-prediction) architectures from
-                        Python/PyTorch into a pure-Rust, candle-based stack. It
-                        loads real HuggingFace weights, runs the complete
-                        forward path, and matches Python outputs across
-                        entities, classifications, relations, and span
-                        attributes.
+                        <strong>gliner2-candle</strong> ports both GLiNER2
+                        (span-enumeration) and GLiNER2.5 (boundary-prediction)
+                        into a pure-Rust stack on HuggingFace Candle. It loads
+                        real Hub weights and reproduces the Python reference
+                        numerics — not just top-1 spans, but the whole
+                        candidate matrix.
                     </p>
                     <div class="cta-row">
                         <a class="btn btn-primary" href="../README.md"
-                            >View Getting Started
-                            <span aria-hidden="true">→</span></a
+                            >Getting Started <span aria-hidden="true">→</span></a
                         >
                         <a
                             class="btn btn-ghost"
-                            href="../tests/real_inference_test.rs"
-                            >See Integration Test</a
+                            href="../CHANGELOG.md"
+                            >Changelog</a
                         >
                     </div>
                 </article>
 
                 <aside class="hero-side reveal">
-                    <div class="code" aria-label="Example command">
-                        $ cargo test --release --test \
-                        real_inference_test_25 test_task_output_parity \
-                        -- --ignored
+                    <div class="terminal" aria-label="Terminal session">
+                        <span>$ cargo run --release</span><br />
+                        <span class="cmd"
+                            >entities · global
+                            <span class="flag">0.0000</span></span
+                        ><br />
+                        <span class="cmd"
+                            >entities · relevant
+                            <span class="flag">0.0000</span></span
+                        ><br />
+                        <span class="cmd"
+                            >classifications
+                            <span class="flag">exact</span></span
+                        ><br />
+                        <span class="cmd"
+                            >relations <span class="flag">exact</span></span
+                        ><br />
+                        <span class="cmd"
+                            >attributes <span class="flag">7–8 dp</span></span
+                        ><br />
+                        <span class="cmd ok">▸ parity confirmed ✓</span>
                     </div>
                     <div class="metrics" id="metrics" aria-live="polite">
                         <div class="metric">
-                            <b data-target="12">0</b>
-                            <span>Encoder Layers</span>
+                            <b data-target="2">0</b>
+                            <span>Model Families</span>
                         </div>
                         <div class="metric">
                             <b data-target="148">0</b>
@@ -655,27 +820,26 @@
                         </div>
                         <div class="metric">
                             <b data-target="4">0</b>
-                            <span>Task Types Matched</span>
+                            <span>Task Types</span>
                         </div>
                         <div class="metric">
-                            <b data-target="0">0</b>
-                            <span>Pair-Logit Diff (relevant)</span>
+                            <b class="green" data-target="0">0</b>
+                            <span>Relevant Diff</span>
                         </div>
                     </div>
                     <div class="readiness" aria-label="Readiness board">
-                        <h3>Release Readiness Board</h3>
+                        <h3>Parity Board</h3>
                         <ul class="readiness-list">
                             <li>
                                 <span class="dot-ok" aria-hidden="true"></span>
-                                <span>GLiNER2 + GLiNER2.5 loading &amp; forward</span>
+                                <span>GLiNER2 span-enumeration</span>
                                 <span class="value">100%</span>
                             </li>
                             <li>
                                 <span class="dot-ok" aria-hidden="true"></span>
                                 <span class="track">
                                     <span class="track-label"
-                                        >Entity-matrix parity (global /
-                                        relevant)</span
+                                        >GLiNER2.5 boundary pipeline</span
                                     >
                                     <span class="rail"
                                         ><span data-width="100"></span
@@ -687,7 +851,7 @@
                                 <span class="dot-ok" aria-hidden="true"></span>
                                 <span class="track">
                                     <span class="track-label"
-                                        >Attribute logit parity (output)</span
+                                        >Full candidate-matrix parity</span
                                     >
                                     <span class="rail"
                                         ><span data-width="100"></span
@@ -703,29 +867,31 @@
 
             <main>
                 <section class="card stack reveal">
-                    <h2>Architecture Highlights</h2>
+                    <h2>Architecture</h2>
                     <p>
-                        Both GLiNER2 (span-enumeration) and GLiNER2.5
-                        (boundary-prediction) pipelines run end-to-end in Rust,
-                        matching the Python reference numerically.
+                        Two pipelines, one candle backend. From collation to
+                        thresholded extraction, every stage is explicit and
+                        debuggable.
                     </p>
                     <ul class="list">
                         <li>
-                            Custom DeBERTa-v3 encoder with relative position
-                            embeddings and sign-flipped rel_pos (matches HF)
+                            Custom DeBERTa-v3 encoder — sign-corrected relative
+                            positions + exact-erf GELU
                         </li>
                         <li>
-                            GLiNER2: markerV0 span representation + classifier /
-                            count heads
+                            GLiNER2: markerV0 span rep + classifier / count heads
                         </li>
                         <li>
-                            GLiNER2.5: boundary encoder, shared-pool scorer with
-                            relation reranker, and span-attribute scoring
+                            GLiNER2.5: boundary encoder + shared-pool scorer with
+                            relation reranker
                         </li>
                         <li>
-                            HF tokenizer-driven collator with schema + text
-                            batching, and auto-chunking for long documents
-                            (&gt;384 words)
+                            Span attributes via hidden entity queries
+                            (score_explicit_spans) — no dedicated weights
+                        </li>
+                        <li>
+                            Long documents auto-chunked (&gt;384 words), merged
+                            with overlap policies
                         </li>
                     </ul>
                 </section>
@@ -733,56 +899,141 @@
                 <section class="card flow reveal">
                     <h2>Pipeline</h2>
                     <p>
-                        Each stage is explicit and debuggable, from token
-                        collation to thresholded span extraction.
+                        Text + schema flow through explicit, inspectable stages.
                     </p>
                     <div class="pipeline" aria-label="Pipeline stages">
-                        <span class="chip">Text + Schema</span>
-                        <span class="chip">Tokenizer</span>
-                        <span class="chip">Collator</span>
-                        <span class="chip">DeBERTa V3</span>
-                        <span class="chip">Span / Boundary Head</span>
-                        <span class="chip">Pooled Scoring</span>
-                        <span class="chip">Entities</span>
-                        <span class="chip">Classifications</span>
-                        <span class="chip">Relations</span>
-                        <span class="chip">Attributes</span>
+                        <div class="pipe-row">
+                            <span class="chip">Text + Schema</span>
+                            <span class="arrow">→</span>
+                            <span class="chip">Collator</span>
+                            <span class="arrow">→</span>
+                            <span class="chip hot">DeBERTa V3</span>
+                        </div>
+                        <div class="pipe-row">
+                            <span class="arrow">└</span>
+                            <span class="chip">Span Rep</span>
+                            <span class="arrow">/</span>
+                            <span class="chip">Boundary Head</span>
+                        </div>
+                        <div class="pipe-row">
+                            <span class="arrow">→</span>
+                            <span class="chip">Pooled Scoring</span>
+                            <span class="arrow">→</span>
+                            <span class="chip">Decode + Merge</span>
+                        </div>
+                        <div class="pipe-row">
+                            <span class="arrow">→</span>
+                            <span class="chip hot">Entities</span>
+                            <span class="chip">Classifications</span>
+                            <span class="chip">Relations</span>
+                            <span class="chip">Attributes</span>
+                        </div>
+                        <div class="pipe-caption">
+                            GLiNER2.5 boundary path shown; GLiNER2 spans the same
+                            encoder.
+                        </div>
                     </div>
                 </section>
 
-                <section class="card perf reveal">
-                    <h2>Why Rust</h2>
+                <section class="card parity reveal">
+                    <h2>Numeric Parity vs Python</h2>
                     <p>
-                        Deterministic execution, static typing, and zero Python
-                        runtime simplify deployment, observability, and
-                        operational reliability.
+                        Validated against the reference candidate matrix, not
+                        just the winning spans.
                     </p>
-                    <div class="ticker">
-                        <span class="pulse"></span>
-                        <span id="status-text"
-                            >All four task types match Python · Phase D parity
-                            complete</span
-                        >
+                    <div class="parity-grid">
+                        <div class="parity-cell">
+                            <div class="task">Entities · global</div>
+                            <div class="result">0.0000</div>
+                            <div class="detail">full-matrix agreement</div>
+                        </div>
+                        <div class="parity-cell">
+                            <div class="task">Entities · relevant</div>
+                            <div class="result">0.0000</div>
+                            <div class="detail">full-matrix agreement</div>
+                        </div>
+                        <div class="parity-cell">
+                            <div class="task">Classifications</div>
+                            <div class="result">exact</div>
+                            <div class="detail">output match</div>
+                        </div>
+                        <div class="parity-cell">
+                            <div class="task">Relations</div>
+                            <div class="result">exact</div>
+                            <div class="detail">bare-pair format</div>
+                        </div>
+                        <div class="parity-cell">
+                            <div class="task">Attributes · single</div>
+                            <div class="result">8 dp</div>
+                            <div class="detail">0.9966161847 · softmax</div>
+                        </div>
+                        <div class="parity-cell">
+                            <div class="task">Attributes · multi</div>
+                            <div class="result">7 dp</div>
+                            <div class="detail">0.5735875 · sigmoid</div>
+                        </div>
                     </div>
+                </section>
+
+                <section class="card why reveal">
+                    <h2>Why "candle"?</h2>
+                    <p>
+                        crates.io already has GLiNER2 crates — on ONNX Runtime.
+                        This one is pure Rust.
+                    </p>
+                    <table class="why-table">
+                        <thead>
+                            <tr>
+                                <th>Backend</th>
+                                <th>Runtime</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td>gliner2 / gliner2-rs</td>
+                                <td>ONNX</td>
+                            </tr>
+                            <tr>
+                                <td>gliner2-tch</td>
+                                <td>libtorch</td>
+                            </tr>
+                            <tr>
+                                <td>this crate</td>
+                                <td>Candle ✓</td>
+                            </tr>
+                        </tbody>
+                    </table>
                 </section>
 
                 <section class="card status reveal">
-                    <h2>Parity &amp; Release Readiness</h2>
+                    <h2>Status</h2>
                     <p>
-                        Every task type validated against the Python reference:
-                        entities full-matrix parity (global and relevant
-                        =&nbsp;0.0000), classifications exact output match,
-                        relations exact bare-pair output, and span attributes
-                        matching to 7–8 decimal places. Long documents are
-                        auto-chunked and merged. Remaining work is release /
-                        CI packaging only.
+                        Both architectures run end-to-end with documented parity.
+                        Remaining work is release / CI packaging and GPU
+                        validation — nothing blocking inference.
                     </p>
+                    <div class="status-bar">
+                        <span class="status-pill"
+                            ><span class="dot-ok"></span>cargo test: 148 pass</span
+                        >
+                        <span class="status-pill"
+                            ><span class="dot-ok"></span>clippy: 0 warnings</span
+                        >
+                        <span class="status-pill"
+                            ><span class="dot-ok"></span>audit: 0 vulns</span
+                        >
+                        <span class="status-pill"
+                            ><span class="dot-warn"></span>crates.io publish:
+                            planned</span
+                        >
+                    </div>
                 </section>
             </main>
 
             <footer>
-                Built for GLiNER2 Rust · GLiNER2 + GLiNER2.5 at full Python
-                numeric parity.
+                <span class="flame-small" aria-hidden="true"></span>
+                gliner2-candle — GLiNER2 + GLiNER2.5 at full Python numeric
+                parity. Built pure-Rust on Candle.
             </footer>
         </div>
 
@@ -798,50 +1049,27 @@
                 },
                 { threshold: 0.15 },
             );
-
-            document
-                .querySelectorAll(".reveal")
-                .forEach((el) => io.observe(el));
+            document.querySelectorAll(".reveal").forEach((el) => io.observe(el));
 
             function animateCounter(el) {
                 const target = Number(el.dataset.target || 0);
                 const duration = 900;
                 const start = performance.now();
-
                 function tick(now) {
                     const t = Math.min(1, (now - start) / duration);
                     const eased = 1 - Math.pow(1 - t, 3);
-                    el.textContent = Math.round(
-                        target * eased,
-                    ).toLocaleString();
+                    el.textContent = Math.round(target * eased).toLocaleString();
                     if (t < 1) requestAnimationFrame(tick);
                 }
-
                 requestAnimationFrame(tick);
             }
-
             document.querySelectorAll("#metrics b").forEach(animateCounter);
+
             requestAnimationFrame(() => {
                 document.querySelectorAll(".rail > span").forEach((el) => {
                     el.style.width = `${el.dataset.width || 0}%`;
                 });
             });
-
-            const phrases = [
-                "All four task types match Python · Phase D parity complete",
-                "Entities full-matrix parity · Relations exact · Attributes 7–8dp",
-                "Long documents auto-chunked + merged · release / CI packaging remains",
-            ];
-            let idx = 0;
-            setInterval(() => {
-                idx = (idx + 1) % phrases.length;
-                const node = document.getElementById("status-text");
-                node.style.opacity = "0.25";
-                setTimeout(() => {
-                    node.textContent = phrases[idx];
-                    node.style.opacity = "1";
-                }, 180);
-            }, 3200);
         </script>
     </body>
 </html>

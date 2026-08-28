@@ -1,5 +1,5 @@
-use gliner2_rs::inference::engine::GLiNER2;
-use gliner2_rs::schema::builder::SchemaBuilder;
+use gliner2_candle::inference::engine::GLiNER2;
+use gliner2_candle::schema::builder::SchemaBuilder;
 
 #[test]
 #[ignore]
