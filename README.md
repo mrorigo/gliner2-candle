@@ -1,7 +1,7 @@
 # GLiNER2 Rust
 
-A high-performance, pure Rust implementation of [GLiNER2](https://github.com/urchade/GLiNER2)
-(span-enumeration) and [GLiNER2.5](https://github.com/urchade/GLiNER2.5)
+A high-performance, pure Rust implementation of [GLiNER2](https://huggingface.co/collections/fastino/gliner2-family)
+(span-enumeration) and [GLiNER2.5](https://huggingface.co/collections/fastino/gliner25-models)
 (boundary-prediction) information extraction models, built on HuggingFace's
 [`candle`](https://github.com/huggingface/candle) ML framework — no PyTorch
 runtime required. Designed for efficient CPU inference with real model weights

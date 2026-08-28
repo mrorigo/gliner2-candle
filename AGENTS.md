@@ -2,7 +2,7 @@
 
 ## 🎯 Project Overview
 
-This is a pure Rust implementation of the [GLiNER2](https://github.com/urchade/GLiNER2) and [GLiNER2.5](https://github.com/urchade/GLiNER2.5) information extraction models. The entire PyTorch/Python codebase has been ported to Rust using HuggingFace's `candle` ML framework.
+This is a pure Rust implementation of the [GLiNER2](https://huggingface.co/collections/fastino/gliner2-family) and [GLiNER2.5](https://huggingface.co/collections/fastino/gliner25-models) information extraction models. The entire PyTorch/Python codebase has been ported to Rust using HuggingFace's `candle` ML framework.
 
 **Key Achievement**: Both GLiNER2 (span-enumeration) and GLiNER2.5 (boundary-prediction) pipelines work end-to-end with real model weights downloaded from HuggingFace Hub.
 

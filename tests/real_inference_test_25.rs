@@ -419,4 +419,31 @@ fn test_task_output_parity() {
         let pc = want["confidence"].as_f64().unwrap();
         assert!((c - pc).abs() < 0.01, "skill confidence {c} vs {pc}");
     }
+
+    // --- Records / JSON Structures ---
+    let schema = SchemaBuilder::new()
+        .entities(vec!["person".to_string(), "employer".to_string()])
+        .structure("employee")
+        .field("name")
+        .done_field()
+        .field("employer")
+        .done_field()
+        .done_structure()
+        .build()
+        .unwrap();
+    let r = engine
+        .extract(
+            "Tim Cook works for Apple in California.",
+            &schema,
+            0.5,
+            false,
+            false,
+            None,
+        )
+        .unwrap();
+    println!("record: {r}");
+    assert!(
+        r.get("employee").is_some(),
+        "expected employee record key in GLiNER2.5 output, got: {r}"
+    );
 }

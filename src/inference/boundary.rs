@@ -240,12 +240,22 @@ pub(crate) fn extract_sample(
                                 obj.insert("end".into(), json!(char_end));
                             }
                             JsonValue::Object(obj)
-                        } else if include_confidence {
-                            // Legacy shape: spans always included with confidences.
+                        } else if include_spans && include_confidence {
                             json!({
                                 "text": text,
                                 "start": char_start,
                                 "end": char_end,
+                                "confidence": conf,
+                            })
+                        } else if include_spans {
+                            json!({
+                                "text": text,
+                                "start": char_start,
+                                "end": char_end,
+                            })
+                        } else if include_confidence {
+                            json!({
+                                "text": text,
                                 "confidence": conf,
                             })
                         } else {
@@ -288,7 +298,12 @@ pub(crate) fn extract_sample(
                     &mut result,
                 )?;
             }
-            "records" => {
+            "records" | "json_structures" => {
+                let task_name = batch
+                    .schema_tokens(sample_idx, group)
+                    .and_then(|t| t.get(2).map(|s| s.to_string()))
+                    .unwrap_or_else(|| format!("record_{group}"));
+                let mut entries: Vec<JsonValue> = Vec::new();
                 if let (Some(rd), Some(cand_states)) = (
                     boundary.record_decoder.as_ref(),
                     scored.candidate_states.as_ref(),
@@ -327,11 +342,7 @@ pub(crate) fn extract_sample(
                             threshold,
                             0.3,
                         );
-                        let task_name = batch
-                            .schema_tokens(sample_idx, group)
-                            .and_then(|t| t.get(2).map(|s| s.to_string()))
-                            .unwrap_or_else(|| format!("record_{group}"));
-                        let entries: Vec<JsonValue> = decoded
+                        entries = decoded
                             .iter()
                             .map(|rec| {
                                 let mut fields_json = serde_json::Map::new();
@@ -342,22 +353,27 @@ pub(crate) fn extract_sample(
                                             .map(|&(s, e)| {
                                                 let cs = char_offset(starts_map, s.min(text_len.saturating_sub(1)));
                                                 let ce = char_offset(ends_map, (e - 1).min(text_len - 1));
-                                                json!({"text": safe_slice(original_text, cs, ce), "start": cs, "end": ce})
+                                                let text = safe_slice(original_text, cs, ce);
+                                                if include_spans && include_confidence {
+                                                    json!({"text": text, "start": cs, "end": ce, "confidence": rec.score})
+                                                } else if include_spans {
+                                                    json!({"text": text, "start": cs, "end": ce})
+                                                } else if include_confidence {
+                                                    json!({"text": text, "confidence": rec.score})
+                                                } else {
+                                                    json!(text)
+                                                }
                                             })
                                             .collect();
                                         fields_json.insert(spec.name.clone(), JsonValue::Array(span_jsons));
                                     }
                                 }
-                                if include_confidence {
-                                    json!({"fields": fields_json, "confidence": rec.score})
-                                } else {
-                                    json!({"fields": fields_json})
-                                }
+                                JsonValue::Object(fields_json)
                             })
                             .collect();
-                        result.insert(task_name, JsonValue::Array(entries));
                     }
                 }
+                result.insert(task_name, JsonValue::Array(entries));
             }
             "relations" => {
                 if let Some(rs) = boundary.relation_scorer.as_ref() {
@@ -368,35 +384,37 @@ pub(crate) fn extract_sample(
                         .map_err(|e| GlinerError::inference(format!("{e}")))?;
                     // Find the relation spec for this group.
                     if let Some(rel) = relation_specs.iter().find(|r| r.group == group) {
-                        let head_qid = rel.head_qid;
-                        let tail_qid = rel.tail_qid;
-                        if head_qid < q && tail_qid < q {
-                            // Build relation query state (directional concat).
+                        let h_qid = rel.head_qid;
+                        let t_qid = rel.tail_qid;
+                        if h_qid < specs.len() && t_qid < specs.len() {
+                            // Build relation query state (directional concat of head and tail query states).
                             let qr: Vec<f32> = {
                                 let rows = query_states
                                     .to_vec2::<f32>()
                                     .map_err(|e| GlinerError::inference(format!("{e}")))?;
                                 let mut r = Vec::with_capacity(2 * h);
-                                r.extend_from_slice(&rows[head_qid]);
-                                r.extend_from_slice(&rows[tail_qid]);
+                                r.extend_from_slice(&rows[h_qid]);
+                                r.extend_from_slice(&rows[t_qid]);
                                 r
                             };
-                            // Collect head/tail candidates by their per-query scores.
+
+                            // Collect candidate spans for head and tail queries.
                             let mut head_cands: Vec<(usize, f32)> = Vec::new();
                             let mut tail_cands: Vec<(usize, f32)> = Vec::new();
                             for ci in 0..scored.valid.len() {
                                 if !scored.valid[ci] {
                                     continue;
                                 }
-                                let s_h = sigmoid(scored.scores[ci][head_qid]);
-                                let s_t = sigmoid(scored.scores[ci][tail_qid]);
-                                if s_h >= threshold {
-                                    head_cands.push((ci, s_h));
+                                let h_score = scored.scores[ci][h_qid];
+                                if h_score > MASK_LOGIT / 2.0 {
+                                    head_cands.push((ci, h_score));
                                 }
-                                if s_t >= threshold {
-                                    tail_cands.push((ci, s_t));
+                                let t_score = scored.scores[ci][t_qid];
+                                if t_score > MASK_LOGIT / 2.0 {
+                                    tail_cands.push((ci, t_score));
                                 }
                             }
+
                             // Sort descending by score, take top-K.
                             head_cands.sort_by(|a, b| {
                                 b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
@@ -470,8 +488,12 @@ pub(crate) fn extract_sample(
                                     };
                                     entries.push(obj);
                                 }
-                                let task_name = rel.relation_name.clone();
-                                result.insert(task_name, JsonValue::Array(entries));
+                                let mut rel_map = match result.remove("relation_extraction") {
+                                    Some(JsonValue::Object(m)) => m,
+                                    _ => serde_json::Map::new(),
+                                };
+                                rel_map.insert(rel.relation_name.clone(), JsonValue::Array(entries));
+                                result.insert("relation_extraction".to_string(), JsonValue::Object(rel_map));
                             }
                         }
                     }

@@ -1337,8 +1337,9 @@ impl GLiNER2 {
         }
 
         // Step 5: Extract entities for each entity type
+        let original_text = batch.original_text(sample_idx).unwrap_or_default();
         for (entity_idx, entity_type) in entity_types.iter().enumerate() {
-            let mut found_entities: Vec<JsonValue> = Vec::new();
+            let mut found_spans: Vec<(String, f32, usize, usize)> = Vec::new();
 
             for i in 0..mask_seq_len {
                 for w in 0..mask_max_width {
@@ -1355,92 +1356,35 @@ impl GLiNER2 {
                             let start_pos = spans_idx_data[spans_flat_idx] as usize;
                             let end_pos = spans_idx_data[spans_flat_idx + 1] as usize;
 
-                            // Extract text from span
-                            let entity_text =
-                                if start_pos < text_tokens.len() && end_pos < text_tokens.len() {
-                                    text_tokens[start_pos..=end_pos].join(" ")
-                                } else if start_pos < text_tokens.len() {
-                                    text_tokens[start_pos].clone()
-                                } else {
-                                    continue;
-                                };
+                            let char_start = if start_pos < start_mappings.len() {
+                                start_mappings[start_pos]
+                            } else {
+                                0
+                            };
+                            let char_end = if end_pos < end_mappings.len() {
+                                end_mappings[end_pos]
+                            } else {
+                                char_start
+                            };
 
-                            let mut entity_obj = serde_json::Map::new();
-                            entity_obj
-                                .insert("text".to_string(), JsonValue::String(entity_text.clone()));
+                            let entity_text = if !original_text.is_empty() && char_start <= char_end {
+                                safe_slice(original_text, char_start, char_end)
+                            } else if start_pos < text_tokens.len() && end_pos < text_tokens.len() {
+                                text_tokens[start_pos..=end_pos].join(" ")
+                            } else if start_pos < text_tokens.len() {
+                                text_tokens[start_pos].clone()
+                            } else {
+                                continue;
+                            };
 
-                            if include_confidence {
-                                let confidence = serde_json::Number::from_f64(prob as f64)
-                                    .unwrap_or_else(|| serde_json::Number::from(0));
-                                entity_obj.insert(
-                                    "confidence".to_string(),
-                                    JsonValue::Number(confidence),
-                                );
-                            }
-
-                            if include_spans {
-                                // Get character positions from mappings
-                                let char_start = if start_pos < start_mappings.len() {
-                                    start_mappings[start_pos]
-                                } else {
-                                    0
-                                };
-                                let char_end = if end_pos < end_mappings.len() {
-                                    end_mappings[end_pos]
-                                } else {
-                                    char_start + entity_text.len()
-                                };
-                                entity_obj.insert(
-                                    "start".to_string(),
-                                    JsonValue::Number(serde_json::Number::from(char_start)),
-                                );
-                                entity_obj.insert(
-                                    "end".to_string(),
-                                    JsonValue::Number(serde_json::Number::from(char_end)),
-                                );
-                            }
-
-                            found_entities.push(JsonValue::Object(entity_obj));
+                            found_spans.push((entity_text, prob, char_start, char_end));
                         }
                     }
                 }
             }
 
-            // Sort by confidence (descending)
-            found_entities.sort_by(|a, b| {
-                let conf_a = a.get("confidence").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                let conf_b = b.get("confidence").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                conf_b
-                    .partial_cmp(&conf_a)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-
-            // Suppress overlapping spans (match Python _format_spans behavior)
-            let mut selected_entities: Vec<JsonValue> = Vec::new();
-            for candidate in found_entities.into_iter() {
-                let c_start = candidate.get("start").and_then(|v| v.as_u64());
-                let c_end = candidate.get("end").and_then(|v| v.as_u64());
-
-                let has_overlap = if let (Some(c_start), Some(c_end)) = (c_start, c_end) {
-                    selected_entities.iter().any(|selected| {
-                        let s_start = selected.get("start").and_then(|v| v.as_u64());
-                        let s_end = selected.get("end").and_then(|v| v.as_u64());
-                        if let (Some(s_start), Some(s_end)) = (s_start, s_end) {
-                            !(c_end <= s_start || c_start >= s_end)
-                        } else {
-                            false
-                        }
-                    })
-                } else {
-                    false
-                };
-
-                if !has_overlap {
-                    selected_entities.push(candidate);
-                }
-            }
-
-            entities.insert(entity_type.clone(), JsonValue::Array(selected_entities));
+            let formatted = Self::format_spans(&mut found_spans, include_confidence, include_spans);
+            entities.insert(entity_type.clone(), formatted);
         }
 
         Ok(JsonValue::Object(entities))
@@ -1689,6 +1633,7 @@ impl GLiNER2 {
         let text_tokens = batch.sample_text_tokens(sample_idx).unwrap_or(&[]);
         let start_mappings = batch.sample_start_mapping(sample_idx).unwrap_or(&[]);
         let end_mappings = batch.sample_end_mapping(sample_idx).unwrap_or(&[]);
+        let original_text = batch.original_text(sample_idx).unwrap_or_default();
 
         let rel_name = schema_tokens.get(2).cloned().unwrap_or_default();
         let rel_threshold =
@@ -1714,6 +1659,7 @@ impl GLiNER2 {
                     inst,
                     field_idx,
                     total_spans,
+                    original_text,
                     text_tokens,
                     start_mappings,
                     end_mappings,
@@ -1882,6 +1828,7 @@ impl GLiNER2 {
             .unwrap_or(mask_max_width);
         let total_spans = mask_seq_len * mask_max_width;
 
+        let original_text = batch.original_text(sample_idx).unwrap_or_default();
         let text_tokens = batch.sample_text_tokens(sample_idx).unwrap_or(&[]);
         let start_mappings = batch.sample_start_mapping(sample_idx).unwrap_or(&[]);
         let end_mappings = batch.sample_end_mapping(sample_idx).unwrap_or(&[]);
@@ -1907,6 +1854,7 @@ impl GLiNER2 {
                     inst,
                     field_idx,
                     total_spans,
+                    original_text,
                     text_tokens,
                     start_mappings,
                     end_mappings,
@@ -1965,16 +1913,15 @@ impl GLiNER2 {
             && let Some(sample_counts) = all_counts.get(sample_idx)
             && let Some(count) = sample_counts.get(schema_idx)
         {
-            return (*count).clamp(1, 20);
+            return *count;
         }
 
-        if let Some(p_token_emb) = schema_tokens_embs.first()
-            && let Ok(out) = model.count_pred.predict_count(p_token_emb)
-        {
-            return out.count.clamp(1, 20);
+        if schema_tokens_embs.is_empty() {
+            return 1;
         }
 
-        5
+        let p_emb = &schema_tokens_embs[0];
+        model.count_pred.predict_count(p_emb).map(|out| out.count).unwrap_or(1)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1991,6 +1938,7 @@ impl GLiNER2 {
         count_idx: usize,
         field_idx: usize,
         total_spans: usize,
+        original_text: &str,
         text_tokens: &[String],
         start_mappings: &[usize],
         end_mappings: &[usize],
@@ -2036,13 +1984,6 @@ impl GLiNER2 {
                 let start_pos = spans_idx_data[spans_flat_idx] as usize;
                 let end_pos = spans_idx_data[spans_flat_idx + 1] as usize;
 
-                let entity_text = if start_pos < text_tokens.len() && end_pos < text_tokens.len() {
-                    text_tokens[start_pos..=end_pos].join(" ")
-                } else if start_pos < text_tokens.len() {
-                    text_tokens[start_pos].clone()
-                } else {
-                    continue;
-                };
                 let char_start = if start_pos < start_mappings.len() {
                     start_mappings[start_pos]
                 } else {
@@ -2051,8 +1992,19 @@ impl GLiNER2 {
                 let char_end = if end_pos < end_mappings.len() {
                     end_mappings[end_pos]
                 } else {
-                    char_start + entity_text.len()
+                    char_start
                 };
+
+                let entity_text = if !original_text.is_empty() && char_start <= char_end {
+                    safe_slice(original_text, char_start, char_end)
+                } else if start_pos < text_tokens.len() && end_pos < text_tokens.len() {
+                    text_tokens[start_pos..=end_pos].join(" ")
+                } else if start_pos < text_tokens.len() {
+                    text_tokens[start_pos].clone()
+                } else {
+                    continue;
+                };
+
                 spans.push((entity_text, prob, char_start, char_end));
             }
         }
@@ -2296,6 +2248,25 @@ impl GLiNER2 {
     }
 }
 
+fn safe_slice(text: &str, start: usize, end: usize) -> String {
+    let end = end.min(text.len());
+    let start = start.min(end);
+    if let Some(s) = text.get(start..end) {
+        return s.to_string();
+    }
+    let mut chars = text.char_indices();
+    let s = chars
+        .find(|&(idx, _)| idx >= start)
+        .map(|(idx, _)| idx)
+        .unwrap_or(text.len());
+    let mut chars = text.char_indices();
+    let e = chars
+        .find(|&(idx, _)| idx >= end)
+        .map(|(idx, _)| idx)
+        .unwrap_or(text.len());
+    text.get(s..e).map(str::to_string).unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2357,5 +2328,78 @@ mod tests {
         assert_eq!(engine.default_threshold(), 0.5);
         engine.set_default_threshold(0.7);
         assert_eq!(engine.default_threshold(), 0.7);
+    }
+
+    #[test]
+    fn test_safe_slice_provenance() {
+        let text = "Server handled 500 requests/second under load.";
+        let start = 15;
+        let end = 34; // "500 requests/second"
+        let slice = safe_slice(text, start, end);
+        assert_eq!(slice, "500 requests/second");
+        assert_eq!(text.get(start..end), Some(slice.as_str()));
+        assert_eq!(&text.as_bytes()[start..end], slice.as_bytes());
+
+        // Unicode / multi-byte characters
+        let unicode_text = "Apple 🍎 CEO Tim Cook announced Zürich results in 北京.";
+        let start_zurich = unicode_text.find("Zürich").unwrap();
+        let end_zurich = start_zurich + "Zürich".len();
+        let zurich_slice = safe_slice(unicode_text, start_zurich, end_zurich);
+        assert_eq!(zurich_slice, "Zürich");
+        assert_eq!(unicode_text.get(start_zurich..end_zurich), Some(zurich_slice.as_str()));
+
+        let start_bj = unicode_text.find("北京").unwrap();
+        let end_bj = start_bj + "北京".len();
+        let bj_slice = safe_slice(unicode_text, start_bj, end_bj);
+        assert_eq!(bj_slice, "北京");
+        assert_eq!(unicode_text.get(start_bj..end_bj), Some(bj_slice.as_str()));
+    }
+
+    #[test]
+    fn test_format_spans_flags() {
+        let spans = vec![
+            ("Apple".to_string(), 0.95, 0, 5),
+            ("Tim Cook".to_string(), 0.98, 10, 18),
+            ("Apple CEO".to_string(), 0.80, 0, 9), // Overlaps with Apple (lower score)
+        ];
+
+        // 1. Neither spans nor confidence
+        let res_bare = GLiNER2::format_spans(&mut spans.clone(), false, false);
+        assert_eq!(
+            res_bare,
+            serde_json::json!(["Tim Cook", "Apple"])
+        );
+
+        // 2. Only spans
+        let res_spans = GLiNER2::format_spans(&mut spans.clone(), false, true);
+        assert_eq!(
+            res_spans,
+            serde_json::json!([
+                {"text": "Tim Cook", "start": 10, "end": 18},
+                {"text": "Apple", "start": 0, "end": 5}
+            ])
+        );
+
+        // 3. Only confidence
+        let res_conf = GLiNER2::format_spans(&mut spans.clone(), true, false);
+        let conf_arr = res_conf.as_array().unwrap();
+        assert_eq!(conf_arr.len(), 2);
+        assert_eq!(conf_arr[0]["text"], "Tim Cook");
+        assert!((conf_arr[0]["confidence"].as_f64().unwrap() - 0.98).abs() < 1e-4);
+        assert_eq!(conf_arr[1]["text"], "Apple");
+        assert!((conf_arr[1]["confidence"].as_f64().unwrap() - 0.95).abs() < 1e-4);
+
+        // 4. Both spans and confidence
+        let res_both = GLiNER2::format_spans(&mut spans.clone(), true, true);
+        let both_arr = res_both.as_array().unwrap();
+        assert_eq!(both_arr.len(), 2);
+        assert_eq!(both_arr[0]["text"], "Tim Cook");
+        assert_eq!(both_arr[0]["start"], 10);
+        assert_eq!(both_arr[0]["end"], 18);
+        assert!((both_arr[0]["confidence"].as_f64().unwrap() - 0.98).abs() < 1e-4);
+        assert_eq!(both_arr[1]["text"], "Apple");
+        assert_eq!(both_arr[1]["start"], 0);
+        assert_eq!(both_arr[1]["end"], 5);
+        assert!((both_arr[1]["confidence"].as_f64().unwrap() - 0.95).abs() < 1e-4);
     }
 }
