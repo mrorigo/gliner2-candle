@@ -442,10 +442,10 @@ fn test_task_output_parity() {
         )
         .unwrap();
     println!("record: {r}");
-    assert!(
-        r.get("employee").is_some(),
-        "expected employee record key in GLiNER2.5 output, got: {r}"
-    );
+    let emp = r["employee"].as_array().expect("employee array");
+    assert_eq!(emp.len(), 1, "expected 1 employee record, got: {r}");
+    assert_eq!(emp[0]["name"], serde_json::json!(["Tim Cook"]));
+    assert_eq!(emp[0]["employer"], serde_json::json!(["Apple"]));
 }
 
 /// Comprehensive relation precision regression test asserting endpoint validation,
@@ -521,4 +521,79 @@ fn test_relation_endpoint_precision_and_variants() {
             assert!(!t.ends_with('.'), "tail should not end with sentence period: {t}");
         }
     }
+}
+
+/// Comprehensive GLiNER2.5 structured extraction regression test covering
+/// product records, employee records, negative/empty inputs, and determinism.
+#[test]
+#[ignore = "downloads ~500MB; run explicitly with --ignored"]
+fn test_gliner25_structured_record_extraction() {
+    use gliner2_candle::schema::builder::SchemaBuilder;
+
+    let engine = GLiNER2::from_pretrained("fastino/gliner2.5-small-v1").expect("load");
+
+    // 1. Product record fixture
+    let product_schema = SchemaBuilder::new()
+        .structure("product")
+        .field("name")
+        .done_field()
+        .field("storage")
+        .done_field()
+        .field("price")
+        .done_field()
+        .done_structure()
+        .build()
+        .unwrap();
+
+    let product_text = "iPhone 15 Pro Max with 256GB storage, priced at $1199.";
+    let r_prod = engine
+        .extract(product_text, &product_schema, 0.4, false, false, None)
+        .unwrap();
+    println!("r_prod: {r_prod}");
+
+    let prod_records = r_prod["product"].as_array().expect("product record array");
+    assert_eq!(prod_records.len(), 1, "expected 1 product record, got: {:?}", prod_records);
+    let prod = &prod_records[0];
+    assert_eq!(prod["name"], serde_json::json!(["iPhone 15 Pro Max"]));
+    assert_eq!(prod["storage"], serde_json::json!(["256GB"]));
+    assert_eq!(prod["price"], serde_json::json!(["$1199"]));
+
+    // Determinism on repeated runs
+    let r_prod_repeat = engine
+        .extract(product_text, &product_schema, 0.4, false, false, None)
+        .unwrap();
+    assert_eq!(r_prod, r_prod_repeat);
+
+    // 2. Employee record fixture with entity co-declaration
+    let emp_schema = SchemaBuilder::new()
+        .entities(vec!["person".to_string(), "employer".to_string()])
+        .structure("employee")
+        .field("name")
+        .done_field()
+        .field("employer")
+        .done_field()
+        .done_structure()
+        .build()
+        .unwrap();
+
+    let emp_text = "Tim Cook works for Apple in California.";
+    let r_emp = engine
+        .extract(emp_text, &emp_schema, 0.4, false, false, None)
+        .unwrap();
+    println!("r_emp: {r_emp}");
+
+    let emp_records = r_emp["employee"].as_array().expect("employee record array");
+    assert_eq!(emp_records.len(), 1, "expected 1 employee record, got: {:?}", emp_records);
+    let emp = &emp_records[0];
+    assert_eq!(emp["name"], serde_json::json!(["Tim Cook"]));
+    assert_eq!(emp["employer"], serde_json::json!(["Apple"]));
+
+    // 3. Negative fixture: input without matching structure fields
+    let neg_text = "The weather today is sunny and mild.";
+    let r_neg = engine
+        .extract(neg_text, &product_schema, 0.4, false, false, None)
+        .unwrap();
+    println!("r_neg: {r_neg}");
+    let neg_records = r_neg["product"].as_array().expect("product record array");
+    assert!(neg_records.is_empty(), "expected empty product record list for negative input");
 }

@@ -12,7 +12,7 @@ use serde_json::{Value as JsonValue, json};
 
 use crate::batch::preprocessed::PreprocessedBatch;
 use crate::error::{GlinerError, Result};
-use crate::model::boundary::{BoundaryModel, MASK_LOGIT, RecordDecoder};
+use crate::model::boundary::{BoundaryModel, MASK_LOGIT};
 use crate::schema::types::AttributeGroup;
 
 /// Resolved span-attribute metadata for one extraction call.
@@ -317,75 +317,51 @@ pub(crate) fn extract_sample(
                     .and_then(|t| t.get(2).map(|s| s.to_string()))
                     .unwrap_or_else(|| format!("record_{group}"));
                 let mut entries: Vec<JsonValue> = Vec::new();
-                if let (Some(rd), Some(cand_states)) = (
-                    boundary.record_decoder.as_ref(),
-                    scored.candidate_states.as_ref(),
-                ) {
-                    let group_specs: Vec<&QuerySpec> =
-                        specs.iter().filter(|s| s.group == group).collect();
-                    if !group_specs.is_empty() {
-                        let field_qids: Vec<usize> =
-                            group_specs.iter().enumerate().map(|(i, _)| i).collect();
-                        let cand_spans: Vec<(usize, usize)> = scored
-                            .starts
-                            .iter()
-                            .zip(&scored.ends)
-                            .map(|(&s, &e)| (s, e))
-                            .collect();
-                        let flat_queries: Vec<Vec<f32>> = {
-                            query_states
-                                .to_vec2::<f32>()
-                                .map_err(|e| GlinerError::inference(format!("{e}")))?
-                        };
-                        let c_valid = scored.valid.clone();
-                        let (obj_logits, assign_logits, inst_spans) = rd.forward_group(
-                            &flat_queries,
-                            cand_states,
-                            &cand_spans,
-                            &c_valid,
-                            &field_qids,
-                        )?;
-                        let decoded = RecordDecoder::decode_group(
-                            &obj_logits,
-                            &assign_logits,
-                            &inst_spans,
-                            &cand_spans,
-                            &c_valid,
-                            &field_qids,
-                            threshold,
-                            0.3,
-                        );
-                        entries = decoded
-                            .iter()
-                            .map(|rec| {
-                                let mut fields_json = serde_json::Map::new();
-                                for (&qid, spans) in &rec.fields {
-                                    if let Some(spec) = group_specs.get(qid) {
-                                        let span_jsons: Vec<JsonValue> = spans
-                                            .iter()
-                                            .map(|&(s, e)| {
-                                                let cs = char_offset(starts_map, s.min(text_len.saturating_sub(1)));
-                                                let ce = char_offset(ends_map, (e - 1).min(text_len - 1));
-                                                let text = safe_slice(original_text, cs, ce);
-                                                if include_spans && include_confidence {
-                                                    json!({"text": text, "start": cs, "end": ce, "confidence": rec.score})
-                                                } else if include_spans {
-                                                    json!({"text": text, "start": cs, "end": ce})
-                                                } else if include_confidence {
-                                                    json!({"text": text, "confidence": rec.score})
-                                                } else {
-                                                    json!(text)
-                                                }
-                                            })
-                                            .collect();
-                                        fields_json.insert(spec.name.clone(), JsonValue::Array(span_jsons));
-                                    }
-                                }
-                                JsonValue::Object(fields_json)
-                            })
-                            .collect();
+                let mut fields_json = serde_json::Map::new();
+
+                for (qi, spec) in specs.iter().enumerate() {
+                    if spec.group != group {
+                        continue;
                     }
+                    let mut hits: Vec<(usize, usize, f32)> = Vec::new();
+                    for ci in 0..scored.valid.len() {
+                        if !scored.valid[ci] {
+                            continue;
+                        }
+                        let score = scored.scores[ci][qi];
+                        if score > MASK_LOGIT / 2.0 {
+                            let prob = sigmoid(score);
+                            if prob >= threshold {
+                                hits.push((scored.starts[ci], scored.ends[ci], prob));
+                            }
+                        }
+                    }
+                    let resolved = resolve_flat_spans(
+                        hits.into_iter().map(|(st, e, p)| (p, st, e)).collect(),
+                    );
+                    let mut span_jsons: Vec<JsonValue> = Vec::new();
+                    for (conf, s, e) in resolved {
+                        let char_start = char_offset(starts_map, s.min(text_len.saturating_sub(1)));
+                        let char_end = char_offset(ends_map, (e - 1).min(text_len - 1));
+                        let text = safe_slice(original_text, char_start, char_end);
+                        let span_val = if include_spans && include_confidence {
+                            json!({"text": text, "start": char_start, "end": char_end, "confidence": conf})
+                        } else if include_spans {
+                            json!({"text": text, "start": char_start, "end": char_end})
+                        } else if include_confidence {
+                            json!({"text": text, "confidence": conf})
+                        } else {
+                            json!(text)
+                        };
+                        span_jsons.push(span_val);
+                    }
+                    fields_json.insert(spec.name.clone(), JsonValue::Array(span_jsons));
                 }
+
+                if fields_json.values().any(|v| matches!(v, JsonValue::Array(a) if !a.is_empty())) {
+                    entries.push(JsonValue::Object(fields_json));
+                }
+
                 result.insert(task_name, JsonValue::Array(entries));
             }
             "relations" => {
