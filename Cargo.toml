@@ -2,11 +2,24 @@
 name = "gliner2-candle"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.87"
 description = "Pure Rust implementation of GLiNER2 and GLiNER2.5 for CPU-based information extraction (entities, classifications, relations, span attributes)"
 license = "Apache-2.0"
 repository = "https://github.com/mrorigo/gliner2-candle"
+documentation = "https://docs.rs/gliner2-candle"
+readme = "README.md"
+homepage = "https://mrorigo.github.io/gliner2-candle/"
 keywords = ["nlp", "ner", "information-extraction", "transformer", "gliner"]
 categories = ["science", "text-processing"]
+exclude = [
+    "/AGENTS.md",
+    "/RUST_GUIDELINES.md",
+    "/audit.toml",
+    "/GLiNER2",
+    "/docs",
+    "/tests",
+    "/debug_comparison",
+]
 
 [dependencies]
 # Neural network inference (Candle - HuggingFace's pure Rust ML framework)

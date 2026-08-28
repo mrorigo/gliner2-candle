@@ -1,5 +1,8 @@
 GLiNER2
 
+# Python reference/virtualenvs (dev-only, not part of the crate)
+/.venv
+/.venv-python
 
 # Added by cargo
 
