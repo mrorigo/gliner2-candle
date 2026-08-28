@@ -534,8 +534,22 @@ impl ExtractorCollator {
             for relation in rel_array {
                 if let Some(rel_obj) = relation.as_object() {
                     for (rel_name, fields) in rel_obj {
-                        let field_names: Vec<String> = if let Some(fields_obj) = fields.as_object()
+                        let field_names: Vec<String> = if let Some(meta_fields) = schema
+                            .get("relation_metadata")
+                            .and_then(|m| m.get(rel_name))
+                            .and_then(|m| m.get("fields"))
+                            .and_then(|f| f.as_array())
                         {
+                            meta_fields
+                                .iter()
+                                .filter_map(|v| v.as_str().map(String::from))
+                                .collect()
+                        } else if let Some(fields_arr) = fields.as_array() {
+                            fields_arr
+                                .iter()
+                                .filter_map(|v| v.as_str().map(String::from))
+                                .collect()
+                        } else if let Some(fields_obj) = fields.as_object() {
                             fields_obj.keys().cloned().collect()
                         } else {
                             vec!["head".to_string(), "tail".to_string()]

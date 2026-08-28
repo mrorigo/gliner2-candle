@@ -597,3 +597,54 @@ fn test_gliner25_structured_record_extraction() {
     let neg_records = r_neg["product"].as_array().expect("product record array");
     assert!(neg_records.is_empty(), "expected empty product record list for negative input");
 }
+
+/// Test that typed relation endpoints (.fields(vec!["system", "metric_value"]))
+/// strictly constrain relation candidate head/tail selection, preventing user/speaker
+/// names from entering the relation tuple.
+#[test]
+#[ignore = "downloads ~500MB; run explicitly with --ignored"]
+fn test_typed_relation_endpoint_constraints() {
+    use gliner2_candle::schema::builder::SchemaBuilder;
+
+    let engine = GLiNER2::from_pretrained("fastino/gliner2.5-small-v1").expect("load");
+
+    let schema = SchemaBuilder::new()
+        .entities(vec![
+            "system".to_string(),
+            "user".to_string(),
+            "metric_value".to_string(),
+        ])
+        .relation("rate_limit")
+            .description("configured system operational value")
+            .fields(vec!["system".to_string(), "metric_value".to_string()])
+            .threshold(0.30)
+            .done()
+        .build()
+        .unwrap();
+
+    let text = "turn-2: alice: The api rate_limit is 500 requests/second (production only).";
+    let res = engine
+        .extract(text, &schema, 0.30, false, false, None)
+        .unwrap();
+    println!("typed_relation_res: {res}");
+
+    // Entities must be correctly extracted
+    assert_eq!(res["entities"]["user"], serde_json::json!(["alice"]));
+    assert_eq!(res["entities"]["system"], serde_json::json!(["api"]));
+    assert_eq!(res["entities"]["metric_value"], serde_json::json!(["500 requests/second"]));
+
+    // Relation must strictly bind system -> metric_value ("api" -> "500 requests/second")
+    // and MUST NOT contain "alice" in head or tail
+    if let Some(pairs) = res.get("relation_extraction").and_then(|r| r.get("rate_limit")).and_then(|v| v.as_array()) {
+        assert_eq!(pairs.len(), 1, "expected exactly 1 rate_limit pair, got: {:?}", pairs);
+        assert_eq!(pairs[0], serde_json::json!(["api", "500 requests/second"]));
+        for p in pairs {
+            let h = p[0].as_str().unwrap();
+            let t = p[1].as_str().unwrap();
+            assert_ne!(h, "alice", "head must not be user 'alice'");
+            assert_ne!(t, "alice", "tail must not be user 'alice'");
+        }
+    } else {
+        panic!("expected relation_extraction.rate_limit in result, got: {res}");
+    }
+}

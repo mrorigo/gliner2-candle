@@ -931,14 +931,12 @@ impl Schema {
                 .map(|r| {
                     let mut obj = serde_json::Map::new();
                     let mut fields = serde_json::Map::new();
-                    fields.insert(
-                        "head".to_string(),
-                        serde_json::Value::String("".to_string()),
-                    );
-                    fields.insert(
-                        "tail".to_string(),
-                        serde_json::Value::String("".to_string()),
-                    );
+                    for field_name in &r.fields {
+                        fields.insert(
+                            field_name.clone(),
+                            serde_json::Value::String("".to_string()),
+                        );
+                    }
                     obj.insert(r.name.clone(), serde_json::Value::Object(fields));
                     serde_json::Value::Object(obj)
                 })
@@ -948,14 +946,23 @@ impl Schema {
             let relation_meta: serde_json::Map<String, serde_json::Value> = self
                 .relations
                 .iter()
-                .filter_map(|r| {
-                    r.threshold.and_then(|t| {
-                        serde_json::Number::from_f64(t as f64).map(|n| {
-                            let mut meta = serde_json::Map::new();
+                .map(|r| {
+                    let mut meta = serde_json::Map::new();
+                    if let Some(t) = r.threshold {
+                        if let Some(n) = serde_json::Number::from_f64(t as f64) {
                             meta.insert("threshold".to_string(), serde_json::Value::Number(n));
-                            (r.name.clone(), serde_json::Value::Object(meta))
-                        })
-                    })
+                        }
+                    }
+                    meta.insert(
+                        "fields".to_string(),
+                        serde_json::Value::Array(
+                            r.fields
+                                .iter()
+                                .map(|f| serde_json::Value::String(f.clone()))
+                                .collect(),
+                        ),
+                    );
+                    (r.name.clone(), serde_json::Value::Object(meta))
                 })
                 .collect();
             if !relation_meta.is_empty() {
@@ -1100,8 +1107,32 @@ impl Schema {
                 if let Some(rel_arr) = relations.as_array() {
                     for rel_value in rel_arr {
                         if let Some(rel_obj) = rel_value.as_object() {
-                            for (name, _) in rel_obj {
-                                schema.relations.push(RelationDef::new(name));
+                            for (name, fields_val) in rel_obj {
+                                let mut relation = RelationDef::new(name);
+                                let field_names: Vec<String> = if let Some(meta_fields) = obj
+                                    .get("relation_metadata")
+                                    .and_then(|m| m.get(name))
+                                    .and_then(|m| m.get("fields"))
+                                    .and_then(|f| f.as_array())
+                                {
+                                    meta_fields
+                                        .iter()
+                                        .filter_map(|v| v.as_str().map(String::from))
+                                        .collect()
+                                } else if let Some(fields_arr) = fields_val.as_array() {
+                                    fields_arr
+                                        .iter()
+                                        .filter_map(|v| v.as_str().map(String::from))
+                                        .collect()
+                                } else if let Some(fields_obj) = fields_val.as_object() {
+                                    fields_obj.keys().cloned().collect()
+                                } else {
+                                    vec!["head".to_string(), "tail".to_string()]
+                                };
+                                if !field_names.is_empty() {
+                                    relation = relation.with_fields(field_names);
+                                }
+                                schema.relations.push(relation);
                             }
                         }
                     }
@@ -1229,6 +1260,35 @@ mod tests {
     #[test]
     fn test_field_dtype_from_str() {
         assert_eq!("str".parse::<FieldDtype>().unwrap(), FieldDtype::Str);
+    }
+
+    #[test]
+    fn test_relation_fields_to_from_dict_roundtrip() {
+        let schema = Schema {
+            relations: vec![
+                RelationDef::new("rate_limit")
+                    .with_fields(vec!["system".to_string(), "metric_value".to_string()]),
+            ],
+            ..Default::default()
+        };
+        let dict = schema.to_dict();
+        let rels = dict.get("relations").and_then(|v| v.as_array()).unwrap();
+        assert_eq!(rels.len(), 1);
+        let rel_obj = rels[0].get("rate_limit").and_then(|v| v.as_object()).unwrap();
+        assert!(rel_obj.contains_key("system"));
+        assert!(rel_obj.contains_key("metric_value"));
+
+        let restored = Schema::from_dict(&dict).unwrap();
+        assert_eq!(restored.relations.len(), 1);
+        assert_eq!(restored.relations[0].name, "rate_limit");
+        assert_eq!(
+            restored.relations[0].fields,
+            vec!["system".to_string(), "metric_value".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_field_dtype_from_str_extra() {
         assert_eq!("list".parse::<FieldDtype>().unwrap(), FieldDtype::List);
         assert!("invalid".parse::<FieldDtype>().is_err());
     }
