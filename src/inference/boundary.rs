@@ -12,8 +12,8 @@ use serde_json::{Value as JsonValue, json};
 
 use crate::batch::preprocessed::PreprocessedBatch;
 use crate::error::{GlinerError, Result};
-use crate::model::boundary::{BoundaryModel, MASK_LOGIT};
-use crate::schema::types::AttributeGroup;
+use crate::model::boundary::{BoundaryModel, MASK_LOGIT, SharedPoolScores, decode_group_natural};
+use crate::schema::types::{AttributeGroup, FieldCardinality, FieldDtype};
 
 /// Resolved span-attribute metadata for one extraction call.
 pub(crate) struct AttributesRuntime {
@@ -119,6 +119,229 @@ fn build_queries(
     Ok((specs, relations))
 }
 
+/// Natural (anchor-driven) structured-record decode for one structure group.
+///
+/// Returns `Some(records)` only when the schema declares natural mode with a
+/// valid anchor and a record decoder is available; otherwise `None` so the
+/// caller falls back to the flat per-field span path.
+#[allow(clippy::too_many_arguments)]
+fn decode_structure_records(
+    boundary: &BoundaryModel,
+    encoder_states: &Tensor, // [S, hidden]
+    scored: &SharedPoolScores,
+    batch: &PreprocessedBatch,
+    sample_idx: usize,
+    group: usize,
+    specs: &[QuerySpec],
+    task_name: &str,
+    threshold: f32,
+    include_confidence: bool,
+    include_spans: bool,
+    original_text: &str,
+    starts_map: Option<&[usize]>,
+    ends_map: Option<&[usize]>,
+    text_len: usize,
+) -> Result<Option<JsonValue>> {
+    // --- Resolve structure metadata (`__mode__`, `__anchor__`, cardinality) ---
+    let Some(schemas) = batch.original_schemas.get(sample_idx) else {
+        return Ok(None);
+    };
+    let Some(structure_obj) = schemas
+        .get("json_structures")
+        .and_then(|v| v.as_array())
+        .and_then(|arr| {
+            arr.iter().find(|el| {
+                el.as_object()
+                    .map(|o| o.contains_key(task_name))
+                    .unwrap_or(false)
+            })
+        })
+        .and_then(|el| el.as_object())
+    else {
+        return Ok(None);
+    };
+    let is_natural = structure_obj
+        .get("__mode__")
+        .and_then(|v| v.as_str())
+        .map(|m| m.eq_ignore_ascii_case("natural"))
+        .unwrap_or(false);
+    if !is_natural {
+        return Ok(None);
+    }
+    let anchor = structure_obj
+        .get("__anchor__")
+        .and_then(|v| v.as_str())
+        .filter(|a| !a.is_empty())
+        .map(|s| s.to_string());
+    let Some(anchor) = anchor else {
+        return Ok(None);
+    };
+    let Some(field_obj) = structure_obj.get(task_name).and_then(|v| v.as_object()) else {
+        return Ok(None);
+    };
+
+    // Group's field specs in schema-token order (matches field candidate order).
+    let fields: Vec<&QuerySpec> = specs.iter().filter(|s| s.group == group).collect();
+    let qids: Vec<usize> = specs
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.group == group)
+        .map(|(qi, _)| qi)
+        .collect();
+    let num_fields = fields.len();
+    if num_fields == 0 {
+        return Ok(None);
+    }
+
+    let anchor_field_idx = fields
+        .iter()
+        .position(|s| s.name == anchor)
+        .unwrap_or(usize::MAX);
+    if anchor_field_idx == usize::MAX {
+        return Ok(None);
+    }
+
+    let decoder = match &boundary.record_decoder {
+        Some(d) => d,
+        None => return Ok(None),
+    };
+    let Some(ref states) = scored.candidate_states else {
+        return Ok(None);
+    };
+
+    // --- Per-field candidate enumeration from the shared pool ---
+    let mut field_candidates: Vec<Vec<usize>> = Vec::with_capacity(num_fields);
+    let mut field_cardinality: Vec<FieldCardinality> = Vec::with_capacity(num_fields);
+    for (f, spec) in fields.iter().enumerate() {
+        let qi = qids[f];
+        let mut cands: Vec<usize> = Vec::new();
+        for ci in 0..scored.valid.len() {
+            if scored.valid[ci] && scored.scores[ci][qi] > MASK_LOGIT / 2.0 {
+                cands.push(ci);
+            }
+        }
+        cands.sort_unstable();
+        field_candidates.push(cands);
+
+        let meta = field_obj.get(&spec.name);
+        let dtype = meta
+            .and_then(|v| v.get("dtype"))
+            .and_then(|v| v.as_str())
+            .map(|d| {
+                if d.eq_ignore_ascii_case("list") {
+                    FieldDtype::List
+                } else {
+                    FieldDtype::Str
+                }
+            });
+        let card = meta
+            .and_then(|v| v.get("cardinality"))
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse::<FieldCardinality>().ok())
+            .or_else(|| dtype.map(FieldCardinality::for_dtype))
+            .unwrap_or(FieldCardinality::ZeroOrOne);
+        field_cardinality.push(card);
+    }
+
+    // Anchor candidates seed one instance each (index-aligned with object logits).
+    let anchor_cands = &field_candidates[anchor_field_idx];
+    if anchor_cands.is_empty() {
+        return Ok(None);
+    }
+    let anchor_object_logits: Vec<f32> = anchor_cands
+        .iter()
+        .map(|&ci| scored.scores[ci][qids[anchor_field_idx]])
+        .collect();
+    let anchor_states: Vec<Vec<f32>> = anchor_cands.iter().map(|&ci| states[ci].clone()).collect();
+    let anchor_spans: Vec<(usize, usize)> = anchor_cands
+        .iter()
+        .map(|&ci| (scored.starts[ci], scored.ends[ci]))
+        .collect();
+    let field_cand_states: Vec<Vec<Vec<f32>>> = field_candidates
+        .iter()
+        .map(|cs| cs.iter().map(|&ci| states[ci].clone()).collect())
+        .collect();
+    let field_spans: Vec<Vec<(usize, usize)>> = field_candidates
+        .iter()
+        .map(|cs| {
+            cs.iter()
+                .map(|&ci| (scored.starts[ci], scored.ends[ci]))
+                .collect()
+        })
+        .collect();
+
+    // Schema query states indexed by query id (spec.marker_pos rows).
+    let rows = encoder_states
+        .to_vec2::<f32>()
+        .map_err(|e| GlinerError::inference(format!("{e}")))?;
+    let seq_len = encoder_states.dims()[0];
+    let mut query_states: Vec<Vec<f32>> = Vec::with_capacity(specs.len());
+    for spec in specs {
+        query_states.push(rows[spec.marker_pos.min(seq_len.saturating_sub(1))].clone());
+    }
+
+    let (object_logits, assign_logits, _) = decoder
+        .forward_group_natural(
+            &query_states,
+            &qids,
+            &anchor_object_logits,
+            &anchor_states,
+            &anchor_spans,
+            &field_cand_states,
+        )
+        .map_err(|e| GlinerError::inference(format!("{e}")))?;
+
+    let records = decode_group_natural(
+        &object_logits,
+        &assign_logits,
+        &field_spans,
+        anchor_field_idx,
+        &field_cardinality,
+        threshold,
+        threshold,
+    );
+
+    // --- Emit JSON records ---
+    let mut entries: Vec<JsonValue> = Vec::new();
+    for rec in records {
+        let mut rec_obj = serde_json::Map::new();
+        for (f, spans) in &rec.fields {
+            if *f >= fields.len() {
+                continue;
+            }
+            let name = &fields[*f].name;
+            let mut span_jsons: Vec<JsonValue> = Vec::new();
+            for (k, &(s, e)) in spans.iter().enumerate() {
+                let conf = rec
+                    .field_scores
+                    .get(f)
+                    .and_then(|v| v.get(k))
+                    .copied()
+                    .unwrap_or(0.0);
+                let char_start = char_offset(starts_map, s.min(text_len.saturating_sub(1)));
+                let char_end = char_offset(ends_map, (e.saturating_sub(1)).min(text_len - 1));
+                let text = safe_slice(original_text, char_start, char_end);
+                let span_val = if include_spans && include_confidence {
+                    json!({"text": text, "start": char_start, "end": char_end, "confidence": conf})
+                } else if include_spans {
+                    json!({"text": text, "start": char_start, "end": char_end})
+                } else if include_confidence {
+                    json!({"text": text, "confidence": conf})
+                } else {
+                    json!(text)
+                };
+                span_jsons.push(span_val);
+            }
+            rec_obj.insert(name.clone(), JsonValue::Array(span_jsons));
+        }
+        if !rec_obj.is_empty() {
+            entries.push(JsonValue::Object(rec_obj));
+        }
+    }
+
+    Ok(Some(JsonValue::Array(entries)))
+}
+
 /// Boundary-path extraction for a single collated sample.
 ///
 /// Returns task results keyed like the span path (`entities`, task names).
@@ -192,8 +415,7 @@ pub(crate) fn extract_sample(
     // First pass: decode all entity groups so relation extraction has access to canonical endpoints
     for (group, task) in task_types.iter().enumerate() {
         if task.as_str() == "entities" {
-            let attr_prompts: HashSet<&str> =
-                attrs.map(|a| a.prompt_labels()).unwrap_or_default();
+            let attr_prompts: HashSet<&str> = attrs.map(|a| a.prompt_labels()).unwrap_or_default();
             let has_attributes = attrs.is_some_and(|a| !a.is_empty());
 
             // name -> (entries, token coords per entry)
@@ -284,7 +506,10 @@ pub(crate) fn extract_sample(
 
             let mut by_type: serde_json::Map<String, JsonValue> = Default::default();
             for (name, entries, coords) in decoded_entities {
-                all_entity_spans_by_type.entry(name.clone()).or_default().extend(coords.iter().copied());
+                all_entity_spans_by_type
+                    .entry(name.clone())
+                    .or_default()
+                    .extend(coords.iter().copied());
                 all_canonical_entity_spans.extend(coords.iter().copied());
                 by_type.insert(name, JsonValue::Array(entries));
             }
@@ -316,6 +541,30 @@ pub(crate) fn extract_sample(
                     .schema_tokens(sample_idx, group)
                     .and_then(|t| t.get(2).map(|s| s.to_string()))
                     .unwrap_or_else(|| format!("record_{group}"));
+
+                // Natural (anchor-driven) record decoding preserves instance
+                // identity. Only engaged when the schema declares it.
+                if let Some(records) = decode_structure_records(
+                    boundary,
+                    encoder_states,
+                    &scored,
+                    batch,
+                    sample_idx,
+                    group,
+                    &specs,
+                    &task_name,
+                    threshold,
+                    include_confidence,
+                    include_spans,
+                    original_text,
+                    starts_map,
+                    ends_map,
+                    text_len,
+                )? {
+                    result.insert(task_name, records);
+                    continue;
+                }
+
                 let mut entries: Vec<JsonValue> = Vec::new();
                 let mut fields_json = serde_json::Map::new();
 
@@ -336,9 +585,8 @@ pub(crate) fn extract_sample(
                             }
                         }
                     }
-                    let resolved = resolve_flat_spans(
-                        hits.into_iter().map(|(st, e, p)| (p, st, e)).collect(),
-                    );
+                    let resolved =
+                        resolve_flat_spans(hits.into_iter().map(|(st, e, p)| (p, st, e)).collect());
                     let mut span_jsons: Vec<JsonValue> = Vec::new();
                     for (conf, s, e) in resolved {
                         let char_start = char_offset(starts_map, s.min(text_len.saturating_sub(1)));
@@ -358,7 +606,10 @@ pub(crate) fn extract_sample(
                     fields_json.insert(spec.name.clone(), JsonValue::Array(span_jsons));
                 }
 
-                if fields_json.values().any(|v| matches!(v, JsonValue::Array(a) if !a.is_empty())) {
+                if fields_json
+                    .values()
+                    .any(|v| matches!(v, JsonValue::Array(a) if !a.is_empty()))
+                {
                     entries.push(JsonValue::Object(fields_json));
                 }
 
@@ -390,14 +641,19 @@ pub(crate) fn extract_sample(
                             let h_name = &specs[h_qid].name;
                             let t_name = &specs[t_qid].name;
 
-                            let (head_cands, tail_cands) = if !all_canonical_entity_spans.is_empty() {
-                                let mut hc: Vec<(usize, usize)> = if let Some(type_spans) = all_entity_spans_by_type.get(h_name) {
+                            let (head_cands, tail_cands) = if !all_canonical_entity_spans.is_empty()
+                            {
+                                let mut hc: Vec<(usize, usize)> = if let Some(type_spans) =
+                                    all_entity_spans_by_type.get(h_name)
+                                {
                                     type_spans.clone()
                                 } else {
                                     all_canonical_entity_spans.iter().copied().collect()
                                 };
                                 hc.sort_unstable();
-                                let mut tc: Vec<(usize, usize)> = if let Some(type_spans) = all_entity_spans_by_type.get(t_name) {
+                                let mut tc: Vec<(usize, usize)> = if let Some(type_spans) =
+                                    all_entity_spans_by_type.get(t_name)
+                                {
                                     type_spans.clone()
                                 } else {
                                     all_canonical_entity_spans.iter().copied().collect()
@@ -415,15 +671,21 @@ pub(crate) fn extract_sample(
                                     if h_score > MASK_LOGIT / 2.0 {
                                         let prob = sigmoid(h_score);
                                         if prob >= threshold {
-                                            head_hits.push((scored.starts[ci], scored.ends[ci], prob));
+                                            head_hits.push((
+                                                scored.starts[ci],
+                                                scored.ends[ci],
+                                                prob,
+                                            ));
                                         }
                                     }
                                 }
                                 let resolved_heads = resolve_flat_spans(
                                     head_hits.into_iter().map(|(st, e, p)| (p, st, e)).collect(),
                                 );
-                                let hc: Vec<(usize, usize)> =
-                                    resolved_heads.into_iter().map(|(_, st, e)| (st, e)).collect();
+                                let hc: Vec<(usize, usize)> = resolved_heads
+                                    .into_iter()
+                                    .map(|(_, st, e)| (st, e))
+                                    .collect();
 
                                 let mut tail_hits: Vec<(usize, usize, f32)> = Vec::new();
                                 for ci in 0..scored.valid.len() {
@@ -434,15 +696,21 @@ pub(crate) fn extract_sample(
                                     if t_score > MASK_LOGIT / 2.0 {
                                         let prob = sigmoid(t_score);
                                         if prob >= threshold {
-                                            tail_hits.push((scored.starts[ci], scored.ends[ci], prob));
+                                            tail_hits.push((
+                                                scored.starts[ci],
+                                                scored.ends[ci],
+                                                prob,
+                                            ));
                                         }
                                     }
                                 }
                                 let resolved_tails = resolve_flat_spans(
                                     tail_hits.into_iter().map(|(st, e, p)| (p, st, e)).collect(),
                                 );
-                                let tc: Vec<(usize, usize)> =
-                                    resolved_tails.into_iter().map(|(_, st, e)| (st, e)).collect();
+                                let tc: Vec<(usize, usize)> = resolved_tails
+                                    .into_iter()
+                                    .map(|(_, st, e)| (st, e))
+                                    .collect();
 
                                 (hc, tc)
                             };
@@ -469,7 +737,8 @@ pub(crate) fn extract_sample(
                                 )?;
                                 // Decode pairs above threshold, ranked descending by score.
                                 let mut scored_entries: Vec<(f32, JsonValue)> = Vec::new();
-                                let mut seen_pairs: HashSet<((usize, usize), (usize, usize))> = HashSet::new();
+                                let mut seen_pairs: HashSet<((usize, usize), (usize, usize))> =
+                                    HashSet::new();
                                 for (idx, &score) in pair_scores.iter().enumerate() {
                                     let prob = sigmoid(score);
                                     if prob < threshold {
@@ -511,14 +780,21 @@ pub(crate) fn extract_sample(
                                     };
                                     scored_entries.push((prob, obj));
                                 }
-                                scored_entries.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-                                let entries: Vec<JsonValue> = scored_entries.into_iter().map(|(_, obj)| obj).collect();
+                                scored_entries.sort_by(|a, b| {
+                                    b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal)
+                                });
+                                let entries: Vec<JsonValue> =
+                                    scored_entries.into_iter().map(|(_, obj)| obj).collect();
                                 let mut rel_map = match result.remove("relation_extraction") {
                                     Some(JsonValue::Object(m)) => m,
                                     _ => serde_json::Map::new(),
                                 };
-                                rel_map.insert(rel.relation_name.clone(), JsonValue::Array(entries));
-                                result.insert("relation_extraction".to_string(), JsonValue::Object(rel_map));
+                                rel_map
+                                    .insert(rel.relation_name.clone(), JsonValue::Array(entries));
+                                result.insert(
+                                    "relation_extraction".to_string(),
+                                    JsonValue::Object(rel_map),
+                                );
                             }
                         }
                     }

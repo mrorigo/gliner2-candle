@@ -1377,6 +1377,103 @@ impl RecordDecoder {
         Ok((object_logits, assign_logits, instance_spans))
     }
 
+    /// Natural (anchor-driven) forward: every anchor candidate seeds one record
+    /// instance and each non-anchor field is scored per instance with an
+    /// explicit ABSENT alternative (column 0).
+    ///
+    /// Mirrors ``RecordHead.forward_group`` mode == ``natural`` and
+    /// ``RecordHead._assign_logits`` in the reference.
+    ///
+    /// * `query_states` - `(Q, H)` schema query embeddings
+    /// * `field_query_ids` - `[F]` query index used by each field
+    /// * `anchor_object_logits` - anchor field's pair logits `[Ca]` (instances)
+    /// * `anchor_candidate_states` - `[Ca, H]` anchor candidate states
+    /// * `anchor_candidate_spans` - `[Ca]` anchor half-open spans
+    /// * `field_candidate_states` - per field `[F]` each `[Cf, H]`
+    ///
+    /// Returns `(object_logits[Ca], assign_logits[Ca][F][1+Cf], instance_spans[Ca])`
+    /// where column 0 of each assign row is the null/ABSENT alternative.
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    pub fn forward_group_natural(
+        &self,
+        query_states: &[Vec<f32>],
+        field_query_ids: &[usize],
+        anchor_object_logits: &[f32],
+        anchor_candidate_states: &[Vec<f32>],
+        anchor_candidate_spans: &[(usize, usize)],
+        field_candidate_states: &[Vec<Vec<f32>>],
+    ) -> Result<(Vec<f32>, Vec<Vec<Vec<f32>>>, Vec<(usize, usize)>)> {
+        let h = self.hidden_size;
+        let d = self.record_dim;
+        let num_instances = anchor_candidate_states.len();
+        let num_fields = field_query_ids.len();
+
+        let (w_inst, _, _) = mat2(self.inst_proj.weight())?;
+        let b_inst = bias1(self.inst_proj.bias())?;
+        let (w_field, _, _) = mat2(self.field_proj.weight())?;
+        let b_field = bias1(self.field_proj.bias())?;
+        let (w_cand, _, _) = mat2(self.cand_proj.weight())?;
+        let b_cand = bias1(self.cand_proj.bias())?;
+        let null_emb: Vec<f32> = self
+            .null_embed
+            .to_vec1()
+            .map_err(|e| GlinerError::inference(format!("{e}")))?;
+
+        // Precompute per-field projected candidate states: [F][Cf, D].
+        let mut field_cand_proj: Vec<Vec<Vec<f32>>> = Vec::with_capacity(num_fields);
+        for cs in field_candidate_states {
+            field_cand_proj.push(
+                cs.iter()
+                    .map(|c| apply_linear(&w_cand, h, &b_cand, c))
+                    .collect(),
+            );
+        }
+
+        // Field query states: [F, H]. Out-of-range query ids fall back to zero.
+        let field_q_embs: Vec<Vec<f32>> = field_query_ids
+            .iter()
+            .map(|&qid| {
+                if qid < query_states.len() {
+                    query_states[qid].clone()
+                } else {
+                    vec![0.0f32; h]
+                }
+            })
+            .collect();
+        let field_q_proj: Vec<Vec<f32>> = field_q_embs
+            .iter()
+            .map(|x| apply_linear(&w_field, h, &b_field, x))
+            .collect();
+
+        let mut assign_logits = Vec::with_capacity(num_instances);
+        #[allow(clippy::needless_range_loop)]
+        for i in 0..num_instances {
+            let inst_q_proj = apply_linear(&w_inst, h, &b_inst, &anchor_candidate_states[i]);
+            let mut field_logits = Vec::with_capacity(num_fields);
+            #[allow(clippy::needless_range_loop)]
+            for f in 0..num_fields {
+                let mut query = vec![0.0f32; d];
+                for k in 0..d {
+                    query[k] = inst_q_proj[k] + field_q_proj[f][k];
+                }
+                let null_col = dot(&query, &null_emb);
+                let mut row = Vec::with_capacity(1 + field_cand_proj[f].len());
+                row.push(null_col);
+                for cand_p in &field_cand_proj[f] {
+                    row.push(dot(&query, cand_p));
+                }
+                field_logits.push(row);
+            }
+            assign_logits.push(field_logits);
+        }
+
+        Ok((
+            anchor_object_logits.to_vec(),
+            assign_logits,
+            anchor_candidate_spans.to_vec(),
+        ))
+    }
+
     /// Decode one record group into a list of `DecodedRecord`.
     ///
     /// Uses the anchorless mode: sigmoid(object_logits) → object probability,
@@ -1495,6 +1592,248 @@ impl RecordDecoder {
 
         deduped
     }
+}
+
+/// Decode a natural (anchor-driven) record group into a list of `DecodedRecord`.
+///
+/// Mirrors the reference ``record_head.decode_group`` for ``mode == "natural"``:
+/// anchor candidates are the instances, scalar (str) fields are assigned
+/// globally with an explicit ABSENT alternative (Hungarian), list fields keep
+/// sigmoid-thresholded candidates, the anchor field is auto-filled, records are
+/// sorted by anchor span, and aliasing/dedup is not applied (instances are
+/// distinct by construction).
+///
+/// * `object_logits` - anchor pair logits `[Ca]` (one per instance)
+/// * `assign_logits` - `[Ca][F][1+Cf]` per-instance field assignment logits
+/// * `field_spans` - per field `[F]` the candidate half-open spans `[Cf]`
+/// * `anchor_field_idx` - field index of the anchor
+/// * `field_cardinality` - per field `[F]` cardinality
+/// * `object_threshold` - anchor-selection threshold (default 0.5)
+/// * `field_threshold` - candidate-selection threshold (default 0.5)
+pub fn decode_group_natural(
+    object_logits: &[f32],
+    assign_logits: &[Vec<Vec<f32>>],
+    field_spans: &[Vec<(usize, usize)>],
+    anchor_field_idx: usize,
+    field_cardinality: &[crate::schema::types::FieldCardinality],
+    object_threshold: f32,
+    field_threshold: f32,
+) -> Vec<DecodedRecord> {
+    let num_instances = object_logits.len();
+    let num_fields = field_cardinality.len();
+    if num_instances == 0 || num_fields == 0 {
+        return Vec::new();
+    }
+
+    let obj_prob: Vec<f32> = object_logits.iter().map(|&x| sigmoid_f32(x)).collect();
+    let mut order: Vec<usize> = (0..num_instances).collect();
+    order.sort_by(|&a, &b| {
+        obj_prob[b]
+            .partial_cmp(&obj_prob[a])
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.cmp(&b))
+    });
+    let selected: Vec<usize> = order
+        .into_iter()
+        .filter(|&i| obj_prob[i] >= object_threshold)
+        .collect();
+    if selected.is_empty() {
+        return Vec::new();
+    }
+
+    // Exclusive scalar fields are a global assignment problem over the selected
+    // instances: each instance picks a distinct candidate or ABSENT. Go through
+    // every (instance, field) logically, but only allocate for scalar fields.
+    let mut scalar_choices: std::collections::HashMap<(usize, usize), Option<(usize, f32)>> =
+        std::collections::HashMap::new();
+    let mut list_owners: std::collections::HashMap<(usize, usize), (usize, f32)> =
+        std::collections::HashMap::new();
+
+    for f_idx in 0..num_fields {
+        let card = field_cardinality[f_idx];
+        if f_idx == anchor_field_idx {
+            continue;
+        }
+        let c_count = field_spans[f_idx].len();
+        let row_len = assign_logits[selected[0]][f_idx].len();
+        if card.is_scalar() {
+            if c_count == 0 {
+                for &inst in &selected {
+                    scalar_choices.insert((inst, f_idx), None);
+                }
+                continue;
+            }
+            // softmax over [null, cand1..candC] per selected instance.
+            let mut probs: Vec<Vec<f32>> = Vec::with_capacity(selected.len());
+            for &inst in &selected {
+                let row: Vec<f32> = assign_logits[inst][f_idx]
+                    .iter()
+                    .take(row_len)
+                    .copied()
+                    .collect();
+                let max_logit = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let exp_sum: f32 = row.iter().map(|v| (v - max_logit).exp()).sum();
+                probs.push(
+                    row.iter()
+                        .map(|v| (v - max_logit).exp() / exp_sum)
+                        .collect(),
+                );
+            }
+            let candidate_count = c_count;
+            let row_count = selected.len();
+            // Max candidate cost used to size the ABSENT columns for required
+            // fields (never prefer ABSENT while a candidate is available).
+            let candidate_max_all: f64 = probs
+                .iter()
+                .flat_map(|row| row.iter().skip(1))
+                .map(|&p| -(p.clamp(f64::MIN_POSITIVE as f32, 1.0) as f64).ln())
+                .fold(f64::NEG_INFINITY, f64::max);
+            let mut diagonal: Vec<f64> = Vec::with_capacity(row_count);
+            if card.allows_absent() {
+                for row in &probs {
+                    diagonal.push(-(row[0].clamp(f64::MIN_POSITIVE as f32, 1.0) as f64).ln());
+                }
+            } else {
+                diagonal.resize(row_count, candidate_max_all + 50.0);
+            }
+            let diagonal_max_all = diagonal.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            let invalid = candidate_max_all.max(diagonal_max_all) + 1000.0;
+            let mut cost: Vec<Vec<f64>> = Vec::with_capacity(row_count);
+            for r in 0..row_count {
+                let mut row_cost: Vec<f64> = Vec::with_capacity(candidate_count + row_count);
+                for c in 0..candidate_count {
+                    let p = probs[r][c + 1].clamp(f64::MIN_POSITIVE as f32, 1.0);
+                    row_cost.push(-(p as f64).ln());
+                }
+                for r2 in 0..row_count {
+                    row_cost.push(if r2 == r { diagonal[r] } else { invalid });
+                }
+                cost.push(row_cost);
+            }
+            let rows_cols = linear_sum_assignment(&cost);
+            for (row, &inst) in selected.iter().enumerate() {
+                let col = rows_cols.get(row).copied().unwrap_or(candidate_count + row);
+                if col >= candidate_count {
+                    scalar_choices.insert((inst, f_idx), None);
+                    continue;
+                }
+                let probability = probs[row][col + 1];
+                if probability < field_threshold && card.allows_absent() {
+                    scalar_choices.insert((inst, f_idx), None);
+                    continue;
+                }
+                scalar_choices.insert((inst, f_idx), Some((col, probability)));
+            }
+        } else {
+            // List field: sigmoid each candidate, keep those above threshold.
+            for cand_idx in 0..c_count {
+                let mut best_row = 0usize;
+                let mut best_p = f32::NEG_INFINITY;
+                for (row, &inst) in selected.iter().enumerate() {
+                    let logit_start = 1 + cand_idx;
+                    let logit = assign_logits[inst][f_idx]
+                        .get(logit_start)
+                        .copied()
+                        .unwrap_or(MASK_LOGIT);
+                    let p = sigmoid_f32(logit);
+                    if p > best_p {
+                        best_p = p;
+                        best_row = row;
+                    }
+                }
+                if best_p >= field_threshold {
+                    list_owners.insert((f_idx, cand_idx), (selected[best_row], best_p));
+                }
+            }
+        }
+    }
+
+    let mut records: Vec<DecodedRecord> = Vec::new();
+    for &inst in &selected {
+        let mut rec = DecodedRecord {
+            fields: std::collections::HashMap::new(),
+            field_scores: std::collections::HashMap::new(),
+            score: obj_prob[inst],
+        };
+
+        for f_idx in 0..num_fields {
+            let card = field_cardinality[f_idx];
+            let c_count = field_spans[f_idx].len();
+            if f_idx == anchor_field_idx {
+                // Each instance is seeded by the anchor candidate with the same
+                // index; the anchor value is that candidate's span.
+                if let Some(&anchor_span) = field_spans[anchor_field_idx].get(inst) {
+                    rec.fields.insert(anchor_field_idx, vec![anchor_span]);
+                }
+                continue;
+            }
+
+            if card.is_scalar() {
+                if let Some(choice) = scalar_choices.get(&(inst, f_idx)).copied().flatten() {
+                    let (cand_idx, probability) = choice;
+                    if cand_idx < c_count {
+                        let span = field_spans[f_idx][cand_idx];
+                        rec.fields.entry(f_idx).or_default().push(span);
+                        rec.field_scores.entry(f_idx).or_default().push(probability);
+                    }
+                }
+            } else {
+                let mut selected_spans = Vec::new();
+                let mut selected_scores = Vec::new();
+                #[allow(clippy::needless_range_loop)]
+                for cand_idx in 0..c_count {
+                    let owner = list_owners.get(&(f_idx, cand_idx)).copied();
+                    let probability = if let Some((owner_inst, p)) = owner {
+                        if owner_inst != inst {
+                            continue;
+                        }
+                        p
+                    } else {
+                        let logit_start = 1 + cand_idx;
+                        sigmoid_f32(
+                            assign_logits[inst][f_idx]
+                                .get(logit_start)
+                                .copied()
+                                .unwrap_or(MASK_LOGIT),
+                        )
+                    };
+                    if probability < field_threshold {
+                        continue;
+                    }
+                    selected_spans.push(field_spans[f_idx][cand_idx]);
+                    selected_scores.push(probability);
+                }
+                if !selected_spans.is_empty() {
+                    rec.fields.entry(f_idx).or_default().extend(selected_spans);
+                    rec.field_scores
+                        .entry(f_idx)
+                        .or_default()
+                        .extend(selected_scores);
+                }
+            }
+        }
+
+        if !rec.fields.is_empty() {
+            records.push(rec);
+        }
+    }
+
+    // Natural mode orders records by anchor span (textual order); no dedup.
+    records.sort_by(|a, b| {
+        let a_span = a
+            .fields
+            .get(&anchor_field_idx)
+            .and_then(|v| v.first())
+            .copied();
+        let b_span = b
+            .fields
+            .get(&anchor_field_idx)
+            .and_then(|v| v.first())
+            .copied();
+        (a_span.is_none(), a_span.unwrap_or((usize::MAX, usize::MAX)))
+            .cmp(&(b_span.is_none(), b_span.unwrap_or((usize::MAX, usize::MAX))))
+    });
+    records
 }
 
 /// Complete GLiNER2.5 boundary model (everything except the shared encoder).
@@ -2208,6 +2547,97 @@ fn sigmoid_f32(x: f32) -> f32 {
     1.0 / (1.0 + (-x).exp())
 }
 
+/// Minimum-cost assignment of each row to a distinct column of a (possibly
+/// rectangular, `rows <= cols`) cost matrix. Returns `rows` column indices.
+///
+/// Implements the classic O(n^3) Jonker-Volgenant / Kuhn-Munkres potentials
+/// algorithm on the square-padded matrix (rows x cols with `fill` for the
+/// unused columns), mirroring ``scipy.optimize.linear_sum_assignment`` used by
+/// the reference record decoder for exclusive scalar fields.
+fn linear_sum_assignment(cost: &[Vec<f64>]) -> Vec<usize> {
+    let rows = cost.len();
+    if rows == 0 {
+        return Vec::new();
+    }
+    let cols = cost.iter().map(|r| r.len()).max().unwrap_or(0);
+    let n = cols.max(rows);
+
+    // Pad to square with a large cost for nonexistent columns.
+    let fill = cost
+        .iter()
+        .flat_map(|r| r.iter().copied())
+        .fold(f64::NEG_INFINITY, f64::max)
+        + 1e6
+        + 1.0;
+    let mut work = vec![vec![fill; n]; n];
+    for (i, row) in cost.iter().enumerate() {
+        for (j, &v) in row.iter().enumerate() {
+            work[i][j] = v;
+        }
+    }
+
+    // u[i], v[j] potentials; p[j] = row matched to column j (0-based, -1 none).
+    let mut u = vec![0.0f64; n + 1];
+    let mut v = vec![0.0f64; n + 1];
+    let mut p = vec![0usize; n + 1];
+    let mut way = vec![0usize; n + 1];
+
+    for i in 1..=n {
+        p[0] = i;
+        let mut j0 = 0usize;
+        let mut minv = vec![f64::INFINITY; n + 1];
+        let mut used = vec![false; n + 1];
+        loop {
+            used[j0] = true;
+            let i0 = p[j0];
+            let mut delta = f64::INFINITY;
+            let mut j1 = 0usize;
+            for j in 1..=n {
+                if !used[j] {
+                    let cur = work[i0 - 1][j - 1] - u[i0] - v[j];
+                    if cur < minv[j] {
+                        minv[j] = cur;
+                        way[j] = j0;
+                    }
+                    if minv[j] < delta {
+                        delta = minv[j];
+                        j1 = j;
+                    }
+                }
+            }
+            for j in 0..=n {
+                if used[j] {
+                    u[p[j]] += delta;
+                    v[j] -= delta;
+                } else {
+                    minv[j] -= delta;
+                }
+            }
+            j0 = j1;
+            if p[j0] == 0 {
+                break;
+            }
+        }
+        loop {
+            let j1 = way[j0];
+            p[j0] = p[j1];
+            j0 = j1;
+            if j0 == 0 {
+                break;
+            }
+        }
+    }
+
+    // Column `j` (1-based) is matched to row `p[j]` (0-based).
+    let mut answer = vec![0usize; rows];
+    for j in 1..=n {
+        if p[j] != 0 && p[j] <= rows {
+            answer[p[j] - 1] = j - 1;
+        }
+    }
+    answer
+}
+
 fn erf(x: f32) -> f32 {
     // Abramowitz & Stegun 7.1.26 approximation (|err| < 1.5e-7).
     // NOTE: the polynomial is multiplied by exp(-x^2); omitting that factor
@@ -2655,6 +3085,64 @@ mod tests {
             0.3,
         );
         assert_eq!(records.len(), 1);
+    }
+
+    #[test]
+    fn decode_group_natural_anchor_fill_and_hungarian() {
+        use crate::schema::types::FieldCardinality;
+        // Structure "purchase": fields [buyer (anchor), item (scalar)].
+        // Two anchor candidates seed two instances (Alice, Bob) by index.
+        let object_logits = vec![3.0, 2.0]; // both selected (sigmoid 0.95, 0.88)
+        // field index 0 = buyer (anchor), field index 1 = item (2 candidates).
+        let assign_logits = vec![
+            vec![
+                vec![-2.0, 9.0, 9.0], // buyer row ignored (auto-filled)
+                vec![-1.0, 5.0, 2.0], // instance0 (Alice): prefers apple
+            ],
+            vec![
+                vec![-2.0, 9.0, 9.0], // buyer row ignored
+                vec![-1.0, 2.0, 5.0], // instance1 (Bob): prefers banana
+            ],
+        ];
+        // field 0 = anchor candidates (Alice=(10,15), Bob=(20,25));
+        // field 1 = item candidates (apple=(30,35), banana=(40,45)).
+        let field_spans = vec![vec![(10, 15), (20, 25)], vec![(30, 35), (40, 45)]];
+        let anchor_field_idx = 0;
+        let field_cardinality = vec![FieldCardinality::RequiredOne, FieldCardinality::ZeroOrOne];
+
+        let records = decode_group_natural(
+            &object_logits,
+            &assign_logits,
+            &field_spans,
+            anchor_field_idx,
+            &field_cardinality,
+            0.3, // object threshold
+            0.3, // field threshold
+        );
+
+        assert_eq!(records.len(), 2, "two anchor candidates -> two records");
+        // Sorted by anchor span (textual order): Alice before Bob.
+        assert_eq!(
+            records[0].fields.get(&0),
+            Some(&vec![(10, 15)]),
+            "Alice anchor"
+        );
+        assert_eq!(
+            records[1].fields.get(&0),
+            Some(&vec![(20, 25)]),
+            "Bob anchor"
+        );
+        // Hungarian assigns a distinct item candidate per instance.
+        assert_eq!(
+            records[0].fields.get(&1),
+            Some(&vec![(30, 35)]),
+            "Alice -> apple"
+        );
+        assert_eq!(
+            records[1].fields.get(&1),
+            Some(&vec![(40, 45)]),
+            "Bob -> banana"
+        );
     }
 
     #[test]

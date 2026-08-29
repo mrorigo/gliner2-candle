@@ -259,6 +259,8 @@ impl SchemaBuilder {
             fields: Vec::new(),
             descriptions: HashMap::new(),
             field_order: Vec::new(),
+            mode: StructureMode::Default,
+            anchor: None,
         }
     }
 
@@ -573,9 +575,23 @@ pub struct StructureBuilder {
     fields: Vec<FieldDef>,
     descriptions: HashMap<String, String>,
     field_order: Vec<String>,
+    mode: StructureMode,
+    anchor: Option<String>,
 }
 
 impl StructureBuilder {
+    /// Set the record decoding mode for the structure.
+    pub fn mode(mut self, mode: StructureMode) -> Self {
+        self.mode = mode;
+        self
+    }
+
+    /// Set the anchor field for natural-mode records.
+    pub fn anchor(mut self, anchor: impl Into<String>) -> Self {
+        self.anchor = Some(anchor.into());
+        self
+    }
+
     /// Add a field to the structure.
     ///
     /// # Arguments
@@ -592,6 +608,7 @@ impl StructureBuilder {
             parent: self,
             name,
             dtype: FieldDtype::List,
+            cardinality: None,
             choices: None,
             description: None,
             threshold: None,
@@ -605,6 +622,8 @@ impl StructureBuilder {
             name: self.name.clone(),
             fields: self.fields,
             descriptions: self.descriptions,
+            mode: self.mode,
+            anchor: self.anchor,
         };
         let mut parent = *self.parent;
         parent.schema.structures.push(structure);
@@ -618,6 +637,8 @@ impl StructureBuilder {
             name: self.name,
             fields: self.fields,
             descriptions: self.descriptions,
+            mode: self.mode,
+            anchor: self.anchor,
         }
     }
 }
@@ -632,6 +653,7 @@ pub struct FieldBuilder {
     parent: StructureBuilder,
     name: String,
     dtype: FieldDtype,
+    cardinality: Option<FieldCardinality>,
     choices: Option<Vec<String>>,
     description: Option<String>,
     threshold: Option<f32>,
@@ -642,6 +664,12 @@ impl FieldBuilder {
     /// Set the data type.
     pub fn dtype(mut self, dtype: FieldDtype) -> Self {
         self.dtype = dtype;
+        self
+    }
+
+    /// Set the cardinality.
+    pub fn cardinality(mut self, cardinality: FieldCardinality) -> Self {
+        self.cardinality = Some(cardinality);
         self
     }
 
@@ -672,6 +700,9 @@ impl FieldBuilder {
     /// Finish the field and return to the structure builder.
     pub fn done_field(mut self) -> StructureBuilder {
         let mut field = FieldDef::new(&self.name).with_dtype(self.dtype);
+        if let Some(cardinality) = self.cardinality {
+            field = field.with_cardinality(cardinality);
+        }
 
         if let Some(ref choices) = self.choices {
             field = field.with_choices(choices.clone());

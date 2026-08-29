@@ -133,6 +133,111 @@ impl RegexValidator {
     }
 }
 
+/// Cardinality of a structure field: how many values it may hold and whether
+/// absence is allowed. Mirrors the reference `gliner2` `cardinality` concept.
+///
+/// * Scalar fields (`Str` dtype) map to ``RequiredOne``/``ZeroOrOne``.
+/// * List fields (`List` dtype) map to ``OneOrMore``/``ZeroOrMore``.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FieldCardinality {
+    /// Exactly one value, always present.
+    RequiredOne,
+    /// At most one value, absence allowed.
+    ZeroOrOne,
+    /// One or more values.
+    OneOrMore,
+    /// Zero or more values.
+    ZeroOrMore,
+}
+
+#[allow(clippy::derivable_impls)]
+impl Default for FieldCardinality {
+    fn default() -> Self {
+        FieldCardinality::ZeroOrMore
+    }
+}
+
+impl FieldCardinality {
+    /// Whether the field holds a single scalar value (`str` dtype).
+    pub fn is_scalar(self) -> bool {
+        matches!(
+            self,
+            FieldCardinality::RequiredOne | FieldCardinality::ZeroOrOne
+        )
+    }
+
+    /// Whether the model may leave the field unset.
+    pub fn allows_absent(self) -> bool {
+        matches!(
+            self,
+            FieldCardinality::ZeroOrOne | FieldCardinality::ZeroOrMore
+        )
+    }
+
+    /// The canonical cardinality for a given dtype (used when unspecified).
+    pub fn for_dtype(dtype: FieldDtype) -> Self {
+        match dtype {
+            FieldDtype::Str => FieldCardinality::ZeroOrOne,
+            FieldDtype::List => FieldCardinality::ZeroOrMore,
+        }
+    }
+}
+
+impl std::fmt::Display for FieldCardinality {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}",
+            match self {
+                FieldCardinality::RequiredOne => "required_one",
+                FieldCardinality::ZeroOrOne => "zero_or_one",
+                FieldCardinality::OneOrMore => "one_or_more",
+                FieldCardinality::ZeroOrMore => "zero_or_more",
+            }
+        )
+    }
+}
+
+impl std::str::FromStr for FieldCardinality {
+    type Err = GlinerError;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s {
+            "required_one" => Ok(FieldCardinality::RequiredOne),
+            "zero_or_one" => Ok(FieldCardinality::ZeroOrOne),
+            "one_or_more" => Ok(FieldCardinality::OneOrMore),
+            "zero_or_more" => Ok(FieldCardinality::ZeroOrMore),
+            _ => Err(GlinerError::validation(format!("Invalid cardinality: {s}"))),
+        }
+    }
+}
+
+/// Record decoding mode for a structure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StructureMode {
+    /// Default mode.
+    #[default]
+    Default,
+    /// Natural mode: an anchor field defines the record instances and each
+    /// remaining field is assigned to the instance it co-occurs with.
+    Natural,
+}
+
+impl std::fmt::Display for StructureMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}",
+            match self {
+                StructureMode::Default => "default",
+                StructureMode::Natural => "natural",
+            }
+        )
+    }
+}
+
 /// Field definition for structured data extraction.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FieldDef {
@@ -141,6 +246,9 @@ pub struct FieldDef {
     /// Data type (str or list).
     #[serde(default)]
     pub dtype: FieldDtype,
+    /// Cardinality of the field (optional; inferred from dtype when unset).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cardinality: Option<FieldCardinality>,
     /// Predefined choices for classification-style fields.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub choices: Option<Vec<String>>,
@@ -156,11 +264,20 @@ pub struct FieldDef {
 }
 
 impl FieldDef {
+    /// Resolve the effective cardinality (explicit or dtype-default).
+    pub fn effective_cardinality(&self) -> FieldCardinality {
+        self.cardinality
+            .unwrap_or_else(|| FieldCardinality::for_dtype(self.dtype))
+    }
+}
+
+impl FieldDef {
     /// Create a new field definition.
     pub fn new(name: impl Into<String>) -> Self {
         Self {
             name: name.into(),
             dtype: FieldDtype::List,
+            cardinality: None,
             choices: None,
             description: None,
             threshold: None,
@@ -171,6 +288,12 @@ impl FieldDef {
     /// Set the data type.
     pub fn with_dtype(mut self, dtype: FieldDtype) -> Self {
         self.dtype = dtype;
+        self
+    }
+
+    /// Set the cardinality.
+    pub fn with_cardinality(mut self, cardinality: FieldCardinality) -> Self {
+        self.cardinality = Some(cardinality);
         self
     }
 
@@ -209,6 +332,12 @@ pub struct StructureDef {
     /// Field descriptions.
     #[serde(skip_serializing_if = "HashMap::is_empty", default)]
     pub descriptions: HashMap<String, String>,
+    /// Record decoding mode.
+    #[serde(default)]
+    pub mode: StructureMode,
+    /// Anchor field name for natural mode (defines record instances).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor: Option<String>,
 }
 
 impl StructureDef {
@@ -218,12 +347,26 @@ impl StructureDef {
             name: name.into(),
             fields: Vec::new(),
             descriptions: HashMap::new(),
+            mode: StructureMode::Default,
+            anchor: None,
         }
     }
 
     /// Add a field to the structure.
     pub fn add_field(mut self, field: FieldDef) -> Self {
         self.fields.push(field);
+        self
+    }
+
+    /// Set the record decoding mode.
+    pub fn with_mode(mut self, mode: StructureMode) -> Self {
+        self.mode = mode;
+        self
+    }
+
+    /// Set the anchor field for natural mode.
+    pub fn with_anchor(mut self, anchor: impl Into<String>) -> Self {
+        self.anchor = Some(anchor.into());
         self
     }
 }
@@ -729,9 +872,31 @@ impl Schema {
                     structure.name
                 )));
             }
+            if structure.mode == StructureMode::Natural {
+                let anchor = structure.anchor.as_deref().ok_or_else(|| {
+                    GlinerError::invalid_schema(format!(
+                        "Structure '{}' is in natural mode but has no anchor field",
+                        structure.name
+                    ))
+                })?;
+                if !structure.fields.iter().any(|f| f.name == anchor) {
+                    return Err(GlinerError::invalid_schema(format!(
+                        "Structure '{}' anchor field '{anchor}' is not among its fields",
+                        structure.name
+                    )));
+                }
+            }
             for field in &structure.fields {
                 if field.name.is_empty() {
                     return Err(GlinerError::invalid_schema("Field name cannot be empty"));
+                }
+                if let Some(card) = field.cardinality {
+                    if card.is_scalar() != (field.dtype == FieldDtype::Str) {
+                        return Err(GlinerError::invalid_schema(format!(
+                            "Field '{}.{}' cardinality '{}' is incompatible with dtype '{}'",
+                            structure.name, field.name, card, field.dtype
+                        )));
+                    }
                 }
                 if let Some(threshold) = field.threshold
                     && !(0.0..=1.0).contains(&threshold)
@@ -857,6 +1022,12 @@ impl Schema {
                                 "dtype".to_string(),
                                 serde_json::Value::String(field.dtype.to_string()),
                             );
+                            if let Some(card) = field.cardinality {
+                                field_obj.insert(
+                                    "cardinality".to_string(),
+                                    serde_json::Value::String(card.to_string()),
+                                );
+                            }
 
                             if let Some(choices) = &field.choices {
                                 field_obj.insert(
@@ -896,6 +1067,18 @@ impl Schema {
                         }
                     }
                     obj.insert(s.name.clone(), serde_json::Value::Object(fields));
+                    if s.mode == StructureMode::Natural {
+                        obj.insert(
+                            "__mode__".to_string(),
+                            serde_json::Value::String("natural".to_string()),
+                        );
+                        if let Some(anchor) = &s.anchor {
+                            obj.insert(
+                                "__anchor__".to_string(),
+                                serde_json::Value::String(anchor.clone()),
+                            );
+                        }
+                    }
                     serde_json::Value::Object(obj)
                 })
                 .collect();
@@ -1059,20 +1242,47 @@ impl Schema {
             {
                 for struct_value in struct_arr {
                     if let Some(struct_obj) = struct_value.as_object() {
+                        let mut mode = StructureMode::Default;
+                        let mut anchor: Option<String> = None;
                         for (name, fields_value) in struct_obj {
+                            if name == "__mode__" {
+                                if fields_value.as_str() == Some("natural") {
+                                    mode = StructureMode::Natural;
+                                }
+                                continue;
+                            }
+                            if name == "__anchor__" {
+                                anchor = fields_value.as_str().map(String::from);
+                                continue;
+                            }
                             let mut structure = StructureDef::new(name);
+                            structure.mode = mode;
+                            structure.anchor.clone_from(&anchor);
                             if let Some(fields_obj) = fields_value.as_object() {
                                 for (field_name, field_value) in fields_obj {
                                     let mut field = FieldDef::new(field_name);
-                                    if let Some(field_obj) = field_value.as_object()
-                                        && let Some(choices) =
+                                    if let Some(field_obj) = field_value.as_object() {
+                                        if let Some(dtype) =
+                                            field_obj.get("dtype").and_then(|v| v.as_str())
+                                            && let Ok(dt) = dtype.parse::<FieldDtype>()
+                                        {
+                                            field = field.with_dtype(dt);
+                                        }
+                                        if let Some(card) =
+                                            field_obj.get("cardinality").and_then(|v| v.as_str())
+                                            && let Ok(c) = card.parse::<FieldCardinality>()
+                                        {
+                                            field = field.with_cardinality(c);
+                                        }
+                                        if let Some(choices) =
                                             field_obj.get("choices").and_then(|v| v.as_array())
-                                    {
-                                        let choice_strings: Vec<String> = choices
-                                            .iter()
-                                            .filter_map(|v| v.as_str().map(String::from))
-                                            .collect();
-                                        field = field.with_choices(choice_strings);
+                                        {
+                                            let choice_strings: Vec<String> = choices
+                                                .iter()
+                                                .filter_map(|v| v.as_str().map(String::from))
+                                                .collect();
+                                            field = field.with_choices(choice_strings);
+                                        }
                                     }
                                     structure.fields.push(field);
                                 }
@@ -1274,7 +1484,10 @@ mod tests {
         let dict = schema.to_dict();
         let rels = dict.get("relations").and_then(|v| v.as_array()).unwrap();
         assert_eq!(rels.len(), 1);
-        let rel_obj = rels[0].get("rate_limit").and_then(|v| v.as_object()).unwrap();
+        let rel_obj = rels[0]
+            .get("rate_limit")
+            .and_then(|v| v.as_object())
+            .unwrap();
         assert!(rel_obj.contains_key("system"));
         assert!(rel_obj.contains_key("metric_value"));
 
