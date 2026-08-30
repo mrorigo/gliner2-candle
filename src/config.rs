@@ -250,6 +250,9 @@ pub struct BoundaryConfig {
     pub content_dim: usize,
     /// Pair-scoring representation dimension.
     pub pair_dim: usize,
+    /// Temperature dividing reranker pair logits before the span-confidence
+    /// sigmoid (mirrors `boundary_head.pair_temperature`, default 1.0).
+    pub pair_temperature: f32,
     /// Number of start boundaries kept per query.
     pub start_top_k: usize,
     /// Number of end boundaries kept per query.
@@ -295,6 +298,7 @@ impl Default for BoundaryConfig {
             boundary_dim: 128,
             content_dim: 64,
             pair_dim: 128,
+            pair_temperature: 1.0,
             start_top_k: 24,
             end_top_k: 24,
             ends_per_start: 12,
@@ -335,6 +339,9 @@ impl BoundaryConfig {
             }
             if let Some(x) = get_usize("pair_dim") {
                 config.pair_dim = x;
+            }
+            if let Some(x) = get_f32("pair_temperature") {
+                config.pair_temperature = x;
             }
             if let Some(x) = get_usize("start_top_k") {
                 config.start_top_k = x;

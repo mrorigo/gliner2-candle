@@ -304,6 +304,7 @@ fn decode_structure_records(
     );
 
     // --- Emit JSON records ---
+    let pair_temp = boundary.config.pair_temperature.max(f32::MIN_POSITIVE);
     let mut entries: Vec<JsonValue> = Vec::new();
     for rec in records {
         let mut rec_obj = serde_json::Map::new();
@@ -312,14 +313,32 @@ fn decode_structure_records(
                 continue;
             }
             let name = &fields[*f].name;
+            let qi = qids[*f];
+            let pool_cands = field_candidates.get(*f).cloned().unwrap_or_default();
             let mut span_jsons: Vec<JsonValue> = Vec::new();
             for (k, &(s, e)) in spans.iter().enumerate() {
-                let conf = rec
+                let assignment_conf = rec
                     .field_scores
                     .get(f)
                     .and_then(|v| v.get(k))
                     .copied()
                     .unwrap_or(0.0);
+                // candidate-span score: sigmoid(pair_logit / pair_temperature).
+                // Mirrors the reference `_candidate_span_probability` + the
+                // `min(candidate, assignment)` combination in `_format_field`.
+                let cand_prob = field_spans[*f]
+                    .iter()
+                    .position(|&sp| sp == (s, e))
+                    .and_then(|ci| pool_cands.get(ci))
+                    .and_then(|&pool_ci| scored.scores.get(pool_ci))
+                    .and_then(|row| row.get(qi))
+                    .map(|&lg| sigmoid(lg / pair_temp))
+                    .unwrap_or(0.0);
+                let conf = if *f == anchor_field_idx {
+                    cand_prob
+                } else {
+                    cand_prob.min(assignment_conf)
+                };
                 let char_start = char_offset(starts_map, s.min(text_len.saturating_sub(1)));
                 let char_end = char_offset(ends_map, (e.saturating_sub(1)).min(text_len - 1));
                 let text = safe_slice(original_text, char_start, char_end);
