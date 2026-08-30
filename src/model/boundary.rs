@@ -1908,14 +1908,14 @@ impl BoundaryModel {
             pair_scorer: PairScorer::load(bh.pp("pair_scorer"), hidden_size, &cfg)?,
             count_head: optional_linear(&bh, "count_head", cfg.enable_count_head)?,
             null_projection: optional_linear(&bh, "null_projection", true)?,
-            candidate_encoder: match vb.get(
+            candidate_encoder: match bh.get(
                 (hidden_size, 2 * cfg.boundary_dim),
                 "candidate_encoder.weight",
             ) {
                 Ok(_) => Some(linear(
                     2 * cfg.boundary_dim,
                     hidden_size,
-                    vb.pp("candidate_encoder"),
+                    bh.pp("candidate_encoder"),
                 )?),
                 Err(_) => None,
             },

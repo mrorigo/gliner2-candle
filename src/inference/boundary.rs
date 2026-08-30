@@ -203,7 +203,9 @@ fn decode_structure_records(
 
     let decoder = match &boundary.record_decoder {
         Some(d) => d,
-        None => return Ok(None),
+        None => {
+            return Ok(None);
+        }
     };
     let Some(ref states) = scored.candidate_states else {
         return Ok(None);
