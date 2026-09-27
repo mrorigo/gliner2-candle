@@ -7,6 +7,52 @@ versions remain `0.x` (pre-1.0, additive-only semver policy).
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-09-28
+
+Internal refactoring only. No public API, output format, or numeric change.
+
+### Changed
+
+- Structural erosion reduced from **76.06% to 71.08%**; the highest cyclomatic
+  complexity in the crate dropped from **101 to 68**. Verified across every
+  change by differential harnesses rather than by the test suite alone.
+
+Extracted, with byte-identical output before and after each step:
+
+- `src/inference/engine.rs`: the 30-line span-score input plumbing that
+  `extract_relations_from_output` and `extract_structures_from_output` held
+  **byte-identically**, plus a third near-copy in
+  `extract_entities_from_output` → `prepare_span_score_inputs`. Also the four
+  copies of the schema-marker scan → `marker_children`, and three copies of the
+  query-embedding gather → `gather_query_embeddings`.
+- `src/inference/boundary.rs`: `extract_sample` (459 → 158 lines) split into
+  `decode_entities` / `decode_records` / `decode_relations`; then
+  `relation_endpoint_candidates` and `enumerate_relation_pairs`; then
+  `entity_entry` and `relation_entry`.
+- `src/model/boundary.rs`: `score_spans` (331 → 253 lines, CC 101 → 68) split
+  into `marginal_logits` → `boundary_marginal` + `inside_marginal`,
+  `compose_candidates`, and `assemble_scores`.
+
+### Added
+
+- `tests/decide_test.rs` — GLiNER2.5-Decide classification coverage: single-label,
+  multi-label with threshold, several heads scored in one forward pass, labels
+  with descriptions, ordinal scales, and softmax confidence semantics.
+- Unit tests for `relation_endpoint_candidates` and
+  `enumerate_relation_pairs` (9 cases). Candidate selection was previously only
+  reachable through a checkpoint; the function is pure, so it is now tested
+  directly.
+
+### Notes
+
+- `gather_query_embeddings` preserves two deliberately different failure modes
+  that the previous inline code expressed asymmetrically: a slot past the end of
+  the embedding vector is zero-filled, while a present-but-unflattenable slot
+  returns `None`. Collapsing both would have silently dropped a schema.
+- `#[allow(clippy::too_many_arguments)]` on several new helpers, and one on the
+  candidate-composition loop, which is indexed deliberately because each output
+  row reads contiguous slices of four flattened weight matrices.
+
 ## [0.2.0] — 2026-09-27
 
 ### Added
