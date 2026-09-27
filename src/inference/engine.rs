@@ -67,6 +67,45 @@ pub type BatchExtractionResult = Vec<ExtractionResult>;
 /// )?;
 /// ```
 #[derive(Debug)]
+pub struct GLiNER2 {
+    /// The underlying extractor model.
+    model: Extractor,
+    /// Batch collator for inference.
+    collator: ExtractorCollator,
+    /// Default confidence threshold.
+    default_threshold: f32,
+    /// Device for inference.
+    device: Device,
+}
+
+/// Collect `(name, embedding_slot)` pairs for schema tokens following `marker`.
+///
+/// A schema group is a flat token list whose bracket tokens (`[P]`, `[E]`,
+/// `[L]`, `[C]`, `[R]`, parens) are each expanded to one special-token id, and
+/// the expanded row order is what the per-sample `schema_embeddings` vector is
+/// indexed by. So a child's embedding slot is the ordinal of its marker among
+/// *all* bracket tokens in the group, not its position among the children.
+///
+/// The folded classification prompt at index 2 deliberately does not count: it
+/// does not start with `[`, so it is not a marker. Getting that wrong silently
+/// shifts every label onto the wrong embedding.
+///
+/// Mirrors `boundary::build_queries`; the two must stay in step.
+fn marker_children(schema_tokens: &[String], marker: &str) -> Vec<(String, usize)> {
+    let mut out = Vec::new();
+    let mut slot = 0usize;
+    for (i, token) in schema_tokens.iter().enumerate() {
+        if !(token.starts_with('[') && token.ends_with(']')) {
+            continue;
+        }
+        if token == marker && i + 1 < schema_tokens.len() {
+            out.push((schema_tokens[i + 1].clone(), slot));
+        }
+        slot += 1;
+    }
+    out
+}
+
 /// Flattened span-scoring inputs, shared by the count-guided extraction paths.
 ///
 /// The relations, structures and entities decoders each need the same four
@@ -78,17 +117,6 @@ struct SpanScoreInputs {
     mask_data: Vec<u32>,
     spans_idx_data: Vec<u32>,
     mask_dims: Vec<usize>,
-}
-
-pub struct GLiNER2 {
-    /// The underlying extractor model.
-    model: Extractor,
-    /// Batch collator for inference.
-    collator: ExtractorCollator,
-    /// Default confidence threshold.
-    default_threshold: f32,
-    /// Device for inference.
-    device: Device,
 }
 
 impl GLiNER2 {
@@ -1175,21 +1203,11 @@ impl GLiNER2 {
 
         // Find entity type tokens (tokens following [E] markers)
         // Schema format: ["(", "[P]", "entities", "(", "[E]", "location", "[E]", "organization", "[E]", "person", ")", ")"]
-        let mut entity_types: Vec<String> = Vec::new();
-        let mut entity_type_indices: Vec<usize> = Vec::new();
-        let mut special_token_counter = 0;
-        for (i, token) in schema_tokens.iter().enumerate() {
-            if token.starts_with('[') && token.ends_with(']') {
-                if token == "[E]" && i + 1 < schema_tokens.len() {
-                    let entity_type = schema_tokens[i + 1].clone();
-                    if !entity_type.is_empty() {
-                        entity_types.push(entity_type);
-                        entity_type_indices.push(special_token_counter);
-                    }
-                }
-                special_token_counter += 1;
-            }
-        }
+        let (entity_types, entity_type_indices): (Vec<String>, Vec<usize>) =
+            marker_children(schema_tokens, "[E]")
+                .into_iter()
+                .filter(|(name, _)| !name.is_empty())
+                .unzip();
 
         if entity_types.is_empty() {
             return Ok(JsonValue::Object(entities));
@@ -1423,18 +1441,8 @@ impl GLiNER2 {
         let schema_tokens = batch.schema_tokens(sample_idx, schema_idx).ok_or_else(|| {
             GlinerError::inference("Missing schema tokens for classification task")
         })?;
-        let mut labels = Vec::new();
-        let mut label_emb_indices = Vec::new();
-        let mut special_token_counter = 0usize;
-        for (i, token) in schema_tokens.iter().enumerate() {
-            if token.starts_with('[') && token.ends_with(']') {
-                if token == "[L]" && i + 1 < schema_tokens.len() {
-                    labels.push(schema_tokens[i + 1].clone());
-                    label_emb_indices.push(special_token_counter);
-                }
-                special_token_counter += 1;
-            }
-        }
+        let (labels, label_emb_indices): (Vec<String>, Vec<usize>) =
+            marker_children(schema_tokens, "[L]").into_iter().unzip();
 
         if labels.is_empty() {
             return Ok(JsonValue::Null);
@@ -1556,18 +1564,8 @@ impl GLiNER2 {
         };
 
         // Relation fields are tokens that follow [R].
-        let mut field_names = Vec::new();
-        let mut field_emb_indices = Vec::new();
-        let mut special_token_counter = 0usize;
-        for (i, token) in schema_tokens.iter().enumerate() {
-            if token.starts_with('[') && token.ends_with(']') {
-                if token == "[R]" && i + 1 < schema_tokens.len() {
-                    field_names.push(schema_tokens[i + 1].clone());
-                    field_emb_indices.push(special_token_counter);
-                }
-                special_token_counter += 1;
-            }
-        }
+        let (field_names, field_emb_indices): (Vec<String>, Vec<usize>) =
+            marker_children(schema_tokens, "[R]").into_iter().unzip();
         if field_names.len() < 2 {
             return Ok(JsonValue::Array(Vec::new()));
         }
@@ -1745,18 +1743,8 @@ impl GLiNER2 {
         };
 
         // Structure fields are tokens that follow [C].
-        let mut field_names = Vec::new();
-        let mut field_emb_indices = Vec::new();
-        let mut special_token_counter = 0usize;
-        for (i, token) in schema_tokens.iter().enumerate() {
-            if token.starts_with('[') && token.ends_with(']') {
-                if token == "[C]" && i + 1 < schema_tokens.len() {
-                    field_names.push(schema_tokens[i + 1].clone());
-                    field_emb_indices.push(special_token_counter);
-                }
-                special_token_counter += 1;
-            }
-        }
+        let (field_names, field_emb_indices): (Vec<String>, Vec<usize>) =
+            marker_children(schema_tokens, "[C]").into_iter().unzip();
         if field_names.is_empty() {
             return Ok(JsonValue::Array(Vec::new()));
         }
