@@ -67,6 +67,19 @@ pub type BatchExtractionResult = Vec<ExtractionResult>;
 /// )?;
 /// ```
 #[derive(Debug)]
+/// Flattened span-scoring inputs, shared by the count-guided extraction paths.
+///
+/// The relations, structures and entities decoders each need the same four
+/// tensors flattened to contiguous buffers plus the mask dimensions, and each
+/// previously inlined its own copy of that plumbing.
+struct SpanScoreInputs {
+    struct_proj_data: Vec<f32>,
+    span_rep_data: Vec<f32>,
+    mask_data: Vec<u32>,
+    spans_idx_data: Vec<u32>,
+    mask_dims: Vec<usize>,
+}
+
 pub struct GLiNER2 {
     /// The underlying extractor model.
     model: Extractor,
@@ -1183,9 +1196,9 @@ impl GLiNER2 {
         }
 
         // Get span rep shape: (seq_len, max_width, hidden_size)
+        // span_mask / spans_idx are read via `span_output` in
+        // `prepare_span_score_inputs` below, so only span_rep is needed here.
         let span_rep = &span_output.span_rep;
-        let span_mask = &span_output.span_mask;
-        let spans_idx = &span_output.spans_idx;
 
         let dims = span_rep.dims();
         if dims.len() != 3 {
@@ -1247,42 +1260,25 @@ impl GLiNER2 {
         let Some(count_embed) = self.model.count_embed.as_ref() else {
             return Ok(JsonValue::Object(entities));
         };
-        let struct_proj = match count_embed.forward(&entity_embs_tensor, pred_count) {
-            Ok(out) => out.embeddings,
-            Err(_) => return Ok(JsonValue::Object(entities)),
+        let Some(inputs) = Self::prepare_span_score_inputs(
+            count_embed,
+            &entity_embs_tensor,
+            pred_count,
+            span_output,
+        ) else {
+            return Ok(JsonValue::Object(entities));
         };
-
-        // Get struct_proj as flat data: (pred_count, num_entity_types, hidden)
-        let struct_proj_data: Vec<f32> = match struct_proj.flatten_all() {
-            Ok(t) => t.to_vec1().unwrap_or_default(),
-            Err(_) => return Ok(JsonValue::Object(entities)),
-        };
-
-        // Get span mask dimensions
-        let span_mask_dims = span_mask.dims();
-        if span_mask_dims.len() != 2 {
+        let SpanScoreInputs {
+            struct_proj_data,
+            span_rep_data,
+            mask_data,
+            spans_idx_data,
+            mask_dims,
+        } = inputs;
+        if mask_dims.len() != 2 {
             return Ok(JsonValue::Object(entities));
         }
-        let mask_seq_len = span_mask_dims[0];
-        let mask_max_width = span_mask_dims[1];
-
-        // Get span mask as flat vector
-        let mask_data: Vec<u32> = match span_mask.flatten_all() {
-            Ok(t) => t.to_vec1().unwrap_or_default(),
-            Err(_) => return Ok(JsonValue::Object(entities)),
-        };
-
-        // Get span reps as flat data: (seq_len, max_width, hidden)
-        let span_rep_data: Vec<f32> = match span_rep.flatten_all() {
-            Ok(t) => t.to_vec1().unwrap_or_default(),
-            Err(_) => return Ok(JsonValue::Object(entities)),
-        };
-
-        // Get spans indices
-        let spans_idx_data: Vec<u32> = match spans_idx.flatten_all() {
-            Ok(t) => t.to_vec1().unwrap_or_default(),
-            Err(_) => return Ok(JsonValue::Object(entities)),
-        };
+        let (mask_seq_len, mask_max_width) = (mask_dims[0], mask_dims[1]);
 
         // Step 4: Compute scores using einsum-like operation
         // Python: torch.einsum("lkd,bpd->bplk", span_rep, struct_proj)
@@ -1615,29 +1611,21 @@ impl GLiNER2 {
         let Some(count_embed) = self.model.count_embed.as_ref() else {
             return Ok(JsonValue::Array(Vec::new()));
         };
-        let struct_proj = match count_embed.forward(&field_embs_tensor, pred_count) {
-            Ok(out) => out.embeddings,
-            Err(_) => return Ok(JsonValue::Array(Vec::new())),
+        let Some(inputs) = Self::prepare_span_score_inputs(
+            count_embed,
+            &field_embs_tensor,
+            pred_count,
+            span_outputs,
+        ) else {
+            return Ok(JsonValue::Array(Vec::new()));
         };
-
-        let struct_proj_data: Vec<f32> = match struct_proj.flatten_all() {
-            Ok(t) => t.to_vec1().unwrap_or_default(),
-            Err(_) => return Ok(JsonValue::Array(Vec::new())),
-        };
-        let span_rep_data: Vec<f32> = match span_outputs.span_rep.flatten_all() {
-            Ok(t) => t.to_vec1().unwrap_or_default(),
-            Err(_) => return Ok(JsonValue::Array(Vec::new())),
-        };
-        let mask_data: Vec<u32> = match span_outputs.span_mask.flatten_all() {
-            Ok(t) => t.to_vec1().unwrap_or_default(),
-            Err(_) => return Ok(JsonValue::Array(Vec::new())),
-        };
-        let spans_idx_data: Vec<u32> = match span_outputs.spans_idx.flatten_all() {
-            Ok(t) => t.to_vec1().unwrap_or_default(),
-            Err(_) => return Ok(JsonValue::Array(Vec::new())),
-        };
-
-        let mask_dims = span_outputs.span_mask.dims();
+        let SpanScoreInputs {
+            struct_proj_data,
+            span_rep_data,
+            mask_data,
+            spans_idx_data,
+            mask_dims,
+        } = inputs;
         if mask_dims.len() != 2 {
             return Ok(JsonValue::Array(Vec::new()));
         }
@@ -1812,29 +1800,21 @@ impl GLiNER2 {
         let Some(count_embed) = self.model.count_embed.as_ref() else {
             return Ok(JsonValue::Array(Vec::new()));
         };
-        let struct_proj = match count_embed.forward(&field_embs_tensor, pred_count) {
-            Ok(out) => out.embeddings,
-            Err(_) => return Ok(JsonValue::Array(Vec::new())),
+        let Some(inputs) = Self::prepare_span_score_inputs(
+            count_embed,
+            &field_embs_tensor,
+            pred_count,
+            span_outputs,
+        ) else {
+            return Ok(JsonValue::Array(Vec::new()));
         };
-
-        let struct_proj_data: Vec<f32> = match struct_proj.flatten_all() {
-            Ok(t) => t.to_vec1().unwrap_or_default(),
-            Err(_) => return Ok(JsonValue::Array(Vec::new())),
-        };
-        let span_rep_data: Vec<f32> = match span_outputs.span_rep.flatten_all() {
-            Ok(t) => t.to_vec1().unwrap_or_default(),
-            Err(_) => return Ok(JsonValue::Array(Vec::new())),
-        };
-        let mask_data: Vec<u32> = match span_outputs.span_mask.flatten_all() {
-            Ok(t) => t.to_vec1().unwrap_or_default(),
-            Err(_) => return Ok(JsonValue::Array(Vec::new())),
-        };
-        let spans_idx_data: Vec<u32> = match span_outputs.spans_idx.flatten_all() {
-            Ok(t) => t.to_vec1().unwrap_or_default(),
-            Err(_) => return Ok(JsonValue::Array(Vec::new())),
-        };
-
-        let mask_dims = span_outputs.span_mask.dims();
+        let SpanScoreInputs {
+            struct_proj_data,
+            span_rep_data,
+            mask_data,
+            spans_idx_data,
+            mask_dims,
+        } = inputs;
         if mask_dims.len() != 2 {
             return Ok(JsonValue::Array(Vec::new()));
         }
@@ -1919,6 +1899,31 @@ impl GLiNER2 {
         }
 
         Ok(JsonValue::Array(instances))
+    }
+
+    /// Build [`SpanScoreInputs`], or `None` if any tensor is unavailable.
+    ///
+    /// `field_embs` is the query-embedding tensor to run through `count_embed`,
+    /// and `pred_count` is the number of count steps. A `None` result means the
+    /// caller cannot produce a scored span and should return its empty value,
+    /// which is what every call site did inline before this was factored out.
+    fn prepare_span_score_inputs(
+        count_embed: &crate::model::count_embed::CountEmbedLayer,
+        field_embs: &Tensor,
+        pred_count: usize,
+        span_outputs: &crate::model::span_rep::SpanRepOutput,
+    ) -> Option<SpanScoreInputs> {
+        let struct_proj = count_embed.forward(field_embs, pred_count).ok()?.embeddings;
+        let to_f32 = |t: &Tensor| t.flatten_all().ok()?.to_vec1::<f32>().ok();
+        let to_u32 = |t: &Tensor| t.flatten_all().ok()?.to_vec1::<u32>().ok();
+
+        Some(SpanScoreInputs {
+            struct_proj_data: to_f32(&struct_proj)?,
+            span_rep_data: to_f32(&span_outputs.span_rep)?,
+            mask_data: to_u32(&span_outputs.span_mask)?,
+            spans_idx_data: to_u32(&span_outputs.spans_idx)?,
+            mask_dims: span_outputs.span_mask.dims().to_vec(),
+        })
     }
 
     fn predicted_count(
