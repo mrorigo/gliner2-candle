@@ -8,3 +8,7 @@ GLiNER2
 
 /target
 claw-code
+
+# Slop Gate index artifacts (bound to a commit + policy; rebuildable)
+/.slop-gate/
+slop-gate.sarif

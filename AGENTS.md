@@ -258,6 +258,50 @@ character offsets still index the original string.
 - Encoder `max_position_embeddings: 512` is NOT an input cap — DeBERTa uses
   relative positions (`position_buckets: 256` → rel table 512 rows).
 
+## 🧹 Code quality: Slop Gate
+
+This repo is gated by [Slop Gate](https://github.com/mrorigo/slop-gate), which
+measures newly introduced Rust debt (function growth, near-clones, lint
+suppressions, `unsafe` surface, dependency surface, structural erosion).
+
+- Policy: `.slop-gate.toml` at the root — warning-only defaults, schema
+  version 1. Do not edit it, add suppressions, or change severities to make a
+  check pass. Ask first.
+- CI: `.github/workflows/slop-gate.yml` indexes `main` on push and runs
+  `slop-gate check` on every PR, uploading SARIF to code scanning.
+
+Before opening a PR:
+
+```sh
+cargo install slop-gate --locked   # once
+BASE="$(git rev-parse origin/main)"
+mkdir -p .slop-gate
+slop-gate index --ref "$BASE" --output .slop-gate/main.json
+slop-gate check --base "$BASE" --head HEAD --index .slop-gate/main.json --format human
+```
+
+The index artifact is bound to both the commit and the policy — rebuild it if
+either changes. `.slop-gate/` is gitignored. `check` only accepts committed
+revisions; use `scan --working-tree` for uncommitted edits.
+
+Exit status: `0` no errors, `1` unsuppressed errors, `2` operational failure
+(stop and report — do not read it as a quality result). **Warnings are findings,
+not failures** — do not promote them to errors or reclassify `2`.
+
+### Standing findings on `main` (do not re-investigate)
+`main` sits at ~76% structural erosion (cutoff 10) with 34 near-clone warnings,
+mostly repetitive constructor patterns and test duplication. The worst
+contributors, useful targets for future refactors:
+
+| Function | CC | Mass |
+| --- | --- | --- |
+| `BoundaryModel::score_spans` (`src/model/boundary.rs:1755`) | 101 | 1717 |
+| `extract_sample` (`src/inference/boundary.rs:122`) | 61 | 1118 |
+| `GLiNER2::extract_entities_from_output` (`src/inference/engine.rs:1107`) | 59 | 948 |
+
+`slop-gate history --ref HEAD --count 20` tracks how these move. A PR that
+lowers erosion is a win even if the absolute number looks bad.
+
 ## 🧪 Testing
 
 ### Run All Tests

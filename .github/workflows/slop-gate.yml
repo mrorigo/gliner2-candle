@@ -1,0 +1,91 @@
+name: Slop Gate
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+  actions: read
+  security-events: write
+
+env:
+  SLOP_GATE_RELEASE: latest
+
+  # This workflow is also a copyable template for consumer repositories. It
+  # installs a published binary and does not compile the consumer package.
+  # Pin SLOP_GATE_RELEASE to a tag when reproducible tool selection is needed.
+
+jobs:
+  index-main:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install Slop Gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          asset="slop-gate-x86_64-unknown-linux-gnu.tar.gz"
+          if [[ "$SLOP_GATE_RELEASE" == "latest" ]]; then
+            base_url="https://github.com/mrorigo/slop-gate/releases/latest/download"
+          else
+            base_url="https://github.com/mrorigo/slop-gate/releases/download/${SLOP_GATE_RELEASE}"
+          fi
+          mkdir -p "$RUNNER_TEMP/slop-gate/bin"
+          curl --fail --location --retry 3 "$base_url/$asset" --output "$RUNNER_TEMP/$asset"
+          curl --fail --location --retry 3 "$base_url/checksums.sha256" --output "$RUNNER_TEMP/checksums.sha256"
+          checksum="$(awk -v asset="$asset" '$2 == asset { print $1; exit }' "$RUNNER_TEMP/checksums.sha256")"
+          test -n "$checksum"
+          printf '%s  %s\n' "$checksum" "$RUNNER_TEMP/$asset" | sha256sum --check
+          tar -xzf "$RUNNER_TEMP/$asset" -C "$RUNNER_TEMP/slop-gate/bin"
+          echo "$RUNNER_TEMP/slop-gate/bin" >> "$GITHUB_PATH"
+      - run: mkdir -p .slop-gate
+      - run: slop-gate index --ref HEAD --output .slop-gate/index.json
+      - uses: actions/cache/save@v4
+        with:
+          path: .slop-gate/index.json
+          key: slop-gate-index-${{ github.sha }}
+
+  check-pr:
+    if: github.event_name == 'pull_request'
+    permissions:
+      contents: read
+      security-events: write
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install Slop Gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          asset="slop-gate-x86_64-unknown-linux-gnu.tar.gz"
+          if [[ "$SLOP_GATE_RELEASE" == "latest" ]]; then
+            base_url="https://github.com/mrorigo/slop-gate/releases/latest/download"
+          else
+            base_url="https://github.com/mrorigo/slop-gate/releases/download/${SLOP_GATE_RELEASE}"
+          fi
+          mkdir -p "$RUNNER_TEMP/slop-gate/bin"
+          curl --fail --location --retry 3 "$base_url/$asset" --output "$RUNNER_TEMP/$asset"
+          curl --fail --location --retry 3 "$base_url/checksums.sha256" --output "$RUNNER_TEMP/checksums.sha256"
+          checksum="$(awk -v asset="$asset" '$2 == asset { print $1; exit }' "$RUNNER_TEMP/checksums.sha256")"
+          test -n "$checksum"
+          printf '%s  %s\n' "$checksum" "$RUNNER_TEMP/$asset" | sha256sum --check
+          tar -xzf "$RUNNER_TEMP/$asset" -C "$RUNNER_TEMP/slop-gate/bin"
+          echo "$RUNNER_TEMP/slop-gate/bin" >> "$GITHUB_PATH"
+      - uses: actions/cache/restore@v4
+        id: restore-index
+        with:
+          path: .slop-gate/index.json
+          key: slop-gate-index-${{ github.event.pull_request.base.sha }}
+      - if: steps.restore-index.outputs.cache-hit != 'true'
+        run: mkdir -p .slop-gate && slop-gate index --ref ${{ github.event.pull_request.base.sha }} --output .slop-gate/index.json
+      - run: slop-gate check --base ${{ github.event.pull_request.base.sha }} --head HEAD --index .slop-gate/index.json --format sarif > slop-gate.sarif
+      - uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: slop-gate.sarif
