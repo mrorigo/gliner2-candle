@@ -43,6 +43,10 @@ struct QuerySpec {
     marker_pos: usize,
 }
 
+/// A half-open token span `(start, end)`, the unit the pool and entity decoders
+/// pass around. Named because it appears in nearly every signature here.
+type SpanPair = (usize, usize);
+
 /// Metadata for a single relation type within a schema group.
 struct RelationSpec {
     /// Schema group index.
@@ -586,6 +590,80 @@ fn decode_records(
     Ok(())
 }
 
+/// Choose the endpoint candidates a relation may connect.
+///
+/// Prefers spans already decoded for the argument's own entity type, falling
+/// back to all canonical entity spans when that type produced none. When the
+/// schema has no entity group at all, falls back to the argument's own query
+/// proposals resolved under the same flat overlap policy used for entities.
+///
+/// Pure: depends only on its arguments, so it is unit-tested directly rather
+/// than through a checkpoint.
+#[allow(clippy::too_many_arguments)]
+fn relation_endpoint_candidates(
+    h_name: &str,
+    t_name: &str,
+    h_qid: usize,
+    t_qid: usize,
+    scored: &SharedPoolScores,
+    threshold: f32,
+    all_entity_spans_by_type: &HashMap<String, Vec<SpanPair>>,
+    all_canonical_entity_spans: &HashSet<SpanPair>,
+) -> (Vec<SpanPair>, Vec<SpanPair>) {
+    if !all_canonical_entity_spans.is_empty() {
+        let by_type = |name: &str| -> Vec<SpanPair> {
+            let mut spans = all_entity_spans_by_type
+                .get(name)
+                .cloned()
+                .unwrap_or_else(|| all_canonical_entity_spans.iter().copied().collect());
+            spans.sort_unstable();
+            spans
+        };
+        return (by_type(h_name), by_type(t_name));
+    }
+
+    // Fallback when no entity group is in schema: use role query proposals.
+    let role_proposals = |qid: usize| -> Vec<SpanPair> {
+        let mut hits: Vec<(usize, usize, f32)> = Vec::new();
+        for ci in 0..scored.valid.len() {
+            if !scored.valid[ci] {
+                continue;
+            }
+            let score = scored.scores[ci][qid];
+            if score > MASK_LOGIT / 2.0 {
+                let prob = sigmoid(score);
+                if prob >= threshold {
+                    hits.push((scored.starts[ci], scored.ends[ci], prob));
+                }
+            }
+        }
+        resolve_flat_spans(hits.into_iter().map(|(st, e, pr)| (pr, st, e)).collect())
+            .into_iter()
+            .map(|(_, st, e)| (st, e))
+            .collect()
+    };
+    (role_proposals(h_qid), role_proposals(t_qid))
+}
+
+/// All head-tail endpoint combinations, excluding self-loops.
+fn enumerate_relation_pairs(
+    head_cands: &[SpanPair],
+    tail_cands: &[SpanPair],
+) -> (Vec<SpanPair>, Vec<SpanPair>) {
+    let mut pair_heads: Vec<SpanPair> = Vec::new();
+    let mut pair_tails: Vec<SpanPair> = Vec::new();
+    for &hs in head_cands {
+        for &ts in tail_cands {
+            if hs == ts {
+                continue; // no self-loops
+            }
+            pair_heads.push(hs);
+            pair_tails.push(ts);
+        }
+    }
+    (pair_heads, pair_tails)
+}
+
 /// Decode one `"relations"` group into `result`.
 ///
 /// Endpoints come from the canonical entity spans collected by the first pass,
@@ -636,81 +714,18 @@ fn decode_relations(
                 let h_name = &specs[h_qid].name;
                 let t_name = &specs[t_qid].name;
 
-                let (head_cands, tail_cands) = if !all_canonical_entity_spans.is_empty() {
-                    let mut hc: Vec<(usize, usize)> =
-                        if let Some(type_spans) = all_entity_spans_by_type.get(h_name) {
-                            type_spans.clone()
-                        } else {
-                            all_canonical_entity_spans.iter().copied().collect()
-                        };
-                    hc.sort_unstable();
-                    let mut tc: Vec<(usize, usize)> =
-                        if let Some(type_spans) = all_entity_spans_by_type.get(t_name) {
-                            type_spans.clone()
-                        } else {
-                            all_canonical_entity_spans.iter().copied().collect()
-                        };
-                    tc.sort_unstable();
-                    (hc, tc)
-                } else {
-                    // Fallback when no entity group is in schema: use role query proposals
-                    let mut head_hits: Vec<(usize, usize, f32)> = Vec::new();
-                    for ci in 0..scored.valid.len() {
-                        if !scored.valid[ci] {
-                            continue;
-                        }
-                        let h_score = scored.scores[ci][h_qid];
-                        if h_score > MASK_LOGIT / 2.0 {
-                            let prob = sigmoid(h_score);
-                            if prob >= threshold {
-                                head_hits.push((scored.starts[ci], scored.ends[ci], prob));
-                            }
-                        }
-                    }
-                    let resolved_heads = resolve_flat_spans(
-                        head_hits.into_iter().map(|(st, e, p)| (p, st, e)).collect(),
-                    );
-                    let hc: Vec<(usize, usize)> = resolved_heads
-                        .into_iter()
-                        .map(|(_, st, e)| (st, e))
-                        .collect();
+                let (head_cands, tail_cands) = relation_endpoint_candidates(
+                    h_name,
+                    t_name,
+                    h_qid,
+                    t_qid,
+                    scored,
+                    threshold,
+                    all_entity_spans_by_type,
+                    all_canonical_entity_spans,
+                );
 
-                    let mut tail_hits: Vec<(usize, usize, f32)> = Vec::new();
-                    for ci in 0..scored.valid.len() {
-                        if !scored.valid[ci] {
-                            continue;
-                        }
-                        let t_score = scored.scores[ci][t_qid];
-                        if t_score > MASK_LOGIT / 2.0 {
-                            let prob = sigmoid(t_score);
-                            if prob >= threshold {
-                                tail_hits.push((scored.starts[ci], scored.ends[ci], prob));
-                            }
-                        }
-                    }
-                    let resolved_tails = resolve_flat_spans(
-                        tail_hits.into_iter().map(|(st, e, p)| (p, st, e)).collect(),
-                    );
-                    let tc: Vec<(usize, usize)> = resolved_tails
-                        .into_iter()
-                        .map(|(_, st, e)| (st, e))
-                        .collect();
-
-                    (hc, tc)
-                };
-
-                // Generate all head×tail pairs, skip self-loops.
-                let mut pair_heads: Vec<(usize, usize)> = Vec::new();
-                let mut pair_tails: Vec<(usize, usize)> = Vec::new();
-                for &hs in &head_cands {
-                    for &ts in &tail_cands {
-                        if hs == ts {
-                            continue; // no self-loops
-                        }
-                        pair_heads.push(hs);
-                        pair_tails.push(ts);
-                    }
-                }
+                let (pair_heads, pair_tails) = enumerate_relation_pairs(&head_cands, &tail_cands);
                 if !pair_heads.is_empty() {
                     let pair_scores =
                         rs.forward(&word_states, &qr, &pair_heads, &pair_tails, text_len)?;
@@ -1327,4 +1342,187 @@ fn softmax_conf(best: f32, all: &[f32]) -> f32 {
     let exps: Vec<f32> = all.iter().map(|v| (v - max).exp()).collect();
     let sum: f32 = exps.iter().sum();
     ((best - max).exp()) / sum.max(f32::MIN_POSITIVE)
+}
+
+#[cfg(test)]
+mod endpoint_tests {
+    use super::*;
+
+    /// Build a `SharedPoolScores` from `(start, end, valid, logit_q0, logit_delta)`
+    /// rows. `logit_delta` is added per query index, so one row can make
+    /// different queries agree or disagree about the same candidate.
+    ///
+    /// Validity is explicit rather than derived: a logit of exactly 0.0 is a
+    /// legitimate real score, not a padding slot.
+    fn scores(cands: &[(usize, usize, bool, f32, f32)], n_q: usize) -> SharedPoolScores {
+        SharedPoolScores {
+            starts: cands.iter().map(|c| c.0).collect(),
+            ends: cands.iter().map(|c| c.1).collect(),
+            valid: cands.iter().map(|c| c.2).collect(),
+            scores: (0..cands.len())
+                .map(|ci| {
+                    (0..n_q)
+                        .map(|qi| cands[ci].3 + (qi as f32) * cands[ci].4)
+                        .collect()
+                })
+                .collect(),
+            candidate_states: None,
+            boundary_states: None,
+            debug_terms: None,
+            debug_candidates: None,
+        }
+    }
+
+    fn types(pairs: &[(&str, &[SpanPair])]) -> HashMap<String, Vec<SpanPair>> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_vec()))
+            .collect()
+    }
+
+    /// The canonical-span branch, table-driven: how each argument's candidates
+    /// are chosen when the schema decoded at least one entity group.
+    ///
+    /// Rows are `(name, by_type, all_canonical, expected_head, expected_tail)`.
+    /// `name` labels the case in the assertion message.
+    #[test]
+    fn canonical_span_selection() {
+        let s = scores(&[(0, 1, true, 0.0, 0.0)], 2);
+        let cases: &[(
+            &str,
+            &[(&str, &[SpanPair])],
+            &[SpanPair],
+            Vec<SpanPair>,
+            Vec<SpanPair>,
+        )] = &[
+            (
+                "prefers each argument's own type",
+                &[("person", &[(0, 1), (2, 3)]), ("company", &[(4, 5)])],
+                &[(0, 1), (2, 3), (4, 5)],
+                vec![(0, 1), (2, 3)],
+                vec![(4, 5)],
+            ),
+            (
+                "widens to all canonical spans when a type decoded nothing",
+                &[("person", &[(0, 1)])],
+                &[(0, 1), (4, 5), (6, 7)],
+                vec![(0, 1)],
+                vec![(0, 1), (4, 5), (6, 7)],
+            ),
+            (
+                "sorts each side independently",
+                &[("person", &[(9, 10), (0, 1)]), ("company", &[(7, 8)])],
+                &[(9, 10), (0, 1), (7, 8)],
+                vec![(0, 1), (9, 10)],
+                vec![(7, 8)],
+            ),
+        ];
+
+        for (name, by_type, all, want_h, want_t) in cases {
+            let all: HashSet<SpanPair> = all.iter().copied().collect();
+            let (h, t) = relation_endpoint_candidates(
+                "person",
+                "company",
+                0,
+                1,
+                &s,
+                0.5,
+                &types(by_type),
+                &all,
+            );
+            assert_eq!(h, *want_h, "head side: {name}");
+            assert_eq!(t, *want_t, "tail side: {name}");
+        }
+    }
+
+    #[test]
+    fn no_entity_group_falls_back_to_role_proposals() {
+        let all: HashSet<SpanPair> = HashSet::new();
+        // Both candidates score 5.0 for q0 and -1.0 for q1 (sigmoid 0.27, below
+        // the 0.5 threshold). Note the boundary: a logit of exactly 0.0 gives
+        // sigmoid 0.5, which `prob >= threshold` accepts.
+        let s = scores(&[(0, 1, true, 5.0, -6.0), (2, 3, true, 5.0, -6.0)], 2);
+        let (h, t) =
+            relation_endpoint_candidates("head", "tail", 0, 1, &s, 0.5, &HashMap::new(), &all);
+        assert_eq!(h, vec![(0, 1), (2, 3)]);
+        assert!(t.is_empty(), "q1 rejects both candidates, got {t:?}");
+
+        // Now let only the second candidate fire for q1.
+        let s = scores(&[(0, 1, true, 5.0, -6.0), (2, 3, true, -1.0, 6.0)], 2);
+        let (_, t) =
+            relation_endpoint_candidates("head", "tail", 0, 1, &s, 0.5, &HashMap::new(), &all);
+        assert_eq!(t, vec![(2, 3)]);
+    }
+
+    #[test]
+    fn role_proposals_respect_threshold() {
+        let all: HashSet<SpanPair> = HashSet::new();
+        // logit 0.0 -> sigmoid 0.5 exactly, so a 0.6 threshold drops it.
+        let s = scores(&[(0, 1, true, 0.0, 0.0), (2, 3, true, 2.0, 0.0)], 1);
+        let (h, _) =
+            relation_endpoint_candidates("head", "tail", 0, 0, &s, 0.6, &HashMap::new(), &all);
+        assert_eq!(h, vec![(2, 3)], "the 0.5-probability candidate is filtered");
+    }
+
+    #[test]
+    fn role_proposals_ignore_masked_and_invalid_slots() {
+        let all: HashSet<SpanPair> = HashSet::new();
+        let mut s = scores(&[(0, 1, false, 9.0, 0.0), (2, 3, true, 9.0, 0.0)], 1);
+        s.scores[1][0] = MASK_LOGIT; // valid, but below the MASK_LOGIT/2 gate
+        let (h, _) =
+            relation_endpoint_candidates("head", "tail", 0, 0, &s, 0.5, &HashMap::new(), &all);
+        assert!(h.is_empty(), "both slots must be excluded, got {h:?}");
+    }
+
+    #[test]
+    fn role_proposals_resolve_overlaps_flat() {
+        let all: HashSet<SpanPair> = HashSet::new();
+        // The flat overlap policy maximises the TOTAL score of a non-overlapping
+        // subset, not the single highest-scoring span. Here (0,2)+(2,4) scores
+        // about 1.91 together against (0,4) at 0.993, so both survive.
+        let s = scores(
+            &[
+                (0, 4, true, 5.0, 0.0),
+                (0, 2, true, 3.0, 0.0),
+                (2, 4, true, 3.0, 0.0),
+            ],
+            1,
+        );
+        let (h, _) =
+            relation_endpoint_candidates("head", "tail", 0, 0, &s, 0.5, &HashMap::new(), &all);
+        assert_eq!(h, vec![(0, 2), (2, 4)]);
+
+        // When one span does dominate the sum, it wins alone.
+        let s = scores(&[(0, 9, true, 9.0, 0.0), (0, 2, true, 1.0, 0.0)], 1);
+        let (h, _) =
+            relation_endpoint_candidates("head", "tail", 0, 0, &s, 0.5, &HashMap::new(), &all);
+        assert_eq!(h, vec![(0, 9)]);
+    }
+
+    #[test]
+    fn pair_enumeration_is_a_cross_product_minus_self_loops() {
+        let (ph, pt) = enumerate_relation_pairs(&[(0, 1), (2, 3)], &[(2, 3), (4, 5)]);
+        assert_eq!(ph, vec![(0, 1), (0, 1), (2, 3)]);
+        assert_eq!(pt, vec![(2, 3), (4, 5), (4, 5)]);
+        assert!(
+            !ph.iter().zip(&pt).any(|(a, b)| a == b),
+            "(2,3) x (2,3) is a self-loop and must be dropped"
+        );
+    }
+
+    #[test]
+    fn pair_enumeration_with_no_candidates_is_empty() {
+        let (ph, pt) = enumerate_relation_pairs(&[], &[(0, 1)]);
+        assert!(ph.is_empty() && pt.is_empty());
+    }
+
+    #[test]
+    fn identical_candidate_sets_keep_only_the_cross_pairings() {
+        let (ph, pt) = enumerate_relation_pairs(&[(0, 1), (2, 3)], &[(0, 1), (2, 3)]);
+        assert_eq!(
+            (ph, pt),
+            (vec![(0, 1), (2, 3)], vec![(2, 3), (0, 1)]),
+            "the two diagonal self-loops are dropped, the two off-diagonal pairs remain"
+        );
+    }
 }
