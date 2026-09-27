@@ -11,11 +11,16 @@ permissions:
   security-events: write
 
 env:
-  SLOP_GATE_RELEASE: latest
+  SLOP_GATE_RELEASE: v0.5.0
 
   # This workflow is also a copyable template for consumer repositories. It
   # installs a published binary and does not compile the consumer package.
-  # Pin SLOP_GATE_RELEASE to a tag when reproducible tool selection is needed.
+  #
+  # Pinned rather than `latest`: index artifacts embed the writing tool's schema
+  # version and are not readable across a major bump, so an unpinned tool
+  # silently invalidates every cached artifact and fails open PRs with
+  # "invalid artifact version". The cache keys below are scoped by this same
+  # value, so bumping the pin is all that is needed to move tool versions.
 
 jobs:
   index-main:
@@ -48,7 +53,7 @@ jobs:
       - uses: actions/cache/save@v4
         with:
           path: .slop-gate/index.json
-          key: slop-gate-index-${{ github.sha }}
+          key: slop-gate-index-${{ env.SLOP_GATE_RELEASE }}-${{ github.sha }}
 
   check-pr:
     if: github.event_name == 'pull_request'
@@ -82,7 +87,7 @@ jobs:
         id: restore-index
         with:
           path: .slop-gate/index.json
-          key: slop-gate-index-${{ github.event.pull_request.base.sha }}
+          key: slop-gate-index-${{ env.SLOP_GATE_RELEASE }}-${{ github.event.pull_request.base.sha }}
       - if: steps.restore-index.outputs.cache-hit != 'true'
         run: mkdir -p .slop-gate && slop-gate index --ref ${{ github.event.pull_request.base.sha }} --output .slop-gate/index.json
       - run: slop-gate check --base ${{ github.event.pull_request.base.sha }} --head HEAD --index .slop-gate/index.json --format sarif > slop-gate.sarif
