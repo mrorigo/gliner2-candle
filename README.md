@@ -29,6 +29,51 @@ report against the Python reference across all four task types:
 The GLiNER2 (span-enumeration) pipeline also produces entity/classification/
 relation/structure outputs that match the Python reference.
 
+## 🎯 GLiNER2.5-Decide Support (zero-shot classification)
+
+The [GLiNER2.5-Decide](https://huggingface.co/fastino/GLiNER2.5-Decide) family is
+a zero-shot classification specialist: pass any label set at call time, get one
+label (or all labels above a threshold) back in a single forward pass. It is not
+a new architecture — it reuses the existing `classifier` head over `[L]`-marked
+label embeddings, so the span and boundary pipelines both run it unchanged.
+
+| Checkpoint | Architecture | Encoder | Status |
+|------------|--------------|---------|--------|
+| [`fastino/GLiNER2.5-Decide`](https://huggingface.co/fastino/GLiNER2.5-Decide) (340M) | span | DeBERTa-v3-large, 1024d/24L | ✅ |
+| [`fastino/GLiNER2.5-multi-Decide`](https://huggingface.co/fastino/GLiNER2.5-multi-Decide) (287M) | boundary | mdeberta-v3-base | ✅ multilingual |
+| `fastino/GLiNER2.5-Decide-1B` | span | ModernBERT, 1792d/28L | ❌ needs a ModernBERT encoder |
+
+```rust
+// Single label from a nine-way intent set.
+let res = engine.classify_text(
+    "My subscription renewed on April 15 and I want a refund.",
+    &[("intent".into(), vec!["order_status".into(), "refund_request".into(), /* … */])],
+    None, false, None,
+)?;
+// {"intent": "refund_request"}
+
+// Several heads in ONE forward pass, including a multi-label one.
+let schema = SchemaBuilder::new()
+    .classification("intent", intent_labels).done()
+    .classification("urgency", ["low", "normal", "high", "critical"]).done()
+    .classification("topics", topic_labels)
+    .multi_label(true)
+    .threshold(0.4)
+    .done()
+    .build()?;
+```
+
+Also supported: labels carrying descriptions (`.label_descriptions(..)`),
+a per-task instruction (`.prompt(..)`), few-shot `.examples(..)`, and ordinal
+scales passed as ordinary strings.
+
+> **Entity extraction is unavailable on Decide checkpoints.** They ship
+> `counting_layer: "count_lstm"` (GRU + MLP projector) instead of the
+> GRU+transformer `count_embed` block this port implements, so the
+> count-guided span scorer has no weights to load and returns no spans.
+> Classification is unaffected. Use `gliner2-base-v1` / `gliner2-large-v1` for
+> entity extraction.
+
 ## 🚀 GLiNER2.5 Support (boundary architecture)
 
 The boundary-prediction pipeline is validated numerically against the Python

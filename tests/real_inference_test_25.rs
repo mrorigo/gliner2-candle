@@ -465,33 +465,54 @@ fn test_relation_endpoint_precision_and_variants() {
 
     // 1. Canonical fixture: "Tim Cook works for Apple."
     let text1 = "Tim Cook works for Apple.";
-    let r1 = engine.extract(text1, &schema, 0.5, false, false, None).unwrap();
+    let r1 = engine
+        .extract(text1, &schema, 0.5, false, false, None)
+        .unwrap();
     println!("r1: {r1}");
     assert_eq!(r1["entities"]["person"], serde_json::json!(["Tim Cook"]));
     assert_eq!(r1["entities"]["company"], serde_json::json!(["Apple"]));
-    let pairs1 = r1["relation_extraction"]["works_for"].as_array().expect("works_for array");
-    assert_eq!(pairs1.len(), 1, "expected exactly 1 pair, got: {:?}", pairs1);
+    let pairs1 = r1["relation_extraction"]["works_for"]
+        .as_array()
+        .expect("works_for array");
+    assert_eq!(
+        pairs1.len(),
+        1,
+        "expected exactly 1 pair, got: {:?}",
+        pairs1
+    );
     assert_eq!(pairs1[0], serde_json::json!(["Tim Cook", "Apple"]));
 
     // Repeated inference determinism
-    let r1_repeat = engine.extract(text1, &schema, 0.5, false, false, None).unwrap();
+    let r1_repeat = engine
+        .extract(text1, &schema, 0.5, false, false, None)
+        .unwrap();
     assert_eq!(r1, r1_repeat);
 
     // 2. Variant: "Alice works for Acme."
     let text2 = "Alice works for Acme.";
-    let r2 = engine.extract(text2, &schema, 0.5, false, false, None).unwrap();
+    let r2 = engine
+        .extract(text2, &schema, 0.5, false, false, None)
+        .unwrap();
     println!("r2: {r2}");
-    let pairs2 = r2["relation_extraction"]["works_for"].as_array().expect("works_for array");
+    let pairs2 = r2["relation_extraction"]["works_for"]
+        .as_array()
+        .expect("works_for array");
     assert_eq!(pairs2.len(), 1);
     assert_eq!(pairs2[0], serde_json::json!(["Alice", "Acme"]));
 
     // 3. Variant: "Alice does not work for Acme."
     let text_neg = "Alice does not work for Acme.";
-    let r_neg = engine.extract(text_neg, &schema, 0.5, false, false, None).unwrap();
+    let r_neg = engine
+        .extract(text_neg, &schema, 0.5, false, false, None)
+        .unwrap();
     println!("r_neg: {r_neg}");
     assert_eq!(r_neg["entities"]["person"], serde_json::json!(["Alice"]));
     assert_eq!(r_neg["entities"]["company"], serde_json::json!(["Acme"]));
-    if let Some(pairs_neg) = r_neg.get("relation_extraction").and_then(|re| re.get("works_for")).and_then(|w| w.as_array()) {
+    if let Some(pairs_neg) = r_neg
+        .get("relation_extraction")
+        .and_then(|re| re.get("works_for"))
+        .and_then(|w| w.as_array())
+    {
         for p in pairs_neg {
             assert_eq!(p, &serde_json::json!(["Alice", "Acme"]));
         }
@@ -499,18 +520,28 @@ fn test_relation_endpoint_precision_and_variants() {
 
     // 4. Variant: "Alice works for Acme and Bob works for Delta."
     let text3 = "Alice works for Acme and Bob works for Delta.";
-    let r3 = engine.extract(text3, &schema, 0.43, false, false, None).unwrap();
+    let r3 = engine
+        .extract(text3, &schema, 0.43, false, false, None)
+        .unwrap();
     println!("r3: {r3}");
-    let pairs3 = r3["relation_extraction"]["works_for"].as_array().expect("works_for array");
+    let pairs3 = r3["relation_extraction"]["works_for"]
+        .as_array()
+        .expect("works_for array");
     assert_eq!(pairs3.len(), 2, "expected 2 pairs, got: {:?}", pairs3);
     assert!(pairs3.contains(&serde_json::json!(["Alice", "Acme"])));
     assert!(pairs3.contains(&serde_json::json!(["Bob", "Delta"])));
 
     // 5. Variant with punctuation adjacent to entities: "Tim Cook (CEO) works for 'Apple', Inc."
     let text4 = "Tim Cook (CEO) works for 'Apple', Inc.";
-    let r4 = engine.extract(text4, &schema, 0.5, false, false, None).unwrap();
+    let r4 = engine
+        .extract(text4, &schema, 0.5, false, false, None)
+        .unwrap();
     println!("r4: {r4}");
-    if let Some(pairs4) = r4.get("relation_extraction").and_then(|re| re.get("works_for")).and_then(|w| w.as_array()) {
+    if let Some(pairs4) = r4
+        .get("relation_extraction")
+        .and_then(|re| re.get("works_for"))
+        .and_then(|w| w.as_array())
+    {
         for p in pairs4 {
             let h = p[0].as_str().unwrap();
             let t = p[1].as_str().unwrap();
@@ -518,7 +549,10 @@ fn test_relation_endpoint_precision_and_variants() {
             assert!(!h.contains("for"), "head should not contain 'for': {h}");
             assert!(!t.contains("works"), "tail should not contain 'works': {t}");
             assert!(!t.contains("for"), "tail should not contain 'for': {t}");
-            assert!(!t.ends_with('.'), "tail should not end with sentence period: {t}");
+            assert!(
+                !t.ends_with('.'),
+                "tail should not end with sentence period: {t}"
+            );
         }
     }
 }
@@ -552,7 +586,12 @@ fn test_gliner25_structured_record_extraction() {
     println!("r_prod: {r_prod}");
 
     let prod_records = r_prod["product"].as_array().expect("product record array");
-    assert_eq!(prod_records.len(), 1, "expected 1 product record, got: {:?}", prod_records);
+    assert_eq!(
+        prod_records.len(),
+        1,
+        "expected 1 product record, got: {:?}",
+        prod_records
+    );
     let prod = &prod_records[0];
     assert_eq!(prod["name"], serde_json::json!(["iPhone 15 Pro Max"]));
     assert_eq!(prod["storage"], serde_json::json!(["256GB"]));
@@ -583,7 +622,12 @@ fn test_gliner25_structured_record_extraction() {
     println!("r_emp: {r_emp}");
 
     let emp_records = r_emp["employee"].as_array().expect("employee record array");
-    assert_eq!(emp_records.len(), 1, "expected 1 employee record, got: {:?}", emp_records);
+    assert_eq!(
+        emp_records.len(),
+        1,
+        "expected 1 employee record, got: {:?}",
+        emp_records
+    );
     let emp = &emp_records[0];
     assert_eq!(emp["name"], serde_json::json!(["Tim Cook"]));
     assert_eq!(emp["employer"], serde_json::json!(["Apple"]));
@@ -595,7 +639,10 @@ fn test_gliner25_structured_record_extraction() {
         .unwrap();
     println!("r_neg: {r_neg}");
     let neg_records = r_neg["product"].as_array().expect("product record array");
-    assert!(neg_records.is_empty(), "expected empty product record list for negative input");
+    assert!(
+        neg_records.is_empty(),
+        "expected empty product record list for negative input"
+    );
 }
 
 /// Test that typed relation endpoints (.fields(vec!["system", "metric_value"]))
@@ -615,10 +662,10 @@ fn test_typed_relation_endpoint_constraints() {
             "metric_value".to_string(),
         ])
         .relation("rate_limit")
-            .description("configured system operational value")
-            .fields(vec!["system".to_string(), "metric_value".to_string()])
-            .threshold(0.30)
-            .done()
+        .description("configured system operational value")
+        .fields(vec!["system".to_string(), "metric_value".to_string()])
+        .threshold(0.30)
+        .done()
         .build()
         .unwrap();
 
@@ -631,12 +678,24 @@ fn test_typed_relation_endpoint_constraints() {
     // Entities must be correctly extracted
     assert_eq!(res["entities"]["user"], serde_json::json!(["alice"]));
     assert_eq!(res["entities"]["system"], serde_json::json!(["api"]));
-    assert_eq!(res["entities"]["metric_value"], serde_json::json!(["500 requests/second"]));
+    assert_eq!(
+        res["entities"]["metric_value"],
+        serde_json::json!(["500 requests/second"])
+    );
 
     // Relation must strictly bind system -> metric_value ("api" -> "500 requests/second")
     // and MUST NOT contain "alice" in head or tail
-    if let Some(pairs) = res.get("relation_extraction").and_then(|r| r.get("rate_limit")).and_then(|v| v.as_array()) {
-        assert_eq!(pairs.len(), 1, "expected exactly 1 rate_limit pair, got: {:?}", pairs);
+    if let Some(pairs) = res
+        .get("relation_extraction")
+        .and_then(|r| r.get("rate_limit"))
+        .and_then(|v| v.as_array())
+    {
+        assert_eq!(
+            pairs.len(),
+            1,
+            "expected exactly 1 rate_limit pair, got: {:?}",
+            pairs
+        );
         assert_eq!(pairs[0], serde_json::json!(["api", "500 requests/second"]));
         for p in pairs {
             let h = p[0].as_str().unwrap();

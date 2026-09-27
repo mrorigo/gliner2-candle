@@ -1,6 +1,6 @@
 [package]
 name = "gliner2-candle"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.87"
 description = "Pure Rust implementation of GLiNER2 and GLiNER2.5 for CPU-based information extraction (entities, classifications, relations, span attributes)"
