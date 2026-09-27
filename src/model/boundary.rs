@@ -1869,6 +1869,237 @@ pub struct BoundaryModel {
     pub hidden_size: usize,
 }
 
+/// Per-query boundary marginals: start/end logits over boundary positions,
+/// plus the centered inside-logit mean and its prefix sums.
+///
+/// Positions past `text_len` stay at `MASK_LOGIT`; the caller decides which
+/// boundary indices are addressable.
+struct Marginals {
+    start: Vec<Vec<f32>>,
+    end: Vec<Vec<f32>>,
+    inside_mean: Vec<f32>,
+    inside_prefix: Vec<Vec<f32>>,
+}
+
+/// Compute the start/end/inside marginals from the projected query and boundary
+/// states. `inv_sqrt_d` is the caller's already-computed `1/sqrt(d)`.
+#[allow(clippy::too_many_arguments)]
+fn marginal_logits(
+    sq_t: &Tensor,
+    sk_t: &Tensor,
+    eq_t: &Tensor,
+    ek_t: &Tensor,
+    iq_t: &Tensor,
+    itk_t: &Tensor,
+    q: usize,
+    n: usize,
+    l: usize,
+    text_len: usize,
+    inv_sqrt_d: f64,
+) -> Result<Marginals> {
+    // start/end: (Q, n) = sq @ sk^T / sqrt_d
+    let start_mm = sq_t
+        .matmul(&sk_t.transpose(0, 1)?)?
+        .affine(inv_sqrt_d, 0.0)?
+        .to_vec2::<f32>()
+        .map_err(|e| GlinerError::inference(format!("{e}")))?;
+    let end_mm = eq_t
+        .matmul(&ek_t.transpose(0, 1)?)?
+        .affine(inv_sqrt_d, 0.0)?
+        .to_vec2::<f32>()
+        .map_err(|e| GlinerError::inference(format!("{e}")))?;
+    let mut start = vec![vec![MASK_LOGIT; n]; q];
+    let mut end = vec![vec![MASK_LOGIT; n]; q];
+    for qi in 0..q {
+        for i in 0..n {
+            if i <= text_len {
+                start[qi][i] = start_mm[qi][i];
+                end[qi][i] = end_mm[qi][i];
+            }
+        }
+    }
+
+    // Inside logits over tokens plus per-query prefix sums over boundaries:
+    // prefix[0] = 0; prefix[i+1] = sum of centered inside logits [0..i].
+    let inside_mm = iq_t
+        .matmul(&itk_t.transpose(0, 1)?)?
+        .affine(inv_sqrt_d, 0.0)?
+        .to_vec2::<f32>()
+        .map_err(|e| GlinerError::inference(format!("{e}")))?;
+    let mut inside_mean = vec![0.0f32; q];
+    let mut inside_prefix = vec![vec![0.0f32; n + 1]; q];
+    for qi in 0..q {
+        let mut sum = 0.0f32;
+        #[allow(clippy::needless_range_loop)]
+        for t in 0..text_len.min(l) {
+            sum += inside_mm[qi][t];
+        }
+        inside_mean[qi] = sum / (text_len.max(1) as f32);
+        let mut acc = 0.0f32;
+        for i in 0..=n {
+            inside_prefix[qi][i] = acc;
+            if i < l && i < text_len {
+                acc += inside_mm[qi][i] - inside_mean[qi];
+            }
+        }
+    }
+
+    Ok(Marginals {
+        start,
+        end,
+        inside_mean,
+        inside_prefix,
+    })
+}
+
+/// Weights and biases the scalar candidate-composition kernel needs, unpacked
+/// once per sample rather than per candidate.
+struct CompositionWeights {
+    start_w: Vec<f32>,
+    start_b: Vec<f32>,
+    end_w: Vec<f32>,
+    end_b: Vec<f32>,
+    length_w: Vec<f32>,
+    length_b: Vec<f32>,
+    prior_w: Vec<f32>,
+    prior_b: Vec<f32>,
+    content_w: Vec<f32>,
+    content_b: Vec<f32>,
+    content_ln: (Vec<f32>, Vec<f32>),
+}
+
+/// Compose one candidate vector per pool slot.
+///
+/// Row `i` is the start-projection, end-projection, length-feature, compat-prior
+/// and pooled-content contributions combined, then `candidate_norm` applied.
+/// Invalid slots get a zero row without touching the weights. Returns the rows
+/// plus, when `GLINER2_DEBUG_TERMS` is set, a copy for the debug output.
+#[allow(clippy::too_many_arguments)]
+fn compose_candidates(
+    weights: &CompositionWeights,
+    norm: &(Vec<f32>, Vec<f32>),
+    bs_rows: &[Vec<f32>],
+    run_sum: &[Vec<f32>],
+    sel_s: &[usize],
+    sel_e: &[usize],
+    sel_valid: &[bool],
+    selected_compat: &[f32],
+    c_count: usize,
+    d: usize,
+    c_dim: usize,
+    n: usize,
+    text_len: usize,
+    debug_on: bool,
+) -> (Vec<Vec<f32>>, Vec<Vec<f32>>) {
+    let tl = text_len.max(1) as f32;
+    let mut candidates: Vec<Vec<f32>> = Vec::with_capacity(c_count);
+    let mut debug_rows: Vec<Vec<f32>> = Vec::new();
+    for i in 0..c_count {
+        if !sel_valid[i] {
+            candidates.push(vec![0.0; d]);
+            if debug_on {
+                debug_rows.push(vec![0.0; d]);
+            }
+            continue;
+        }
+        let (s, e) = (sel_s[i], sel_e[i]);
+        let len_f = (e - s).max(1) as f32;
+        let feats = [(1.0f32 + len_f).ln(), len_f / tl, 1.0 / len_f.sqrt()];
+        let span_sum: Vec<f32> = (0..c_dim)
+            .map(|k| run_sum[e.min(n)][k] - run_sum[s.min(n)][k])
+            .collect();
+        let pooled_content_raw: Vec<f32> = span_sum.iter().map(|v| v / len_f).collect();
+        let pooled_content = layernorm(
+            &pooled_content_raw,
+            &weights.content_ln.0,
+            &weights.content_ln.1,
+        )
+        .unwrap_or_else(|e| panic!("content layernorm: {e}"));
+
+        let mut cand = vec![0.0f32; d];
+        // Indexed on purpose: each output row reads a contiguous slice of the
+        // flattened weight matrices, so the row index drives four offsets.
+        #[allow(clippy::needless_range_loop)]
+        for ri in 0..d {
+            let mut acc = weights.start_b[ri]
+                + weights.end_b[ri]
+                + weights.length_b[ri]
+                + weights.prior_b[ri]
+                + weights.content_b[ri];
+            let wsr = &weights.start_w[ri * d..(ri + 1) * d];
+            let wer = &weights.end_w[ri * d..(ri + 1) * d];
+            let wlr = &weights.length_w[ri * 3..(ri + 1) * 3];
+            let wpr = &weights.prior_w[ri];
+            let wcr = &weights.content_w[ri * c_dim..(ri + 1) * c_dim];
+            for k in 0..d {
+                acc += wsr[k] * bs_rows[s][k] + wer[k] * bs_rows[e][k];
+            }
+            for k in 0..3 {
+                acc += wlr[k] * feats[k];
+            }
+            acc += wpr * selected_compat[i];
+            for k in 0..c_dim {
+                acc += wcr[k] * pooled_content[k];
+            }
+            cand[ri] = acc;
+        }
+        cand = layernorm(&cand, &norm.0, &norm.1).unwrap_or_else(|e| panic!("candidate norm: {e}"));
+        candidates.push(cand);
+        if debug_on {
+            debug_rows.push(candidates.last().unwrap().clone());
+        }
+    }
+    (candidates, debug_rows)
+}
+
+/// Combine the per-term scores into the final `(C, Q)` matrix.
+///
+/// Each entry is `dot(cand, query) + film + start + end + inside_interval`,
+/// accumulated in that order. Invalid pool slots keep `MASK_LOGIT`. When
+/// `debug_on`, also records the five components for query 0 of each valid slot.
+#[allow(clippy::too_many_arguments)]
+fn assemble_scores(
+    dots: &[Vec<f32>],
+    fo: &[Vec<f32>],
+    marginals: &Marginals,
+    sel_s: &[usize],
+    sel_e: &[usize],
+    sel_valid: &[bool],
+    c_count: usize,
+    q: usize,
+    n: usize,
+    debug_on: bool,
+) -> (Vec<Vec<f32>>, Option<Vec<[f32; 5]>>) {
+    let mut terms: Vec<[f32; 5]> = Vec::with_capacity(c_count);
+    let mut scores = vec![vec![MASK_LOGIT; q]; c_count];
+    for ci in 0..c_count {
+        if !sel_valid[ci] {
+            if debug_on {
+                terms.push([0.0; 5]);
+            }
+            continue;
+        }
+        let (s, e) = (sel_s[ci], sel_e[ci]);
+        let len_i = (e - s).max(1);
+        for qi in 0..q {
+            let mut sc = dots[ci][qi] + fo[ci][qi];
+            let sl_t = marginals.start[qi][s];
+            let el_t = marginals.end[qi][e];
+            sc += sl_t + el_t;
+            let interval = marginals.inside_prefix[qi][(e).min(n)]
+                - marginals.inside_prefix[qi][(s).min(n)]
+                + marginals.inside_mean[qi] * len_i as f32;
+            let iv_t = interval / (len_i as f32).sqrt();
+            sc += iv_t;
+            scores[ci][qi] = sc;
+            if debug_on && qi == 0 {
+                terms.push([dots[ci][0], fo[ci][0], sl_t, el_t, iv_t]);
+            }
+        }
+    }
+    (scores, debug_on.then_some(terms))
+}
+
 impl BoundaryModel {
     /// Load the full boundary model from a root VarBuilder.
     ///
@@ -2114,7 +2345,6 @@ impl BoundaryModel {
         let bs_rows = bs
             .to_vec2::<f32>()
             .map_err(|e| GlinerError::inference(format!("{e}")))?;
-        let boundary_valid = |i: usize| i <= text_len;
 
         // --- Projected keys/queries (batched through candle gemm) --------------
         let sk_t = self.query_head.start_boundary_projection.forward(&bs)?;
@@ -2134,52 +2364,21 @@ impl BoundaryModel {
             .forward(query_states)?;
 
         // --- Marginal logits -------------------------------------------------
-        // start/end: (Q, n) = sq @ sk^T / sqrt_d
-        let start_mm = sq_t
-            .matmul(&sk_t.transpose(0, 1)?)?
-            .affine(1.0 / sqrt_d as f64, 0.0)?
-            .to_vec2::<f32>()
-            .map_err(|e| GlinerError::inference(format!("{e}")))?;
-        let end_mm = eq_t
-            .matmul(&ek_t.transpose(0, 1)?)?
-            .affine(1.0 / sqrt_d as f64, 0.0)?
-            .to_vec2::<f32>()
-            .map_err(|e| GlinerError::inference(format!("{e}")))?;
-        let mut start_logits = vec![vec![MASK_LOGIT; n]; q];
-        let mut end_logits = vec![vec![MASK_LOGIT; n]; q];
-        for qi in 0..q {
-            for i in 0..n {
-                if boundary_valid(i) {
-                    start_logits[qi][i] = start_mm[qi][i];
-                    end_logits[qi][i] = end_mm[qi][i];
-                }
-            }
-        }
-
-        // Inside logits over tokens plus per-query prefix sums over boundaries:
-        // prefix[0] = 0; prefix[i+1] = sum of centered inside logits [0..i].
-        let inside_mm = iq_t
-            .matmul(&itk_t.transpose(0, 1)?)?
-            .affine(1.0 / sqrt_d as f64, 0.0)?
-            .to_vec2::<f32>()
-            .map_err(|e| GlinerError::inference(format!("{e}")))?;
-        let mut inside_mean = vec![0.0f32; q];
-        let mut inside_prefix = vec![vec![0.0f32; n + 1]; q];
-        for qi in 0..q {
-            let mut sum = 0.0f32;
-            #[allow(clippy::needless_range_loop)]
-            for t in 0..text_len.min(l) {
-                sum += inside_mm[qi][t];
-            }
-            inside_mean[qi] = sum / (text_len.max(1) as f32);
-            let mut acc = 0.0f32;
-            for i in 0..=n {
-                inside_prefix[qi][i] = acc;
-                if i < l && i < text_len {
-                    acc += inside_mm[qi][i] - inside_mean[qi];
-                }
-            }
-        }
+        let marginals = marginal_logits(
+            &sq_t,
+            &sk_t,
+            &eq_t,
+            &ek_t,
+            &iq_t,
+            &itk_t,
+            q,
+            n,
+            l,
+            text_len,
+            1.0 / sqrt_d as f64,
+        )?;
+        let start_logits = &marginals.start;
+        let end_logits = &marginals.end;
 
         // --- Candidate selection ---------------------------------------------
         // Explicit spans bypass pool selection entirely; the shared-pool path
@@ -2210,8 +2409,8 @@ impl BoundaryModel {
                 (ss, ee, vv)
             }
             None => self.select_shared_pool(
-                &start_logits,
-                &end_logits,
+                start_logits,
+                end_logits,
                 &pbsk,
                 &pbek,
                 sqrt_d,
@@ -2234,21 +2433,25 @@ impl BoundaryModel {
             .collect();
 
         // --- SharedPoolScorer --------------------------------------------------
-        // Weight rows for the scalar candidate-composition kernel below.
-        let (w_ss, _, _) = mat2(self.pool_scorer.start_projection.weight())?;
-        let b_ss = bias1(self.pool_scorer.start_projection.bias())?;
-        let (w_se, _, _) = mat2(self.pool_scorer.end_projection.weight())?;
-        let b_se = bias1(self.pool_scorer.end_projection.bias())?;
-        let (w_len, _, _) = mat2(self.pool_scorer.length_projection.weight())?;
-        let b_len = bias1(self.pool_scorer.length_projection.bias())?;
-        let (w_prior, _, _) = mat2(self.pool_scorer.prior_projection.weight())?;
-        let b_prior = bias1(self.pool_scorer.prior_projection.bias())?;
-        let (w_cproj, _, _) = mat2(self.pool_scorer.content_projection.weight())?;
-        let b_cproj = bias1(self.pool_scorer.content_projection.bias())?;
+        // Weight rows for the scalar candidate-composition kernel below, unpacked
+        // once per sample rather than per candidate.
+        let weights = CompositionWeights {
+            start_w: mat2(self.pool_scorer.start_projection.weight())?.0,
+            start_b: bias1(self.pool_scorer.start_projection.bias())?,
+            end_w: mat2(self.pool_scorer.end_projection.weight())?.0,
+            end_b: bias1(self.pool_scorer.end_projection.bias())?,
+            length_w: mat2(self.pool_scorer.length_projection.weight())?.0,
+            length_b: bias1(self.pool_scorer.length_projection.bias())?,
+            prior_w: mat2(self.pool_scorer.prior_projection.weight())?.0,
+            prior_b: bias1(self.pool_scorer.prior_projection.bias())?,
+            content_w: mat2(self.pool_scorer.content_projection.weight())?.0,
+            content_b: bias1(self.pool_scorer.content_projection.bias())?,
+            content_ln: self.pool_scorer.content_ln_params()?,
+        };
+        let candidate_norm = self.pool_scorer.candidate_norm_params()?;
 
         // Span-content pooling: value-project tokens, mean over the span via a
         // running-sum, then LayerNorm (content_soft_max_pool = false).
-        let (ln_w, ln_b) = self.pool_scorer.content_ln_params()?;
         let token_values: Vec<Vec<f32>> = self
             .pool_scorer
             .content_value_projection
@@ -2270,57 +2473,22 @@ impl BoundaryModel {
 
         // Candidate composition.
         let debug_candidates_on = std::env::var("GLINER2_DEBUG_TERMS").is_ok();
-        let mut debug_cand_rows: Vec<Vec<f32>> = Vec::new();
-        let tl = text_len.max(1) as f32;
-        let mut candidates: Vec<Vec<f32>> = Vec::with_capacity(c_count);
-        for i in 0..c_count {
-            if !sel_valid[i] {
-                candidates.push(vec![0.0; d]);
-                if debug_candidates_on {
-                    debug_cand_rows.push(vec![0.0; d]);
-                }
-                continue;
-            }
-            let (s, e) = (sel_s[i], sel_e[i]);
-            let len_f = (e - s).max(1) as f32;
-            let feats = [(1.0f32 + len_f).ln(), len_f / tl, 1.0 / len_f.sqrt()];
-            let span_sum: Vec<f32> = (0..c_dim)
-                .map(|k| run_sum[e.min(n)][k] - run_sum[s.min(n)][k])
-                .collect();
-            let pooled_content_raw: Vec<f32> = span_sum.iter().map(|v| v / len_f).collect();
-            let pooled_content = layernorm(&pooled_content_raw, &ln_w, &ln_b)
-                .unwrap_or_else(|e| panic!("content layernorm: {e}"));
-
-            let mut cand = vec![0.0f32; d];
-            for ri in 0..d {
-                let mut acc = b_ss[ri] + b_se[ri] + b_len[ri] + b_prior[ri] + b_cproj[ri];
-                let wsr = &w_ss[ri * d..(ri + 1) * d];
-                let wer = &w_se[ri * d..(ri + 1) * d];
-                let wlr = &w_len[ri * 3..(ri + 1) * 3];
-                let wpr = &w_prior[ri];
-                let wcr = &w_cproj[ri * c_dim..(ri + 1) * c_dim];
-                for k in 0..d {
-                    acc += wsr[k] * bs_rows[s][k] + wer[k] * bs_rows[e][k];
-                }
-                for k in 0..3 {
-                    acc += wlr[k] * feats[k];
-                }
-                acc += wpr * selected_compat[i];
-                for k in 0..c_dim {
-                    acc += wcr[k] * pooled_content[k];
-                }
-                cand[ri] = acc;
-            }
-            {
-                let (nw, nb) = self.pool_scorer.candidate_norm_params()?;
-                cand = layernorm(&cand, &nw, &nb).unwrap_or_else(|e| panic!("candidate norm: {e}"));
-            }
-            candidates.push(cand);
-            if debug_candidates_on {
-                debug_cand_rows.push(candidates.last().unwrap().clone());
-            }
-        }
-
+        let (candidates, debug_cand_rows) = compose_candidates(
+            &weights,
+            &candidate_norm,
+            &bs_rows,
+            &run_sum,
+            &sel_s,
+            &sel_e,
+            &sel_valid,
+            &selected_compat,
+            c_count,
+            d,
+            c_dim,
+            n,
+            text_len,
+            debug_candidates_on,
+        );
         // Query projection + FiLM conditioning, fully batched.
         //
         // conditioned[c, q] = cand[c] * (1 + gamma[q]) + beta[q]; the FiLM MLP
@@ -2361,33 +2529,18 @@ impl BoundaryModel {
             .map_err(|e| GlinerError::inference(format!("{e}")))?;
 
         let debug_terms = std::env::var("GLINER2_DEBUG_TERMS").is_ok();
-        let mut terms: Vec<[f32; 5]> = Vec::with_capacity(c_count);
-        let mut scores = vec![vec![MASK_LOGIT; q]; c_count];
-        for ci in 0..c_count {
-            if !sel_valid[ci] {
-                if debug_terms {
-                    terms.push([0.0; 5]);
-                }
-                continue;
-            }
-            let (s, e) = (sel_s[ci], sel_e[ci]);
-            let len_i = (e - s).max(1);
-            for qi in 0..q {
-                let mut sc = dots[ci][qi] + fo[ci][qi];
-                let sl_t = start_logits[qi][s];
-                let el_t = end_logits[qi][e];
-                sc += sl_t + el_t;
-                let interval = inside_prefix[qi][(e).min(n)] - inside_prefix[qi][(s).min(n)]
-                    + inside_mean[qi] * len_i as f32;
-                let iv_t = interval / (len_i as f32).sqrt();
-                sc += iv_t;
-                scores[ci][qi] = sc;
-                if debug_terms && qi == 0 {
-                    terms.push([dots[ci][0], fo[ci][0], sl_t, el_t, iv_t]);
-                }
-            }
-        }
-        let debug_terms_out = debug_terms.then_some(terms);
+        let (scores, debug_terms_out) = assemble_scores(
+            &dots,
+            &fo,
+            &marginals,
+            &sel_s,
+            &sel_e,
+            &sel_valid,
+            c_count,
+            q,
+            n,
+            debug_terms,
+        );
 
         // --- Candidate states for record decoder ----------------------------
         let cand_states = if let Some(ref ce) = self.candidate_encoder {
@@ -2441,7 +2594,6 @@ impl BoundaryModel {
         const POOL_BOUNDARY_TOP_K: usize = 32;
         let pool_size = self.config.pool_size;
         const MIN_POOL_PER_QUERY: usize = 8;
-
         let boundary_valid = |i: usize| i <= text_len;
 
         let mut union_start = vec![MASK_LOGIT; n];
