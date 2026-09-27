@@ -1,5 +1,7 @@
 # GLiNER2 Rust
 
+[![Slop Gate passing](https://github.com/mrorigo/gliner2-candle/actions/workflows/slop-gate.yml/badge.svg)](https://github.com/mrorigo/gliner2-candle/actions/workflows/slop-gate.yml)
+
 A high-performance, pure Rust implementation of [GLiNER2](https://huggingface.co/collections/fastino/gliner2-family)
 (span-enumeration) and [GLiNER2.5](https://huggingface.co/collections/fastino/gliner25-models)
 (boundary-prediction) information extraction models, built on HuggingFace's
