@@ -9,7 +9,7 @@ repository = "https://github.com/mrorigo/gliner2-candle"
 documentation = "https://docs.rs/gliner2-candle"
 readme = "README.md"
 homepage = "https://mrorigo.github.io/gliner2-candle/"
-keywords = ["nlp", "ner", "information-extraction", "transformer", "gliner"]
+keywords = ["nlp", "ner", "entity-extraction", "text-classification", "gliner"]
 categories = ["science", "text-processing"]
 exclude = [
     "/AGENTS.md",
