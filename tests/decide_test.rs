@@ -41,14 +41,17 @@ fn multi(result: &Value, task: &str) -> Vec<String> {
 #[test]
 #[ignore = "downloads 500MB-1.9GB; run explicitly with --ignored"]
 fn decide_span_classification() {
-    let model_id = std::env::var("GLINER_MODEL")
-        .unwrap_or_else(|_| "fastino/GLiNER2.5-Decide".to_string());
+    let model_id =
+        std::env::var("GLINER_MODEL").unwrap_or_else(|_| "fastino/GLiNER2.5-Decide".to_string());
     println!("=== {model_id} ===");
     let engine = GLiNER2::from_pretrained(&model_id).expect("load failed");
 
     // Span checkpoints must not be routed through the boundary head. The name
     // contains "gliner2.5", so this only works because config.json wins.
-    assert_eq!(engine.config().architecture, gliner2_candle::config::Architecture::Gliner2);
+    assert_eq!(
+        engine.config().architecture,
+        gliner2_candle::config::Architecture::Gliner2
+    );
     assert_eq!(engine.config().hidden_size, 1024);
     assert_eq!(engine.config().num_hidden_layers, 24);
 
@@ -84,7 +87,9 @@ fn decide_span_classification() {
     let schema = SchemaBuilder::new()
         .classification(
             "aspects",
-            labels(&["battery", "keyboard", "screen", "camera", "price", "support"]),
+            labels(&[
+                "battery", "keyboard", "screen", "camera", "price", "support",
+            ]),
         )
         .multi_label(true)
         .threshold(0.4)
@@ -104,17 +109,36 @@ fn decide_span_classification() {
             &[
                 (
                     "intent".into(),
-                    labels(&["fyi", "request", "approval", "complaint", "newsletter", "security_alert"]),
+                    labels(&[
+                        "fyi",
+                        "request",
+                        "approval",
+                        "complaint",
+                        "newsletter",
+                        "security_alert",
+                    ]),
                 ),
-                ("urgency".into(), labels(&["low", "normal", "high", "critical"])),
-                ("route".into(), labels(&["support", "billing", "legal", "security", "finance", "archive"])),
+                (
+                    "urgency".into(),
+                    labels(&["low", "normal", "high", "critical"]),
+                ),
+                (
+                    "route".into(),
+                    labels(&[
+                        "support", "billing", "legal", "security", "finance", "archive",
+                    ]),
+                ),
             ],
             None,
             false,
             None,
         )
         .unwrap();
-    assert_eq!(res.as_object().unwrap().len(), 3, "all heads must be scored: {res}");
+    assert_eq!(
+        res.as_object().unwrap().len(),
+        3,
+        "all heads must be scored: {res}"
+    );
     assert_eq!(single(&res, "intent"), "request");
     assert_eq!(single(&res, "route"), "legal");
     // Card says "high". The span Decide checkpoint prefers "critical" here; the
@@ -133,7 +157,10 @@ fn decide_span_classification() {
         )
         .label_descriptions(
             [
-                ("card_pin_change", "The customer wants a new PIN or the current PIN replaced"),
+                (
+                    "card_pin_change",
+                    "The customer wants a new PIN or the current PIN replaced",
+                ),
                 ("card_lost", "The physical card is missing"),
                 ("balance_inquiry", "The customer wants the current balance"),
             ]
@@ -164,14 +191,20 @@ fn decide_span_classification() {
         .classify_text(
             "I finished it in two nights. The ending is earned, the middle drags, and \
              I would still hand it to a friend.",
-            &[("rating".into(), labels(&["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10"]))],
+            &[(
+                "rating".into(),
+                labels(&["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10"]),
+            )],
             None,
             false,
             None,
         )
         .unwrap();
     let rating: u32 = single(&res, "rating").parse().expect("numeric label");
-    assert!(rating >= 6, "a favourable review should score high, got {rating}");
+    assert!(
+        rating >= 6,
+        "a favourable review should score high, got {rating}"
+    );
 
     // --- confidence is a softmax, not a sigmoid -------------------------------
     let res = engine
@@ -185,7 +218,10 @@ fn decide_span_classification() {
         )
         .unwrap();
     let conf = res["intent"]["confidence"].as_f64().expect("confidence");
-    assert!((0.0..=1.0).contains(&conf), "confidence out of range: {conf}");
+    assert!(
+        (0.0..=1.0).contains(&conf),
+        "confidence out of range: {conf}"
+    );
     // A two-way softmax on a confident call must be near 1, which a sigmoid over a
     // single raw logit would not be.
     assert!(conf > 0.9, "expected softmax confidence, got {conf}");
@@ -232,9 +268,27 @@ fn decide_boundary_classification() {
             "From: compliance@group.example\nSubject: Protocol update - action required \
              today\n\nPlease confirm the new retention rule is applied before Friday's audit.",
             &[
-                ("intent".into(), labels(&["fyi", "request", "approval", "complaint", "newsletter", "security_alert"])),
-                ("urgency".into(), labels(&["low", "normal", "high", "critical"])),
-                ("route".into(), labels(&["support", "billing", "legal", "security", "finance", "archive"])),
+                (
+                    "intent".into(),
+                    labels(&[
+                        "fyi",
+                        "request",
+                        "approval",
+                        "complaint",
+                        "newsletter",
+                        "security_alert",
+                    ]),
+                ),
+                (
+                    "urgency".into(),
+                    labels(&["low", "normal", "high", "critical"]),
+                ),
+                (
+                    "route".into(),
+                    labels(&[
+                        "support", "billing", "legal", "security", "finance", "archive",
+                    ]),
+                ),
             ],
             None,
             false,

@@ -7,7 +7,8 @@ use gliner2_candle::schema::builder::SchemaBuilder;
 use std::env;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let model_id = env::var("GLINER_MODEL").unwrap_or_else(|_| "fastino/gliner2.5-small-v1".to_string());
+    let model_id =
+        env::var("GLINER_MODEL").unwrap_or_else(|_| "fastino/gliner2.5-small-v1".to_string());
     println!("=== GLiNER2 Task Probe ===");
     println!("Model: {model_id}\n");
 
@@ -15,7 +16,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 1. Entity extraction probe (with punctuation & compound metrics)
     println!("--- 1. Entity Extraction Probe ---");
-    let text = "Server sustained 500 requests/second with 100ms latency. Apple CEO Tim Cook was pleased.";
+    let text =
+        "Server sustained 500 requests/second with 100ms latency. Apple CEO Tim Cook was pleased.";
     let entity_schema = SchemaBuilder::new()
         .entities(vec![
             "metric".to_string(),
@@ -54,7 +56,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .classification("sentiment", vec!["positive".into(), "negative".into()])
         .done()
         .build()?;
-    let cls_res = engine.extract("The new release performs exceptionally well!", &cls_schema, 0.5, true, false, None)?;
+    let cls_res = engine.extract(
+        "The new release performs exceptionally well!",
+        &cls_schema,
+        0.5,
+        true,
+        false,
+        None,
+    )?;
     println!("Result: {}\n", serde_json::to_string_pretty(&cls_res)?);
 
     // 3. Structure probe
@@ -68,7 +77,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .done_field()
         .done_structure()
         .build()?;
-    let struct_res = engine.extract("Apple launched iPhone in Cupertino.", &struct_schema, 0.4, false, false, None)?;
+    let struct_res = engine.extract(
+        "Apple launched iPhone in Cupertino.",
+        &struct_schema,
+        0.4,
+        false,
+        false,
+        None,
+    )?;
     println!("Result: {}\n", serde_json::to_string_pretty(&struct_res)?);
 
     // 4. Relation probe
@@ -78,7 +94,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .relation("works_for")
         .done()
         .build()?;
-    let rel_res = engine.extract("Tim Cook works for Apple in Cupertino.", &rel_schema, 0.5, false, false, None)?;
+    let rel_res = engine.extract(
+        "Tim Cook works for Apple in Cupertino.",
+        &rel_schema,
+        0.5,
+        false,
+        false,
+        None,
+    )?;
     println!("Result: {}\n", serde_json::to_string_pretty(&rel_res)?);
 
     println!("All task probes executed successfully!");
