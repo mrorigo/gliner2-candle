@@ -106,6 +106,33 @@ fn marker_children(schema_tokens: &[String], marker: &str) -> Vec<(String, usize
     out
 }
 
+/// Gather schema-embedding rows for `children` into an `(n, hidden_size)` tensor.
+///
+/// `children` is [`marker_children`] output, so the row order matches the
+/// caller's name vector. A slot past the end of `schema_tokens_embs` is
+/// zero-filled rather than dropped, keeping one row per child so row indices
+/// stay aligned with names.
+///
+/// Returns `None` if a *present* row cannot be flattened, or if the tensor
+/// cannot be built — matching the inline code this replaced, which left the
+/// buffer short and let `Tensor::from_vec` fail.
+fn gather_query_embeddings(
+    schema_tokens_embs: &[Tensor],
+    children: &[(String, usize)],
+    hidden_size: usize,
+    device: &Device,
+) -> Option<Tensor> {
+    let mut data = Vec::with_capacity(children.len() * hidden_size);
+    for &(_, slot) in children {
+        if let Some(emb) = schema_tokens_embs.get(slot) {
+            data.extend_from_slice(&emb.flatten_all().ok()?.to_vec1::<f32>().ok()?);
+        } else {
+            data.resize(data.len() + hidden_size, 0.0);
+        }
+    }
+    Tensor::from_vec(data, (children.len(), hidden_size), device).ok()
+}
+
 /// Flattened span-scoring inputs, shared by the count-guided extraction paths.
 ///
 /// The relations, structures and entities decoders each need the same four
@@ -1203,12 +1230,12 @@ impl GLiNER2 {
 
         // Find entity type tokens (tokens following [E] markers)
         // Schema format: ["(", "[P]", "entities", "(", "[E]", "location", "[E]", "organization", "[E]", "person", ")", ")"]
-        let (entity_types, entity_type_indices): (Vec<String>, Vec<usize>) =
-            marker_children(schema_tokens, "[E]")
-                .into_iter()
-                .filter(|(name, _)| !name.is_empty())
-                .unzip();
+        let entity_children: Vec<(String, usize)> = marker_children(schema_tokens, "[E]")
+            .into_iter()
+            .filter(|(name, _)| !name.is_empty())
+            .collect();
 
+        let entity_types: Vec<String> = entity_children.iter().map(|(n, _)| n.clone()).collect();
         if entity_types.is_empty() {
             return Ok(JsonValue::Object(entities));
         }
@@ -1238,29 +1265,14 @@ impl GLiNER2 {
             return Ok(JsonValue::Object(entities));
         }
 
-        let mut entity_emb_data: Vec<f32> = Vec::with_capacity(num_entity_types * hidden_size);
-        for &emb_idx in &entity_type_indices {
-            if emb_idx < schema_tokens_embs.len() {
-                let emb = &schema_tokens_embs[emb_idx];
-                if let Ok(data) = emb.flatten_all()
-                    && let Ok(vec) = data.to_vec1::<f32>()
-                {
-                    entity_emb_data.extend_from_slice(&vec);
-                }
-            } else {
-                // Pad with zeros if embedding not found
-                entity_emb_data.extend(std::iter::repeat_n(0.0f32, hidden_size));
-            }
-        }
-
-        // Create entity embeddings tensor: (num_entity_types, hidden)
-        let entity_embs_tensor = match Tensor::from_vec(
-            entity_emb_data,
-            (num_entity_types, hidden_size),
+        // Entity embeddings tensor: (num_entity_types, hidden)
+        let Some(entity_embs_tensor) = gather_query_embeddings(
+            schema_tokens_embs,
+            &entity_children,
+            hidden_size,
             &output.device,
-        ) {
-            Ok(t) => t,
-            Err(_) => return Ok(JsonValue::Object(entities)),
+        ) else {
+            return Ok(JsonValue::Object(entities));
         };
 
         // Step 2: Predict count using count_pred layer
@@ -1564,9 +1576,9 @@ impl GLiNER2 {
         };
 
         // Relation fields are tokens that follow [R].
-        let (field_names, field_emb_indices): (Vec<String>, Vec<usize>) =
-            marker_children(schema_tokens, "[R]").into_iter().unzip();
-        if field_names.len() < 2 {
+        let field_children = marker_children(schema_tokens, "[R]");
+        let field_names: Vec<String> = field_children.iter().map(|(n, _)| n.clone()).collect();
+        if field_children.len() < 2 {
             return Ok(JsonValue::Array(Vec::new()));
         }
 
@@ -1575,27 +1587,13 @@ impl GLiNER2 {
             return Ok(JsonValue::Array(Vec::new()));
         }
 
-        let mut field_emb_data: Vec<f32> = Vec::with_capacity(field_names.len() * hidden_size);
-        for &emb_idx in &field_emb_indices {
-            if emb_idx < schema_tokens_embs.len() {
-                let emb = &schema_tokens_embs[emb_idx];
-                if let Ok(data) = emb.flatten_all()
-                    && let Ok(vec) = data.to_vec1::<f32>()
-                {
-                    field_emb_data.extend_from_slice(&vec);
-                }
-            } else {
-                field_emb_data.extend(std::iter::repeat_n(0.0f32, hidden_size));
-            }
-        }
-
-        let field_embs_tensor = match Tensor::from_vec(
-            field_emb_data,
-            (field_names.len(), hidden_size),
+        let Some(field_embs_tensor) = gather_query_embeddings(
+            schema_tokens_embs,
+            &field_children,
+            hidden_size,
             &output.device,
-        ) {
-            Ok(t) => t,
-            Err(_) => return Ok(JsonValue::Array(Vec::new())),
+        ) else {
+            return Ok(JsonValue::Array(Vec::new()));
         };
 
         let pred_count = Self::predicted_count(
@@ -1743,9 +1741,9 @@ impl GLiNER2 {
         };
 
         // Structure fields are tokens that follow [C].
-        let (field_names, field_emb_indices): (Vec<String>, Vec<usize>) =
-            marker_children(schema_tokens, "[C]").into_iter().unzip();
-        if field_names.is_empty() {
+        let field_children = marker_children(schema_tokens, "[C]");
+        let field_names: Vec<String> = field_children.iter().map(|(n, _)| n.clone()).collect();
+        if field_children.is_empty() {
             return Ok(JsonValue::Array(Vec::new()));
         }
 
@@ -1754,27 +1752,13 @@ impl GLiNER2 {
             return Ok(JsonValue::Array(Vec::new()));
         }
 
-        let mut field_emb_data: Vec<f32> = Vec::with_capacity(field_names.len() * hidden_size);
-        for &emb_idx in &field_emb_indices {
-            if emb_idx < schema_tokens_embs.len() {
-                let emb = &schema_tokens_embs[emb_idx];
-                if let Ok(data) = emb.flatten_all()
-                    && let Ok(vec) = data.to_vec1::<f32>()
-                {
-                    field_emb_data.extend_from_slice(&vec);
-                }
-            } else {
-                field_emb_data.extend(std::iter::repeat_n(0.0f32, hidden_size));
-            }
-        }
-
-        let field_embs_tensor = match Tensor::from_vec(
-            field_emb_data,
-            (field_names.len(), hidden_size),
+        let Some(field_embs_tensor) = gather_query_embeddings(
+            schema_tokens_embs,
+            &field_children,
+            hidden_size,
             &output.device,
-        ) {
-            Ok(t) => t,
-            Err(_) => return Ok(JsonValue::Array(Vec::new())),
+        ) else {
+            return Ok(JsonValue::Array(Vec::new()));
         };
 
         let pred_count = Self::predicted_count(
