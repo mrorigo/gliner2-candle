@@ -1,8 +1,8 @@
 GLiNER2
 
-# Python reference/virtualenvs (dev-only, not part of the crate)
+# Python reference env for parity-fixture generation only (see
+# scripts/requirements-reference.txt). Not a runtime dependency of the crate.
 /.venv
-/.venv-python
 
 # Added by cargo
 
