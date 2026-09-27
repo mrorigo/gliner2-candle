@@ -1881,6 +1881,73 @@ struct Marginals {
     inside_prefix: Vec<Vec<f32>>,
 }
 
+/// One query's marginal over boundary positions: `q_proj @ k_proj^T / sqrt(d)`,
+/// with positions past `text_len` left at `MASK_LOGIT`.
+///
+/// Symmetric in its two arguments, so start and end are the same computation
+/// over different projections.
+fn boundary_marginal(
+    q_proj: &Tensor,
+    k_proj: &Tensor,
+    q: usize,
+    n: usize,
+    text_len: usize,
+    inv_sqrt_d: f64,
+) -> Result<Vec<Vec<f32>>> {
+    let mm = q_proj
+        .matmul(&k_proj.transpose(0, 1)?)?
+        .affine(inv_sqrt_d, 0.0)?
+        .to_vec2::<f32>()
+        .map_err(|e| GlinerError::inference(format!("{e}")))?;
+    let mut out = vec![vec![MASK_LOGIT; n]; q];
+    for qi in 0..q {
+        for i in 0..n {
+            if i <= text_len {
+                out[qi][i] = mm[qi][i];
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Per-query inside-logit mean and the prefix sums of the centred inside logits.
+///
+/// `prefix[0] = 0`; `prefix[i+1]` is the sum of `inside[t] - mean` over
+/// `t < i`, which is what lets the score for a span be a single subtraction.
+fn inside_marginal(
+    iq_t: &Tensor,
+    itk_t: &Tensor,
+    q: usize,
+    n: usize,
+    l: usize,
+    text_len: usize,
+    inv_sqrt_d: f64,
+) -> Result<(Vec<f32>, Vec<Vec<f32>>)> {
+    let inside_mm = iq_t
+        .matmul(&itk_t.transpose(0, 1)?)?
+        .affine(inv_sqrt_d, 0.0)?
+        .to_vec2::<f32>()
+        .map_err(|e| GlinerError::inference(format!("{e}")))?;
+    let mut mean = vec![0.0f32; q];
+    let mut prefix = vec![vec![0.0f32; n + 1]; q];
+    for qi in 0..q {
+        let mut sum = 0.0f32;
+        #[allow(clippy::needless_range_loop)]
+        for t in 0..text_len.min(l) {
+            sum += inside_mm[qi][t];
+        }
+        mean[qi] = sum / (text_len.max(1) as f32);
+        let mut acc = 0.0f32;
+        for i in 0..=n {
+            prefix[qi][i] = acc;
+            if i < l && i < text_len {
+                acc += inside_mm[qi][i] - mean[qi];
+            }
+        }
+    }
+    Ok((mean, prefix))
+}
+
 /// Compute the start/end/inside marginals from the projected query and boundary
 /// states. `inv_sqrt_d` is the caller's already-computed `1/sqrt(d)`.
 #[allow(clippy::too_many_arguments)]
@@ -1897,53 +1964,9 @@ fn marginal_logits(
     text_len: usize,
     inv_sqrt_d: f64,
 ) -> Result<Marginals> {
-    // start/end: (Q, n) = sq @ sk^T / sqrt_d
-    let start_mm = sq_t
-        .matmul(&sk_t.transpose(0, 1)?)?
-        .affine(inv_sqrt_d, 0.0)?
-        .to_vec2::<f32>()
-        .map_err(|e| GlinerError::inference(format!("{e}")))?;
-    let end_mm = eq_t
-        .matmul(&ek_t.transpose(0, 1)?)?
-        .affine(inv_sqrt_d, 0.0)?
-        .to_vec2::<f32>()
-        .map_err(|e| GlinerError::inference(format!("{e}")))?;
-    let mut start = vec![vec![MASK_LOGIT; n]; q];
-    let mut end = vec![vec![MASK_LOGIT; n]; q];
-    for qi in 0..q {
-        for i in 0..n {
-            if i <= text_len {
-                start[qi][i] = start_mm[qi][i];
-                end[qi][i] = end_mm[qi][i];
-            }
-        }
-    }
-
-    // Inside logits over tokens plus per-query prefix sums over boundaries:
-    // prefix[0] = 0; prefix[i+1] = sum of centered inside logits [0..i].
-    let inside_mm = iq_t
-        .matmul(&itk_t.transpose(0, 1)?)?
-        .affine(inv_sqrt_d, 0.0)?
-        .to_vec2::<f32>()
-        .map_err(|e| GlinerError::inference(format!("{e}")))?;
-    let mut inside_mean = vec![0.0f32; q];
-    let mut inside_prefix = vec![vec![0.0f32; n + 1]; q];
-    for qi in 0..q {
-        let mut sum = 0.0f32;
-        #[allow(clippy::needless_range_loop)]
-        for t in 0..text_len.min(l) {
-            sum += inside_mm[qi][t];
-        }
-        inside_mean[qi] = sum / (text_len.max(1) as f32);
-        let mut acc = 0.0f32;
-        for i in 0..=n {
-            inside_prefix[qi][i] = acc;
-            if i < l && i < text_len {
-                acc += inside_mm[qi][i] - inside_mean[qi];
-            }
-        }
-    }
-
+    let start = boundary_marginal(sq_t, sk_t, q, n, text_len, inv_sqrt_d)?;
+    let end = boundary_marginal(eq_t, ek_t, q, n, text_len, inv_sqrt_d)?;
+    let (inside_mean, inside_prefix) = inside_marginal(iq_t, itk_t, q, n, l, text_len, inv_sqrt_d)?;
     Ok(Marginals {
         start,
         end,

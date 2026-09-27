@@ -23,6 +23,93 @@ pub(crate) struct AttributesRuntime {
     pub groups: Vec<(String, AttributeGroup)>,
 }
 
+/// Build one entity output entry, honouring the confidence/spans flags.
+///
+/// The attributed form (`has_attributes`) is a fixed shape built by insertion,
+/// because attribute groups are merged into it afterwards; every other form is
+/// a literal of the requested shape. Key order is part of the output contract.
+#[allow(clippy::too_many_arguments)]
+fn entity_entry(
+    text: &str,
+    char_start: usize,
+    char_end: usize,
+    conf: f32,
+    has_attributes: bool,
+    include_confidence: bool,
+    include_spans: bool,
+) -> JsonValue {
+    if has_attributes {
+        // Attributed format follows the flags strictly.
+        let mut obj = serde_json::Map::new();
+        obj.insert("text".into(), json!(text));
+        if include_confidence {
+            obj.insert("confidence".into(), json!(conf));
+        }
+        if include_spans {
+            obj.insert("start".into(), json!(char_start));
+            obj.insert("end".into(), json!(char_end));
+        }
+        JsonValue::Object(obj)
+    } else if include_spans && include_confidence {
+        json!({
+            "text": text,
+            "start": char_start,
+            "end": char_end,
+            "confidence": conf,
+        })
+    } else if include_spans {
+        json!({
+            "text": text,
+            "start": char_start,
+            "end": char_end,
+        })
+    } else if include_confidence {
+        json!({
+            "text": text,
+            "confidence": conf,
+        })
+    } else {
+        json!(text)
+    }
+}
+
+/// Build one relation output entry, honouring the confidence/spans flags.
+///
+/// Mirrors the Python decoder's shape precedence: spans (head and tail as
+/// objects), else confidence-only, else a bare `[head, tail]` pair.
+#[allow(clippy::too_many_arguments)]
+fn relation_entry(
+    head_text: &str,
+    head_span: SpanPair,
+    tail_text: &str,
+    tail_span: SpanPair,
+    prob: f32,
+    include_confidence: bool,
+    include_spans: bool,
+) -> JsonValue {
+    if include_spans {
+        let (cs_h, ce_h) = head_span;
+        let (cs_t, ce_t) = tail_span;
+        let mut o = json!({
+            "head": {"text": head_text, "start": cs_h, "end": ce_h},
+            "tail": {"text": tail_text, "start": cs_t, "end": ce_t},
+        });
+        if include_confidence {
+            let conf = json!(prob);
+            o["head"]["confidence"] = conf.clone();
+            o["tail"]["confidence"] = conf;
+        }
+        o
+    } else if include_confidence {
+        json!({
+            "head": {"text": head_text, "confidence": prob},
+            "tail": {"text": tail_text, "confidence": prob},
+        })
+    } else {
+        json!([head_text, tail_text])
+    }
+}
+
 impl AttributesRuntime {
     pub fn is_empty(&self) -> bool {
         self.groups.is_empty()
@@ -424,39 +511,15 @@ fn decode_entities(
             let char_start = char_offset(starts_map, s.min(text_len.saturating_sub(1)));
             let char_end = char_offset(ends_map, (e - 1).min(text_len - 1));
             let text = safe_slice(original_text, char_start, char_end);
-            let entry = if has_attributes {
-                // Attributed format follows the flags strictly.
-                let mut obj = serde_json::Map::new();
-                obj.insert("text".into(), json!(text));
-                if include_confidence {
-                    obj.insert("confidence".into(), json!(conf));
-                }
-                if include_spans {
-                    obj.insert("start".into(), json!(char_start));
-                    obj.insert("end".into(), json!(char_end));
-                }
-                JsonValue::Object(obj)
-            } else if include_spans && include_confidence {
-                json!({
-                    "text": text,
-                    "start": char_start,
-                    "end": char_end,
-                    "confidence": conf,
-                })
-            } else if include_spans {
-                json!({
-                    "text": text,
-                    "start": char_start,
-                    "end": char_end,
-                })
-            } else if include_confidence {
-                json!({
-                    "text": text,
-                    "confidence": conf,
-                })
-            } else {
-                json!(text)
-            };
+            let entry = entity_entry(
+                &text,
+                char_start,
+                char_end,
+                conf,
+                has_attributes,
+                include_confidence,
+                include_spans,
+            );
             entries.push(entry);
             coords.push((s, e));
         }
@@ -750,25 +813,15 @@ fn decode_relations(
                         let tail_text = safe_slice(original_text, cs_t, ce_t);
                         // Output shape mirrors the Python decoder:
                         // spans > confidence-only > bare pairs.
-                        let obj = if include_spans {
-                            let mut o = json!({
-                                "head": {"text": head_text, "start": cs_h, "end": ce_h},
-                                "tail": {"text": tail_text, "start": cs_t, "end": ce_t},
-                            });
-                            if include_confidence {
-                                let conf = json!(prob);
-                                o["head"]["confidence"] = conf.clone();
-                                o["tail"]["confidence"] = conf;
-                            }
-                            o
-                        } else if include_confidence {
-                            json!({
-                                "head": {"text": head_text, "confidence": prob},
-                                "tail": {"text": tail_text, "confidence": prob},
-                            })
-                        } else {
-                            json!([head_text, tail_text])
-                        };
+                        let obj = relation_entry(
+                            &head_text,
+                            (cs_h, ce_h),
+                            &tail_text,
+                            (cs_t, ce_t),
+                            prob,
+                            include_confidence,
+                            include_spans,
+                        );
                         scored_entries.push((prob, obj));
                     }
                     scored_entries
