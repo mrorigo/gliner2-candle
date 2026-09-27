@@ -1,0 +1,28 @@
+# Python reference environment — for generating GLiNER2.5 parity fixtures.
+#
+# This is NOT a runtime dependency of the Rust crate. The crate is pure Rust and
+# needs no Python. This env exists only so `scripts/dump_g25_fixtures.py` can run
+# the upstream reference implementation and emit the numeric fixtures the
+# ignored-by-default parity tests assert against.
+#
+# Version pins are load-bearing:
+#   gliner2      2.0.0 from GIT MAIN, not PyPI. The published 2.0.0 predates the
+#                tokenizer compatibility shim in models/base.py and dies with
+#                "'list' object has no attribute 'keys'" when loading these
+#                checkpoints. The 1.2.x line predates the GLiNER2.5 boundary head
+#                entirely and cannot produce boundary fixtures.
+#   transformers gliner2 2.0.0 declares `transformers<5`. The 2.5 checkpoints'
+#                config.json is written by transformers 5.x, which is misleading:
+#                the 2.0.0 loader runs on 4.x.
+#
+# Create with:
+#   uv venv --python 3.12 .venv
+#   VIRTUAL_ENV=.venv uv pip install -r scripts/requirements-reference.txt
+#
+# Python 3.12 specifically: the Homebrew 3.14 build on this machine has a broken
+# pyexpat (libexpat symbol mismatch), which breaks pip and anything importing
+# xml/xmlrpc.
+gliner2[local] @ git+https://github.com/fastino-ai/GLiNER2
+protobuf
+torch==2.14.0
+transformers==4.57.6

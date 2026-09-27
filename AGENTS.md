@@ -162,9 +162,27 @@ Root causes, in the order they were found and fixed:
    must be applied to pool candidates; content LayerNorm applies to the pooled
    span mean (not per-token); FiLM GELU is exact erf, not tanh.
 
-Parity fixtures live in `/tmp/g25diag/*.json` (regenerate via Python dumps);
-tests: `test_encoder_parity`, `test_staged_parity`, `test_numeric_parity`
-(ignored; require the fixture files).
+Parity is gated by `test_full_matrix_parity`
+(`tests/gliner25_boundary_test.rs`) against committed fixtures in
+`tests/fixtures/g25/`. It asserts encoder embedding output within 1e-5, final
+encoder output within 1e-4, and pooled-candidate pair logits within 0.15
+globally / 0.05 on decision-relevant scores. It is `#[ignore]`d only because it
+downloads ~500MB of weights — run it with `--ignored` after any change to
+`src/model/boundary.rs`, `src/model/deberta_v3.rs`, or `src/inference/boundary.rs`.
+
+Regenerate the fixtures with:
+
+```sh
+.venv/bin/python scripts/dump_g25_fixtures.py
+```
+
+`.venv` is the Python reference env (see
+`scripts/requirements-reference.txt`); install it with `uv`. Regeneration
+reproduces the committed fixtures byte-for-byte, so a diff after running it
+means either a deliberate reference change or a real numeric regression —
+never routine noise. The script installs `gliner2` from
+`fastino-ai/GLiNER2` git main, not PyPI: the published 2.0.0 predates the
+tokenizer compat shim and cannot load the checkpoints.
 
 ### Perf pitfalls
 - Never benchmark unoptimized builds: candle dispatch overhead in debug is
