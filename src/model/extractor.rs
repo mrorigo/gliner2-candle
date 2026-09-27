@@ -165,7 +165,13 @@ pub struct Extractor {
     /// Count prediction layer.
     pub count_pred: CountPredictionLayer,
     /// Count embedding layer for entity scoring.
-    pub count_embed: CountEmbedLayer,
+    ///
+    /// `None` when the checkpoint ships no compatible `count_embed.*` weights.
+    /// Newer checkpoints (`counting_layer: "count_lstm"`) replace the historical
+    /// GRU+transformer block with a plain GRU + MLP projector, which this port does
+    /// not implement. Count guidance is then unavailable, so entity scoring falls
+    /// back to returning no spans. Classification decoding never uses this module.
+    pub count_embed: Option<CountEmbedLayer>,
     /// Classifier head.
     pub classifier: ClassifierHead,
     /// GLiNER2.5 boundary model (populated at weight-load time; `None` for
@@ -229,10 +235,7 @@ impl Extractor {
         // Initialize submodules
         let span_rep = SpanRepresentationLayer::from_config(config, device.clone())?;
         let count_pred = CountPredictionLayer::from_config(config, device.clone())?;
-        let count_embed =
-            CountEmbedLayer::new(config.hidden_size, 20, device.clone()).map_err(|e| {
-                GlinerError::model_loading(format!("Failed to initialize count_embed: {e}"))
-            })?;
+        let count_embed = CountEmbedLayer::new(config.hidden_size, 20, device.clone()).ok();
         let classifier = ClassifierHead::from_config(config, device.clone())?;
 
         Ok(Self {

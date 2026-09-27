@@ -43,7 +43,11 @@ pub mod special_tokens {
     /// Entity token.
     pub const E_TOKEN: &str = "[E]";
     /// Classification token.
-    pub const L_TOKEN: &str = "[C]";
+    ///
+    /// Distinct from `C_TOKEN` (structure/JSON fields) in the tokenizer: `[L]` is
+    /// id 128007, `[C]` is 128004. Both GLiNER2 reference revisions emit `[L]` for
+    /// classification labels, so these must not be aliased.
+    pub const L_TOKEN: &str = "[L]";
     /// Relation token.
     pub const R_TOKEN: &str = "[R]";
     /// Structure/JSON token.
@@ -370,8 +374,16 @@ impl ExtractorCollator {
 
                 // Tokenize this token into subwords and use the produced IDs directly.
                 // This preserves tokenizer context (e.g. continuation pieces like "er", "tino").
+                // Text words are lower-cased first, matching Python's word splitter
+                // (`word_splitter(text, lower=True)`); character offsets still index
+                // the original string because folding happens per-token after the split.
+                let encode_str: String = if seg_type == "text" {
+                    token.to_lowercase()
+                } else {
+                    token.clone()
+                };
                 let (sub_tokens, sub_token_ids): (Vec<String>, Vec<u32>) = hf_tok
-                    .encode(token.as_str(), false)
+                    .encode(encode_str.as_str(), false)
                     .map(|enc| (enc.get_tokens().to_vec(), enc.get_ids().to_vec()))
                     .unwrap_or_else(|_| (vec![token.clone()], vec![0u32]));
 
@@ -609,35 +621,26 @@ impl ExtractorCollator {
         labels: &[String],
         cls_obj: &serde_json::Map<String, JsonValue>,
     ) -> Vec<String> {
-        let mut tokens = vec![
-            special_tokens::OPEN_PAREN.to_string(),
-            special_tokens::P_TOKEN.to_string(),
-            task.to_string(),
-            special_tokens::OPEN_PAREN.to_string(),
-        ];
-
-        // Add label descriptions if available
+        // Python builds ONE prompt string at token index 2 and appends the
+        // instruction, label descriptions and few-shot examples to it as plain
+        // text (gliner2/processor.py::_transform_schema). Emitting them as separate
+        // top-level schema tokens changes the token sequence and, because the
+        // marker scan counts any `[...]` token, shifts the label embedding indices.
+        let mut prompt_str = task.to_string();
+        if let Some(prompt) = cls_obj.get("prompt").and_then(|v| v.as_str()) {
+            prompt_str = format!("{task}: {prompt}");
+        }
         if let Some(label_descs) = cls_obj
             .get("label_descriptions")
             .and_then(|v| v.as_object())
         {
             for label in labels {
-                tokens.push(special_tokens::L_TOKEN.to_string());
-                tokens.push(label.clone());
-
                 if let Some(desc) = label_descs.get(label).and_then(|v| v.as_str()) {
-                    tokens.push(special_tokens::DESC_TOKEN.to_string());
-                    tokens.push(format!("{label}: {desc}"));
+                    prompt_str
+                        .push_str(&format!(" {} {label}: {desc}", special_tokens::DESC_TOKEN));
                 }
             }
-        } else {
-            for label in labels {
-                tokens.push(special_tokens::L_TOKEN.to_string());
-                tokens.push(label.clone());
-            }
         }
-
-        // Add examples if available
         if let Some(examples) = cls_obj.get("examples").and_then(|v| v.as_array()) {
             for example in examples {
                 if let Some(ex_array) = example.as_array()
@@ -645,12 +648,25 @@ impl ExtractorCollator {
                     && let (Some(input), Some(output)) =
                         (ex_array[0].as_str(), ex_array[1].as_str())
                 {
-                    tokens.push(special_tokens::EXAMPLE_TOKEN.to_string());
-                    tokens.push(input.to_string());
-                    tokens.push(special_tokens::OUTPUT_TOKEN.to_string());
-                    tokens.push(output.to_string());
+                    prompt_str.push_str(&format!(
+                        " {} {input} {} {output}",
+                        special_tokens::EXAMPLE_TOKEN,
+                        special_tokens::OUTPUT_TOKEN
+                    ));
                 }
             }
+        }
+
+        let mut tokens = vec![
+            special_tokens::OPEN_PAREN.to_string(),
+            special_tokens::P_TOKEN.to_string(),
+            prompt_str,
+            special_tokens::OPEN_PAREN.to_string(),
+        ];
+
+        for label in labels {
+            tokens.push(special_tokens::L_TOKEN.to_string());
+            tokens.push(label.clone());
         }
 
         tokens.push(special_tokens::CLOSE_PAREN.to_string());
@@ -891,12 +907,55 @@ mod tests {
 
         let tokens = collator.build_classification_tokens("sentiment", &labels, &cls_obj);
 
-        assert!(tokens.contains(&"(".to_string()));
-        assert!(tokens.contains(&"[P]".to_string()));
-        assert!(tokens.contains(&"sentiment".to_string()));
-        assert!(tokens.contains(&"[C]".to_string()));
-        assert!(tokens.contains(&"positive".to_string()));
-        assert!(tokens.contains(&"negative".to_string()));
+        // Layout: ["(", "[P]", "<folded prompt>", "(", "[L]", label, ..., ")", ")"]
+        // `[L]`, not `[C]`: classification labels use a distinct tokenizer id.
+        assert_eq!(
+            tokens,
+            vec![
+                "(",
+                "[P]",
+                "sentiment",
+                "(",
+                "[L]",
+                "positive",
+                "[L]",
+                "negative",
+                ")",
+                ")"
+            ]
+        );
+    }
+
+    #[test]
+    fn test_classification_prompt_and_descriptions_fold_into_prompt_string() {
+        let tokenizer = WhitespaceTokenizer::new();
+        let collator = ExtractorCollator::new(tokenizer, false);
+
+        let labels = vec!["card_lost".to_string()];
+        let cls_obj = serde_json::json!({
+            "task": "intent",
+            "prompt": "What does the customer want?",
+            "labels": ["card_lost"],
+            "label_descriptions": { "card_lost": "The physical card is missing" }
+        })
+        .as_object()
+        .cloned()
+        .unwrap();
+
+        let tokens = collator.build_classification_tokens("intent", &labels, &cls_obj);
+
+        // Index 2 carries instruction + descriptions as plain text, not as separate
+        // top-level schema tokens (see gliner2/processor.py::_transform_schema).
+        assert_eq!(
+            tokens[2],
+            "intent: What does the customer want? \
+             [DESCRIPTION] card_lost: The physical card is missing"
+        );
+        assert_eq!(tokens[3], "(");
+        assert_eq!(tokens[4], "[L]");
+        assert_eq!(tokens[5], "card_lost");
+        // No stray structural tokens after the label.
+        assert_eq!(tokens.len(), 8);
     }
 
     #[test]

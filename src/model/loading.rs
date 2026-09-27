@@ -205,14 +205,36 @@ impl ModelLoader {
         )
         .map_err(|e| GlinerError::model_loading(format!("Failed to rebuild count_pred: {e}")))?;
 
-        // Rebuild count embedding layer with loaded weights
-        model.count_embed = crate::model::count_embed::CountEmbedLayer::from_var_builder(
-            vb.pp("count_embed"),
-            self.config.hidden_size,
-            20,
-            self.device.clone(),
-        )
-        .map_err(|e| GlinerError::model_loading(format!("Failed to rebuild count_embed: {e}")))?;
+        // Rebuild count embedding layer with loaded weights.
+        //
+        // Optional: checkpoints with `counting_layer: "count_lstm"` (e.g. the
+        // GLiNER2.5-Decide family) ship `count_embed.gru` + `count_embed.projector`
+        // instead of the historical `count_embed.transformer.*` block this port
+        // implements. Probe for the transformer block and skip when absent.
+        let count_embed_vb = vb.pp("count_embed");
+        model.count_embed = match count_embed_vb
+            .get((20, self.config.hidden_size), "pos_embedding.weight")
+        {
+            Err(_) => None,
+            Ok(_) => match count_embed_vb
+                .pp("transformer")
+                .pp("in_projector")
+                .get((self.config.hidden_size, 128), "weight")
+            {
+                Ok(_) => Some(
+                    crate::model::count_embed::CountEmbedLayer::from_var_builder(
+                        count_embed_vb,
+                        self.config.hidden_size,
+                        20,
+                        self.device.clone(),
+                    )
+                    .map_err(|e| {
+                        GlinerError::model_loading(format!("Failed to rebuild count_embed: {e}"))
+                    })?,
+                ),
+                Err(_) => None,
+            },
+        };
 
         // Rebuild classifier head with loaded weights
         model.classifier = crate::model::classifier::ClassifierHead::from_var_builder(

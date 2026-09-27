@@ -155,6 +155,10 @@ impl GLiNER2 {
             if let Some(hf_config_path) = Self::download_hf_config(&input_str)
                 && let Ok(hf_config_str) = std::fs::read_to_string(&hf_config_path)
             {
+                // config.json is authoritative: "span" vs "boundary". Name matching
+                // alone misreads e.g. "GLiNER2.5-Decide", which is a span checkpoint.
+                config.architecture =
+                    crate::config::Architecture::from_hf_config_json(&hf_config_str);
                 // Parse boundary config for GLiNER2.5
                 config.boundary =
                     crate::config::BoundaryConfig::from_hf_config_json(&hf_config_str);
@@ -1062,12 +1066,15 @@ impl GLiNER2 {
                     result.insert("entities".to_string(), task_result);
                 }
                 "classifications" => {
-                    // Get task name from schema tokens
+                    // Token index 2 is the folded prompt string; recover the task name.
                     if let Some(schema_tokens) = batch.schema_tokens(sample_idx, schema_idx)
-                        && schema_tokens.len() > 2
+                        && let Some(prompt_str) = schema_tokens.get(2)
+                        && let Some(task_name) = batch
+                            .original_schemas
+                            .get(sample_idx)
+                            .and_then(|s| Self::resolve_classification_task(s, prompt_str))
                     {
-                        let task_name = &schema_tokens[2];
-                        result.insert(task_name.clone(), task_result);
+                        result.insert(task_name, task_result);
                     }
                 }
                 "relations" => {
@@ -1237,11 +1244,10 @@ impl GLiNER2 {
 
         // Step 3: Transform entity embeddings using count_embed
         // Output shape: (pred_count, num_entity_types, hidden)
-        let struct_proj = match self
-            .model
-            .count_embed
-            .forward(&entity_embs_tensor, pred_count)
-        {
+        let Some(count_embed) = self.model.count_embed.as_ref() else {
+            return Ok(JsonValue::Object(entities));
+        };
+        let struct_proj = match count_embed.forward(&entity_embs_tensor, pred_count) {
             Ok(out) => out.embeddings,
             Err(_) => return Ok(JsonValue::Object(entities)),
         };
@@ -1367,7 +1373,8 @@ impl GLiNER2 {
                                 char_start
                             };
 
-                            let entity_text = if !original_text.is_empty() && char_start <= char_end {
+                            let entity_text = if !original_text.is_empty() && char_start <= char_end
+                            {
                                 safe_slice(original_text, char_start, char_end)
                             } else if start_pos < text_tokens.len() && end_pos < text_tokens.len() {
                                 text_tokens[start_pos..=end_pos].join(" ")
@@ -1412,8 +1419,11 @@ impl GLiNER2 {
             return Ok(JsonValue::Null);
         }
 
-        // Parse schema tokens and map label markers to corresponding special-token embeddings.
-        // In this collator, labels use "[C]" (same token as structure fields).
+        // Map each `[L]` label marker to its schema embedding slot. Python uses
+        // `embs[1:]` (skipping `[P]`), which is the same set: the only bracket
+        // tokens in a classification group are `[P]`, the `[L]` markers, and the
+        // two closing parens. Token index 2 is the folded prompt string, which no
+        // longer counts because it does not start with `[`.
         let schema_tokens = batch.schema_tokens(sample_idx, schema_idx).ok_or_else(|| {
             GlinerError::inference("Missing schema tokens for classification task")
         })?;
@@ -1422,7 +1432,7 @@ impl GLiNER2 {
         let mut special_token_counter = 0usize;
         for (i, token) in schema_tokens.iter().enumerate() {
             if token.starts_with('[') && token.ends_with(']') {
-                if (token == "[C]" || token == "[L]") && i + 1 < schema_tokens.len() {
+                if token == "[L]" && i + 1 < schema_tokens.len() {
                     labels.push(schema_tokens[i + 1].clone());
                     label_emb_indices.push(special_token_counter);
                 }
@@ -1454,12 +1464,24 @@ impl GLiNER2 {
             .map_err(|e| {
                 GlinerError::inference(format!("Failed to decode classification logits: {e}"))
             })?;
-        let probs: Vec<f32> = logits_vec
-            .into_iter()
-            .map(|v| 1.0 / (1.0 + (-v).exp()))
-            .collect();
-
         let is_multi_label = Self::is_multilabel_task(batch, sample_idx, schema_idx);
+
+        // Python: sigmoid for multi_label, softmax otherwise
+        // (`GLiNER2._extract_classification_result`). The argmax is unaffected, but
+        // the reported confidence is not.
+        let probs: Vec<f32> = if is_multi_label {
+            logits_vec
+                .iter()
+                .map(|v| 1.0 / (1.0 + (-v).exp()))
+                .collect()
+        } else {
+            let max = logits_vec.iter().cloned().fold(f32::MIN, f32::max);
+            let sum: f32 = logits_vec.iter().map(|v| (v - max).exp()).sum();
+            logits_vec
+                .iter()
+                .map(|v| (v - max).exp() / sum.max(f32::MIN_POSITIVE))
+                .collect()
+        };
 
         if is_multi_label {
             let mut selected = Vec::new();
@@ -1590,11 +1612,10 @@ impl GLiNER2 {
             schema_tokens_embs,
             &self.model,
         );
-        let struct_proj = match self
-            .model
-            .count_embed
-            .forward(&field_embs_tensor, pred_count)
-        {
+        let Some(count_embed) = self.model.count_embed.as_ref() else {
+            return Ok(JsonValue::Array(Vec::new()));
+        };
+        let struct_proj = match count_embed.forward(&field_embs_tensor, pred_count) {
             Ok(out) => out.embeddings,
             Err(_) => return Ok(JsonValue::Array(Vec::new())),
         };
@@ -1788,11 +1809,10 @@ impl GLiNER2 {
             schema_tokens_embs,
             &self.model,
         );
-        let struct_proj = match self
-            .model
-            .count_embed
-            .forward(&field_embs_tensor, pred_count)
-        {
+        let Some(count_embed) = self.model.count_embed.as_ref() else {
+            return Ok(JsonValue::Array(Vec::new()));
+        };
+        let struct_proj = match count_embed.forward(&field_embs_tensor, pred_count) {
             Ok(out) => out.embeddings,
             Err(_) => return Ok(JsonValue::Array(Vec::new())),
         };
@@ -1921,7 +1941,11 @@ impl GLiNER2 {
         }
 
         let p_emb = &schema_tokens_embs[0];
-        model.count_pred.predict_count(p_emb).map(|out| out.count).unwrap_or(1)
+        model
+            .count_pred
+            .predict_count(p_emb)
+            .map(|out| out.count)
+            .unwrap_or(1)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2113,17 +2137,54 @@ impl GLiNER2 {
         ("list".to_string(), None, Vec::new())
     }
 
+    /// Recover the classification task name from the folded prompt string.
+    ///
+    /// Port of `GLiNER2._resolve_classification_config`. Token index 2 holds the
+    /// whole prompt string (`"<task>"`, or `"<task>: <instruction>"`, plus
+    /// appended `[DESCRIPTION]` / `[EXAMPLE]` segments), so an exact match is not
+    /// enough. Prefers the longest task that prefixes the string, and requires the
+    /// remainder to be empty or start with `':'`/`' '` so that `intent` does not
+    /// shadow `intensity`.
+    fn resolve_classification_task(schema_json: &JsonValue, prompt_str: &str) -> Option<String> {
+        let items = schema_json.get("classifications")?.as_array()?;
+        let mut best: Option<&str> = None;
+        for item in items {
+            let Some(task) = item.get("task").and_then(|t| t.as_str()) else {
+                continue;
+            };
+            if task.is_empty() || !prompt_str.starts_with(task) {
+                continue;
+            }
+            let rest = &prompt_str[task.len()..];
+            let ok = rest.is_empty() || rest.starts_with(':') || rest.starts_with(' ');
+            if ok && best.is_none_or(|b| task.len() > b.len()) {
+                best = Some(task);
+            }
+        }
+        if best.is_some() {
+            return best.map(str::to_string);
+        }
+        // Fallback: any task that prefixes the string, first match wins.
+        items.iter().find_map(|item| {
+            let task = item.get("task")?.as_str()?;
+            prompt_str.starts_with(task).then(|| task.to_string())
+        })
+    }
+
     fn is_multilabel_task(batch: &PreprocessedBatch, sample_idx: usize, schema_idx: usize) -> bool {
-        let task_name = batch
+        let Some(prompt_str) = batch
             .schema_tokens(sample_idx, schema_idx)
             .and_then(|tokens| tokens.get(2))
-            .cloned();
-
-        let Some(task_name) = task_name else {
+            .cloned()
+        else {
             return false;
         };
 
         let Some(schema_json) = batch.original_schemas.get(sample_idx) else {
+            return false;
+        };
+
+        let Some(task) = Self::resolve_classification_task(schema_json, &prompt_str) else {
             return false;
         };
 
@@ -2133,16 +2194,12 @@ impl GLiNER2 {
             .and_then(|items| {
                 items.iter().find_map(|item| {
                     let obj = item.as_object()?;
-                    let task = obj.get("task")?.as_str()?;
-                    if task == task_name {
-                        Some(
-                            obj.get("multi_label")
-                                .and_then(|v| v.as_bool())
-                                .unwrap_or(false),
-                        )
-                    } else {
-                        None
-                    }
+                    let t = obj.get("task")?.as_str()?;
+                    (t == task).then(|| {
+                        obj.get("multi_label")
+                            .and_then(|m| m.as_bool())
+                            .unwrap_or(false)
+                    })
                 })
             })
             .unwrap_or(false)
@@ -2346,7 +2403,10 @@ mod tests {
         let end_zurich = start_zurich + "Zürich".len();
         let zurich_slice = safe_slice(unicode_text, start_zurich, end_zurich);
         assert_eq!(zurich_slice, "Zürich");
-        assert_eq!(unicode_text.get(start_zurich..end_zurich), Some(zurich_slice.as_str()));
+        assert_eq!(
+            unicode_text.get(start_zurich..end_zurich),
+            Some(zurich_slice.as_str())
+        );
 
         let start_bj = unicode_text.find("北京").unwrap();
         let end_bj = start_bj + "北京".len();
@@ -2365,10 +2425,7 @@ mod tests {
 
         // 1. Neither spans nor confidence
         let res_bare = GLiNER2::format_spans(&mut spans.clone(), false, false);
-        assert_eq!(
-            res_bare,
-            serde_json::json!(["Tim Cook", "Apple"])
-        );
+        assert_eq!(res_bare, serde_json::json!(["Tim Cook", "Apple"]));
 
         // 2. Only spans
         let res_spans = GLiNER2::format_spans(&mut spans.clone(), false, true);
