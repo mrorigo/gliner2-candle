@@ -78,6 +78,74 @@ pub struct GLiNER2 {
     device: Device,
 }
 
+/// Collect `(name, embedding_slot)` pairs for schema tokens following `marker`.
+///
+/// A schema group is a flat token list whose bracket tokens (`[P]`, `[E]`,
+/// `[L]`, `[C]`, `[R]`, parens) are each expanded to one special-token id, and
+/// the expanded row order is what the per-sample `schema_embeddings` vector is
+/// indexed by. So a child's embedding slot is the ordinal of its marker among
+/// *all* bracket tokens in the group, not its position among the children.
+///
+/// The folded classification prompt at index 2 deliberately does not count: it
+/// does not start with `[`, so it is not a marker. Getting that wrong silently
+/// shifts every label onto the wrong embedding.
+///
+/// Mirrors `boundary::build_queries`; the two must stay in step.
+fn marker_children(schema_tokens: &[String], marker: &str) -> Vec<(String, usize)> {
+    let mut out = Vec::new();
+    let mut slot = 0usize;
+    for (i, token) in schema_tokens.iter().enumerate() {
+        if !(token.starts_with('[') && token.ends_with(']')) {
+            continue;
+        }
+        if token == marker && i + 1 < schema_tokens.len() {
+            out.push((schema_tokens[i + 1].clone(), slot));
+        }
+        slot += 1;
+    }
+    out
+}
+
+/// Gather schema-embedding rows for `children` into an `(n, hidden_size)` tensor.
+///
+/// `children` is [`marker_children`] output, so the row order matches the
+/// caller's name vector. A slot past the end of `schema_tokens_embs` is
+/// zero-filled rather than dropped, keeping one row per child so row indices
+/// stay aligned with names.
+///
+/// Returns `None` if a *present* row cannot be flattened, or if the tensor
+/// cannot be built — matching the inline code this replaced, which left the
+/// buffer short and let `Tensor::from_vec` fail.
+fn gather_query_embeddings(
+    schema_tokens_embs: &[Tensor],
+    children: &[(String, usize)],
+    hidden_size: usize,
+    device: &Device,
+) -> Option<Tensor> {
+    let mut data = Vec::with_capacity(children.len() * hidden_size);
+    for &(_, slot) in children {
+        if let Some(emb) = schema_tokens_embs.get(slot) {
+            data.extend_from_slice(&emb.flatten_all().ok()?.to_vec1::<f32>().ok()?);
+        } else {
+            data.resize(data.len() + hidden_size, 0.0);
+        }
+    }
+    Tensor::from_vec(data, (children.len(), hidden_size), device).ok()
+}
+
+/// Flattened span-scoring inputs, shared by the count-guided extraction paths.
+///
+/// The relations, structures and entities decoders each need the same four
+/// tensors flattened to contiguous buffers plus the mask dimensions, and each
+/// previously inlined its own copy of that plumbing.
+struct SpanScoreInputs {
+    struct_proj_data: Vec<f32>,
+    span_rep_data: Vec<f32>,
+    mask_data: Vec<u32>,
+    spans_idx_data: Vec<u32>,
+    mask_dims: Vec<usize>,
+}
+
 impl GLiNER2 {
     // -------------------------------------------------------------------------
     // Construction
@@ -1162,30 +1230,20 @@ impl GLiNER2 {
 
         // Find entity type tokens (tokens following [E] markers)
         // Schema format: ["(", "[P]", "entities", "(", "[E]", "location", "[E]", "organization", "[E]", "person", ")", ")"]
-        let mut entity_types: Vec<String> = Vec::new();
-        let mut entity_type_indices: Vec<usize> = Vec::new();
-        let mut special_token_counter = 0;
-        for (i, token) in schema_tokens.iter().enumerate() {
-            if token.starts_with('[') && token.ends_with(']') {
-                if token == "[E]" && i + 1 < schema_tokens.len() {
-                    let entity_type = schema_tokens[i + 1].clone();
-                    if !entity_type.is_empty() {
-                        entity_types.push(entity_type);
-                        entity_type_indices.push(special_token_counter);
-                    }
-                }
-                special_token_counter += 1;
-            }
-        }
+        let entity_children: Vec<(String, usize)> = marker_children(schema_tokens, "[E]")
+            .into_iter()
+            .filter(|(name, _)| !name.is_empty())
+            .collect();
 
+        let entity_types: Vec<String> = entity_children.iter().map(|(n, _)| n.clone()).collect();
         if entity_types.is_empty() {
             return Ok(JsonValue::Object(entities));
         }
 
         // Get span rep shape: (seq_len, max_width, hidden_size)
+        // span_mask / spans_idx are read via `span_output` in
+        // `prepare_span_score_inputs` below, so only span_rep is needed here.
         let span_rep = &span_output.span_rep;
-        let span_mask = &span_output.span_mask;
-        let spans_idx = &span_output.spans_idx;
 
         let dims = span_rep.dims();
         if dims.len() != 3 {
@@ -1207,29 +1265,14 @@ impl GLiNER2 {
             return Ok(JsonValue::Object(entities));
         }
 
-        let mut entity_emb_data: Vec<f32> = Vec::with_capacity(num_entity_types * hidden_size);
-        for &emb_idx in &entity_type_indices {
-            if emb_idx < schema_tokens_embs.len() {
-                let emb = &schema_tokens_embs[emb_idx];
-                if let Ok(data) = emb.flatten_all()
-                    && let Ok(vec) = data.to_vec1::<f32>()
-                {
-                    entity_emb_data.extend_from_slice(&vec);
-                }
-            } else {
-                // Pad with zeros if embedding not found
-                entity_emb_data.extend(std::iter::repeat_n(0.0f32, hidden_size));
-            }
-        }
-
-        // Create entity embeddings tensor: (num_entity_types, hidden)
-        let entity_embs_tensor = match Tensor::from_vec(
-            entity_emb_data,
-            (num_entity_types, hidden_size),
+        // Entity embeddings tensor: (num_entity_types, hidden)
+        let Some(entity_embs_tensor) = gather_query_embeddings(
+            schema_tokens_embs,
+            &entity_children,
+            hidden_size,
             &output.device,
-        ) {
-            Ok(t) => t,
-            Err(_) => return Ok(JsonValue::Object(entities)),
+        ) else {
+            return Ok(JsonValue::Object(entities));
         };
 
         // Step 2: Predict count using count_pred layer
@@ -1247,42 +1290,25 @@ impl GLiNER2 {
         let Some(count_embed) = self.model.count_embed.as_ref() else {
             return Ok(JsonValue::Object(entities));
         };
-        let struct_proj = match count_embed.forward(&entity_embs_tensor, pred_count) {
-            Ok(out) => out.embeddings,
-            Err(_) => return Ok(JsonValue::Object(entities)),
+        let Some(inputs) = Self::prepare_span_score_inputs(
+            count_embed,
+            &entity_embs_tensor,
+            pred_count,
+            span_output,
+        ) else {
+            return Ok(JsonValue::Object(entities));
         };
-
-        // Get struct_proj as flat data: (pred_count, num_entity_types, hidden)
-        let struct_proj_data: Vec<f32> = match struct_proj.flatten_all() {
-            Ok(t) => t.to_vec1().unwrap_or_default(),
-            Err(_) => return Ok(JsonValue::Object(entities)),
-        };
-
-        // Get span mask dimensions
-        let span_mask_dims = span_mask.dims();
-        if span_mask_dims.len() != 2 {
+        let SpanScoreInputs {
+            struct_proj_data,
+            span_rep_data,
+            mask_data,
+            spans_idx_data,
+            mask_dims,
+        } = inputs;
+        if mask_dims.len() != 2 {
             return Ok(JsonValue::Object(entities));
         }
-        let mask_seq_len = span_mask_dims[0];
-        let mask_max_width = span_mask_dims[1];
-
-        // Get span mask as flat vector
-        let mask_data: Vec<u32> = match span_mask.flatten_all() {
-            Ok(t) => t.to_vec1().unwrap_or_default(),
-            Err(_) => return Ok(JsonValue::Object(entities)),
-        };
-
-        // Get span reps as flat data: (seq_len, max_width, hidden)
-        let span_rep_data: Vec<f32> = match span_rep.flatten_all() {
-            Ok(t) => t.to_vec1().unwrap_or_default(),
-            Err(_) => return Ok(JsonValue::Object(entities)),
-        };
-
-        // Get spans indices
-        let spans_idx_data: Vec<u32> = match spans_idx.flatten_all() {
-            Ok(t) => t.to_vec1().unwrap_or_default(),
-            Err(_) => return Ok(JsonValue::Object(entities)),
-        };
+        let (mask_seq_len, mask_max_width) = (mask_dims[0], mask_dims[1]);
 
         // Step 4: Compute scores using einsum-like operation
         // Python: torch.einsum("lkd,bpd->bplk", span_rep, struct_proj)
@@ -1427,18 +1453,8 @@ impl GLiNER2 {
         let schema_tokens = batch.schema_tokens(sample_idx, schema_idx).ok_or_else(|| {
             GlinerError::inference("Missing schema tokens for classification task")
         })?;
-        let mut labels = Vec::new();
-        let mut label_emb_indices = Vec::new();
-        let mut special_token_counter = 0usize;
-        for (i, token) in schema_tokens.iter().enumerate() {
-            if token.starts_with('[') && token.ends_with(']') {
-                if token == "[L]" && i + 1 < schema_tokens.len() {
-                    labels.push(schema_tokens[i + 1].clone());
-                    label_emb_indices.push(special_token_counter);
-                }
-                special_token_counter += 1;
-            }
-        }
+        let (labels, label_emb_indices): (Vec<String>, Vec<usize>) =
+            marker_children(schema_tokens, "[L]").into_iter().unzip();
 
         if labels.is_empty() {
             return Ok(JsonValue::Null);
@@ -1560,19 +1576,9 @@ impl GLiNER2 {
         };
 
         // Relation fields are tokens that follow [R].
-        let mut field_names = Vec::new();
-        let mut field_emb_indices = Vec::new();
-        let mut special_token_counter = 0usize;
-        for (i, token) in schema_tokens.iter().enumerate() {
-            if token.starts_with('[') && token.ends_with(']') {
-                if token == "[R]" && i + 1 < schema_tokens.len() {
-                    field_names.push(schema_tokens[i + 1].clone());
-                    field_emb_indices.push(special_token_counter);
-                }
-                special_token_counter += 1;
-            }
-        }
-        if field_names.len() < 2 {
+        let field_children = marker_children(schema_tokens, "[R]");
+        let field_names: Vec<String> = field_children.iter().map(|(n, _)| n.clone()).collect();
+        if field_children.len() < 2 {
             return Ok(JsonValue::Array(Vec::new()));
         }
 
@@ -1581,27 +1587,13 @@ impl GLiNER2 {
             return Ok(JsonValue::Array(Vec::new()));
         }
 
-        let mut field_emb_data: Vec<f32> = Vec::with_capacity(field_names.len() * hidden_size);
-        for &emb_idx in &field_emb_indices {
-            if emb_idx < schema_tokens_embs.len() {
-                let emb = &schema_tokens_embs[emb_idx];
-                if let Ok(data) = emb.flatten_all()
-                    && let Ok(vec) = data.to_vec1::<f32>()
-                {
-                    field_emb_data.extend_from_slice(&vec);
-                }
-            } else {
-                field_emb_data.extend(std::iter::repeat_n(0.0f32, hidden_size));
-            }
-        }
-
-        let field_embs_tensor = match Tensor::from_vec(
-            field_emb_data,
-            (field_names.len(), hidden_size),
+        let Some(field_embs_tensor) = gather_query_embeddings(
+            schema_tokens_embs,
+            &field_children,
+            hidden_size,
             &output.device,
-        ) {
-            Ok(t) => t,
-            Err(_) => return Ok(JsonValue::Array(Vec::new())),
+        ) else {
+            return Ok(JsonValue::Array(Vec::new()));
         };
 
         let pred_count = Self::predicted_count(
@@ -1615,29 +1607,21 @@ impl GLiNER2 {
         let Some(count_embed) = self.model.count_embed.as_ref() else {
             return Ok(JsonValue::Array(Vec::new()));
         };
-        let struct_proj = match count_embed.forward(&field_embs_tensor, pred_count) {
-            Ok(out) => out.embeddings,
-            Err(_) => return Ok(JsonValue::Array(Vec::new())),
+        let Some(inputs) = Self::prepare_span_score_inputs(
+            count_embed,
+            &field_embs_tensor,
+            pred_count,
+            span_outputs,
+        ) else {
+            return Ok(JsonValue::Array(Vec::new()));
         };
-
-        let struct_proj_data: Vec<f32> = match struct_proj.flatten_all() {
-            Ok(t) => t.to_vec1().unwrap_or_default(),
-            Err(_) => return Ok(JsonValue::Array(Vec::new())),
-        };
-        let span_rep_data: Vec<f32> = match span_outputs.span_rep.flatten_all() {
-            Ok(t) => t.to_vec1().unwrap_or_default(),
-            Err(_) => return Ok(JsonValue::Array(Vec::new())),
-        };
-        let mask_data: Vec<u32> = match span_outputs.span_mask.flatten_all() {
-            Ok(t) => t.to_vec1().unwrap_or_default(),
-            Err(_) => return Ok(JsonValue::Array(Vec::new())),
-        };
-        let spans_idx_data: Vec<u32> = match span_outputs.spans_idx.flatten_all() {
-            Ok(t) => t.to_vec1().unwrap_or_default(),
-            Err(_) => return Ok(JsonValue::Array(Vec::new())),
-        };
-
-        let mask_dims = span_outputs.span_mask.dims();
+        let SpanScoreInputs {
+            struct_proj_data,
+            span_rep_data,
+            mask_data,
+            spans_idx_data,
+            mask_dims,
+        } = inputs;
         if mask_dims.len() != 2 {
             return Ok(JsonValue::Array(Vec::new()));
         }
@@ -1757,19 +1741,9 @@ impl GLiNER2 {
         };
 
         // Structure fields are tokens that follow [C].
-        let mut field_names = Vec::new();
-        let mut field_emb_indices = Vec::new();
-        let mut special_token_counter = 0usize;
-        for (i, token) in schema_tokens.iter().enumerate() {
-            if token.starts_with('[') && token.ends_with(']') {
-                if token == "[C]" && i + 1 < schema_tokens.len() {
-                    field_names.push(schema_tokens[i + 1].clone());
-                    field_emb_indices.push(special_token_counter);
-                }
-                special_token_counter += 1;
-            }
-        }
-        if field_names.is_empty() {
+        let field_children = marker_children(schema_tokens, "[C]");
+        let field_names: Vec<String> = field_children.iter().map(|(n, _)| n.clone()).collect();
+        if field_children.is_empty() {
             return Ok(JsonValue::Array(Vec::new()));
         }
 
@@ -1778,27 +1752,13 @@ impl GLiNER2 {
             return Ok(JsonValue::Array(Vec::new()));
         }
 
-        let mut field_emb_data: Vec<f32> = Vec::with_capacity(field_names.len() * hidden_size);
-        for &emb_idx in &field_emb_indices {
-            if emb_idx < schema_tokens_embs.len() {
-                let emb = &schema_tokens_embs[emb_idx];
-                if let Ok(data) = emb.flatten_all()
-                    && let Ok(vec) = data.to_vec1::<f32>()
-                {
-                    field_emb_data.extend_from_slice(&vec);
-                }
-            } else {
-                field_emb_data.extend(std::iter::repeat_n(0.0f32, hidden_size));
-            }
-        }
-
-        let field_embs_tensor = match Tensor::from_vec(
-            field_emb_data,
-            (field_names.len(), hidden_size),
+        let Some(field_embs_tensor) = gather_query_embeddings(
+            schema_tokens_embs,
+            &field_children,
+            hidden_size,
             &output.device,
-        ) {
-            Ok(t) => t,
-            Err(_) => return Ok(JsonValue::Array(Vec::new())),
+        ) else {
+            return Ok(JsonValue::Array(Vec::new()));
         };
 
         let pred_count = Self::predicted_count(
@@ -1812,29 +1772,21 @@ impl GLiNER2 {
         let Some(count_embed) = self.model.count_embed.as_ref() else {
             return Ok(JsonValue::Array(Vec::new()));
         };
-        let struct_proj = match count_embed.forward(&field_embs_tensor, pred_count) {
-            Ok(out) => out.embeddings,
-            Err(_) => return Ok(JsonValue::Array(Vec::new())),
+        let Some(inputs) = Self::prepare_span_score_inputs(
+            count_embed,
+            &field_embs_tensor,
+            pred_count,
+            span_outputs,
+        ) else {
+            return Ok(JsonValue::Array(Vec::new()));
         };
-
-        let struct_proj_data: Vec<f32> = match struct_proj.flatten_all() {
-            Ok(t) => t.to_vec1().unwrap_or_default(),
-            Err(_) => return Ok(JsonValue::Array(Vec::new())),
-        };
-        let span_rep_data: Vec<f32> = match span_outputs.span_rep.flatten_all() {
-            Ok(t) => t.to_vec1().unwrap_or_default(),
-            Err(_) => return Ok(JsonValue::Array(Vec::new())),
-        };
-        let mask_data: Vec<u32> = match span_outputs.span_mask.flatten_all() {
-            Ok(t) => t.to_vec1().unwrap_or_default(),
-            Err(_) => return Ok(JsonValue::Array(Vec::new())),
-        };
-        let spans_idx_data: Vec<u32> = match span_outputs.spans_idx.flatten_all() {
-            Ok(t) => t.to_vec1().unwrap_or_default(),
-            Err(_) => return Ok(JsonValue::Array(Vec::new())),
-        };
-
-        let mask_dims = span_outputs.span_mask.dims();
+        let SpanScoreInputs {
+            struct_proj_data,
+            span_rep_data,
+            mask_data,
+            spans_idx_data,
+            mask_dims,
+        } = inputs;
         if mask_dims.len() != 2 {
             return Ok(JsonValue::Array(Vec::new()));
         }
@@ -1919,6 +1871,31 @@ impl GLiNER2 {
         }
 
         Ok(JsonValue::Array(instances))
+    }
+
+    /// Build [`SpanScoreInputs`], or `None` if any tensor is unavailable.
+    ///
+    /// `field_embs` is the query-embedding tensor to run through `count_embed`,
+    /// and `pred_count` is the number of count steps. A `None` result means the
+    /// caller cannot produce a scored span and should return its empty value,
+    /// which is what every call site did inline before this was factored out.
+    fn prepare_span_score_inputs(
+        count_embed: &crate::model::count_embed::CountEmbedLayer,
+        field_embs: &Tensor,
+        pred_count: usize,
+        span_outputs: &crate::model::span_rep::SpanRepOutput,
+    ) -> Option<SpanScoreInputs> {
+        let struct_proj = count_embed.forward(field_embs, pred_count).ok()?.embeddings;
+        let to_f32 = |t: &Tensor| t.flatten_all().ok()?.to_vec1::<f32>().ok();
+        let to_u32 = |t: &Tensor| t.flatten_all().ok()?.to_vec1::<u32>().ok();
+
+        Some(SpanScoreInputs {
+            struct_proj_data: to_f32(&struct_proj)?,
+            span_rep_data: to_f32(&span_outputs.span_rep)?,
+            mask_data: to_u32(&span_outputs.span_mask)?,
+            spans_idx_data: to_u32(&span_outputs.spans_idx)?,
+            mask_dims: span_outputs.span_mask.dims().to_vec(),
+        })
     }
 
     fn predicted_count(
