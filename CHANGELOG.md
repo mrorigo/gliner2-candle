@@ -7,13 +7,64 @@ versions remain `0.x` (pre-1.0, additive-only semver policy).
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-09-27
+
+### Added
+
+- **GLiNER2.5-Decide support.** The Decide family is a zero-shot
+  classification specialist. It is not a new architecture — it is a fine-tune of
+  the existing GLiNER2 span model reusing the `classifier` head over
+  `[L]`-marked label embeddings, so the span and boundary pipelines both run it
+  unchanged.
+  - `fastino/GLiNER2.5-Decide` (340M, span, DeBERTa-v3-large) — supported
+  - `fastino/GLiNER2.5-multi-Decide` (287M, boundary, multilingual) — supported
+  - `fastino/GLiNER2.5-Decide-1B` (ModernBERT encoder) — **not** supported; needs
+    a ModernBERT encoder this port does not have
+- Verified against the published model-card surface: single-label, multi-label
+  with threshold, several heads scored in one forward pass, labels carrying
+  descriptions, per-task instructions, few-shot examples, and ordinal scales
+  (`tests/decide_test.rs`).
+- Reference repo correction: `urchade/GLiNER2.5` returns 404. The live upstream
+  is [`fastino-ai/GLiNER2`](https://github.com/fastino-ai/GLiNER2)
+  (`gliner2` 2.0.0). The vendored `GLiNER2/` directory in this repo is stale at
+  v1.2.5 and covers the span path only.
+
+### Fixed
+
+- **Architecture detection no longer trusts the model name.**
+  `Architecture::detect` name-matched `gliner2.5` before consulting
+  `config.json`, so `GLiNER2.5-Decide` — a *span* checkpoint whose name contains
+  "2.5" — was routed to the boundary head and failed on `boundary_head.*` keys.
+  `from_pretrained` now sets `architecture` from the downloaded config. The name
+  heuristic remains only as the local-path fallback.
+- **`count_embed` is now optional.** It was loaded unconditionally and
+  hardcoded to the historical `count_embed.transformer.*` block. Checkpoints with
+  `counting_layer: "count_lstm"` ship `count_embed.gru` + `count_embed.projector`
+  instead, and loading died on a missing tensor. Consequence to be aware of: on
+  such checkpoints the count-guided **entity** scorer has no weights and returns
+  no spans. Classification is unaffected.
+- **`L_TOKEN` is `"[L]"`, not `"[C]".** Classification labels and structure
+  fields are distinct tokenizer ids (`[L]`=128007, `[C]`=128004) and both
+  reference revisions emit `[L]` for classification.
+- **Classification `prompt` is no longer dropped, and descriptions / few-shot
+  examples are no longer emitted as separate schema tokens.** Python folds the
+  instruction, label descriptions and examples into the single prompt string at
+  token index 2. The old layout also inflated the structural-marker count, since
+  the marker scan treats any `[...]` token as structural.
+- **Single-label classification confidence uses softmax**, not sigmoid, matching
+  `GLiNER2._extract_classification_result`. The argmax was unaffected; the
+  reported confidence was.
+- **Text words are lower-cased before subword tokenization**, matching Python's
+  word splitter (`lower=True`). Character offsets still index the original
+  string, since folding happens per-token after the split.
+
 ### Changed
 
-- **Rebrand: crate renamed `gliner2-rs` → `gliner2-candle`** (crate namespace
+- Rebrand: crate renamed `gliner2-rs` → `gliner2-candle` (crate namespace
   `gliner2_rs` → `gliner2_candle`), and the GitHub repository renamed to
   `gliner2-candle` (history retained). `gliner2` / `gliner2-rs` on crates.io are
   already taken by ONNX-Runtime-based crates, so `-candle` signals the
-  pure-Rust backend. Version stays `0.1.0`.
+  pure-Rust backend.
 - Docs: full refresh — rewritten `README.md`, `CHANGELOG.md`,
   `docs/index.html`, and status banners on the historical plans
   (`docs/PLAN.md`, `docs/PLAN2.md`, `docs/PLAN_2.5.md`).

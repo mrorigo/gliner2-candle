@@ -39,6 +39,7 @@ GLiNER2.5: Text + Schema → Tokenizer → Collator → DeBERTa V3 (custom deber
 | **Span Representation** | `src/model/span_rep.rs` | markerV0: project_start/end/out_project (Linear+GELU+Linear) |
 | **Classifier** | `src/model/classifier.rs` | 2-layer MLP: 768→1536→1 with ReLU |
 | **Count Prediction** | `src/model/count_pred.rs` | 2-layer MLP: 768→1536→20 with ReLU |
+| **Count Embedding** | `src/model/count_embed.rs` | Optional; GRU+transformer variant only (see below) |
 | **Candle Encoder** | `src/model/candle_encoder.rs` | Wrapper supporting BERT/DeBERTa V2/V3 |
 | **Collator** | `src/batch/collator.rs` | Tokenization + schema encoding + batching |
 | **Inference Engine** | `src/inference/engine.rs` | Main GLiNER2/2.5 API + entity extraction logic |
@@ -51,6 +52,28 @@ GLiNER2.5: Text + Schema → Tokenizer → Collator → DeBERTa V3 (custom deber
 - **Span Rep**: markerV0 with Linear+GELU+Linear projectors (no LayerNorm)
 - **Classifier**: `create_mlp(768, [1536], 1, activation='relu')`
 - **Count Pred**: `create_mlp(768, [1536], 20, activation='relu')`
+
+### Model Architecture (GLiNER2.5-Decide)
+Decide is a fine-tune of the GLiNER2 **span** architecture for zero-shot
+classification — no new head, no `boundary_head.*`, no `task_types` config key.
+Hidden dims scale with the encoder, so shapes are `hidden*2`/`hidden*4` wide
+rather than 1536/3072:
+
+- **Encoder**: DeBERTa-v3-large (128011 vocab, 1024 hidden, 24 layers, 16 heads)
+- **Span Rep**: same markerV0 layout, `project_*.{0,3}` at [4096,1024] and [1024,4096]
+- **Classifier**: `create_mlp(1024, [2048], 1, activation='relu')`
+- **Counting layer**: `"count_lstm"` — NOT supported (see below)
+
+Three checkpoints ship: `GLiNER2.5-Decide` (span, above),
+`GLiNER2.5-multi-Decide` (boundary, multilingual, already covered by the 2.5
+path), and `GLiNER2.5-Decide-1B` (**ModernBERT** encoder — unsupported; needs
+an encoder this port does not have).
+
+### Reference repo
+`urchade/GLiNER2.5` is **404**. The live reference is
+[`fastino-ai/GLiNER2`](https://github.com/fastino-ai/GLiNER2) (`gliner2` 2.0.0).
+The vendored `GLiNER2/` directory in this repo is stale at v1.2.5 and covers the
+span path only — fetch upstream for the 2.5 boundary source.
 
 ## 🔧 Non-Obvious Technical Details
 
@@ -180,6 +203,54 @@ keys) AND the Python runtime:
   or softmax and attaches results to each span dict
 - Rust port needs: schema AttributeGroup + hidden queries, an
   explicit-spans scoring path in boundary.rs, post-decode attachment
+
+### Fixed: `count_embed` is optional (unblocks Decide)
+`loading.rs` used to load `count_embed` unconditionally and
+`CountEmbedLayer::from_var_builder` hardcodes the historical
+`count_embed.transformer.*` block (in_projector 768→128, 2 layers,
+out_projector 896). Decide ships `counting_layer: "count_lstm"` instead:
+`count_embed.gru` + `count_embed.projector.{0,2}` only
+(`layers.py::CountLSTM`), so load died on a missing tensor.
+
+`Extractor.count_embed` is now `Option<CountEmbedLayer>`, probed via
+`count_embed.transformer.in_projector.weight`. Consequence: on checkpoints with
+no compatible count_embed the **count-guided entity scorer returns no spans**
+(`engine.rs` entity/structure/relation paths bail early). Classification never
+touches it. Adding the new `CountLSTM` is the obvious follow-up.
+
+### Fixed: never infer architecture from the model name
+`Architecture::detect` used to name-match `gliner2.5` before looking at
+`config.json`, so `GLiNER2.5-Decide` — a **span** checkpoint whose name contains
+"2.5" — was routed to the boundary head and failed on `boundary_head.*` keys.
+`GLiNER2::from_pretrained` now sets `config.architecture` from
+`Architecture::from_hf_config_json` on the downloaded config. Keep the name
+heuristic only as the local-path fallback.
+
+### Classification prompt layout (easy to get wrong)
+Python builds ONE prompt string at schema token index 2 and appends the
+instruction, label descriptions and few-shot examples to it as plain text
+(`processor.py::_transform_schema`):
+
+```
+prompt_str = task                                  # or f"{task}: {prompt}"
+prompt_str += f" [DESCRIPTION] {label}: {desc}"     # per described label
+prompt_str += f" [EXAMPLE] {inp} [OUTPUT] {out}"    # per few-shot pair
+tokens = ["(", "[P]", prompt_str, "(", "[L]", label, …, ")", ")"]
+```
+
+Two consequences our port previously got wrong:
+1. Emitting descriptions/examples as separate top-level schema tokens changes
+   the sequence AND inflates the structural-marker count, because the scan
+   treats any `[...]` token as a marker.
+2. Token index 2 is no longer the bare task name. Recover it with
+   `resolve_classification_task` — a port of `_resolve_classification_config`:
+   longest task that prefixes the string, remainder empty or starting with
+   `':'`/`' '`, so `intent` does not shadow `intensity`.
+
+Also note `special_tokens::L_TOKEN` is `"[L]"` (id 128007) and `C_TOKEN` is
+`"[C]"` (id 128004) — distinct ids, not aliases. And text words are lower-cased
+before subword tokenization (Python's word splitter always uses `lower=True`);
+character offsets still index the original string.
 
 ### Checkpoint facts (verified from Hub configs)
 - All three 2.5 checkpoints declare `max_len: 4096`;
