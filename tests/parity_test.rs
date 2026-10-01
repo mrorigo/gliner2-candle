@@ -455,16 +455,11 @@ fn run_case(engine: &GLiNER2, case: &Case) -> JsonValue {
         }
         "classifications" => {
             let schema = classification_schema(&case.classifications);
-            let tasks: Vec<String> = case
-                .classifications
-                .as_object()
-                .map(|o| o.keys().cloned().collect())
-                .unwrap_or_default();
             norm_classifications(
                 &engine
                     .extract(&case.text, &schema, threshold, true, true, None)
                     .unwrap(),
-                &tasks,
+                &task_names(&case.classifications),
             )
         }
         "relations" => norm_relations(
@@ -483,31 +478,6 @@ fn run_case(engine: &GLiNER2, case: &Case) -> JsonValue {
                 )
                 .expect("extract_relations"),
         ),
-        "structure_multi" => {
-            // Build each group in declaration order. Several structures in one
-            // schema exercise group ordering as well as field ordering inside
-            // each group -- both come from the same map-ordering fix.
-            let mut builder = gliner2_candle::schema::builder::SchemaBuilder::new();
-            let mut names: Vec<String> = Vec::new();
-            for (name, fields) in &case.structures {
-                names.push(name.clone());
-                let mut group = builder.structure(name.clone());
-                for f in fields {
-                    group = group.field(f.clone()).done_field();
-                }
-                builder = group.done_structure();
-            }
-            let schema = builder.build().expect("structure schema");
-            let raw = engine
-                .extract(&case.text, &schema, threshold, true, true, None)
-                .unwrap();
-            names
-                .iter()
-                .map(|n| (n.clone(), norm_structure(&raw, n)))
-                .collect::<serde_json::Map<_, _>>()
-                .into_iter()
-                .collect()
-        }
         "structure" => {
             let key = case.structure_key.clone().expect("structure key");
             let schema = structure_schema(&key, &case.structure_fields);
@@ -518,8 +488,41 @@ fn run_case(engine: &GLiNER2, case: &Case) -> JsonValue {
                 &key,
             )
         }
+        "structure_multi" => run_structure_multi(engine, case, threshold),
         other => panic!("unknown case kind: {other}"),
     }
+}
+
+/// Task names, in declaration order, for the classification normaliser.
+fn task_names(spec: &JsonValue) -> Vec<String> {
+    spec.as_object()
+        .map(|o| o.keys().cloned().collect())
+        .unwrap_or_default()
+}
+
+/// Every structure group in the case, in declaration order.
+///
+/// Several groups in one schema exercise group ordering as well as field
+/// ordering inside each group -- both come from the same map-ordering rule.
+fn run_structure_multi(engine: &GLiNER2, case: &Case, threshold: f32) -> JsonValue {
+    let mut builder = SchemaBuilder::new();
+    for (name, fields) in &case.structures {
+        let mut group = builder.structure(name.clone());
+        for f in fields {
+            group = group.field(f.clone()).done_field();
+        }
+        builder = group.done_structure();
+    }
+    let schema = builder.build().expect("structure schema");
+    let raw = engine
+        .extract(&case.text, &schema, threshold, true, true, None)
+        .unwrap();
+    case.structures
+        .iter()
+        .map(|(name, _)| (name.clone(), norm_structure(&raw, name)))
+        .collect::<serde_json::Map<_, _>>()
+        .into_iter()
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -531,44 +534,57 @@ fn run_case(engine: &GLiNER2, case: &Case) -> JsonValue {
 /// with a tolerance. Returns one human-readable line per divergence.
 fn diff(path: &str, rust: &JsonValue, python: &JsonValue, out: &mut Vec<String>) {
     match (rust, python) {
-        (JsonValue::Object(r), JsonValue::Object(p)) => {
-            let mut keys: Vec<&String> = r.keys().chain(p.keys()).collect();
-            keys.sort();
-            keys.dedup();
-            for k in keys {
-                match (r.get(k), p.get(k)) {
-                    (Some(rv), Some(pv)) => diff(&format!("{path}.{k}"), rv, pv, out),
-                    (Some(_), None) => out.push(format!("{path}.{k}: only in rust")),
-                    (None, Some(_)) => out.push(format!("{path}.{k}: only in python")),
-                    _ => {}
-                }
-            }
+        (JsonValue::Object(r), JsonValue::Object(p)) => diff_object(path, r, p, out),
+        (JsonValue::Array(r), JsonValue::Array(p)) => diff_array(path, r, p, out),
+        _ => diff_leaf(path, rust, python, out),
+    }
+}
+
+fn diff_object(
+    path: &str,
+    rust: &serde_json::Map<String, JsonValue>,
+    python: &serde_json::Map<String, JsonValue>,
+    out: &mut Vec<String>,
+) {
+    let mut keys: Vec<&String> = rust.keys().chain(python.keys()).collect();
+    keys.sort();
+    keys.dedup();
+    for k in keys {
+        match (rust.get(k), python.get(k)) {
+            (Some(rv), Some(pv)) => diff(&format!("{path}.{k}"), rv, pv, out),
+            (Some(_), None) => out.push(format!("{path}.{k}: only in rust")),
+            (None, Some(_)) => out.push(format!("{path}.{k}: only in python")),
+            _ => {}
         }
-        (JsonValue::Array(r), JsonValue::Array(p)) => {
-            if r.len() != p.len() {
-                out.push(format!(
-                    "{path}: rust has {} items, python has {}",
-                    r.len(),
-                    p.len()
-                ));
-                return;
-            }
-            for (i, (rv, pv)) in r.iter().zip(p.iter()).enumerate() {
-                diff(&format!("{path}[{i}]"), rv, pv, out);
-            }
+    }
+}
+
+fn diff_array(path: &str, rust: &[JsonValue], python: &[JsonValue], out: &mut Vec<String>) {
+    if rust.len() != python.len() {
+        out.push(format!(
+            "{path}: rust has {} items, python has {}",
+            rust.len(),
+            python.len()
+        ));
+        return;
+    }
+    for (i, (rv, pv)) in rust.iter().zip(python.iter()).enumerate() {
+        diff(&format!("{path}[{i}]"), rv, pv, out);
+    }
+}
+
+/// Compare two scalars. Anything under a `confidence` key is compared with a
+/// tolerance; every other leaf must match exactly.
+fn diff_leaf(path: &str, rust: &JsonValue, python: &JsonValue, out: &mut Vec<String>) {
+    let leaf = path.rsplit('.').next().unwrap_or(path);
+    if leaf == "confidence" || leaf.ends_with("_confidence") {
+        let rv = rust.as_f64().unwrap_or(f64::NAN);
+        let pv = python.as_f64().unwrap_or(f64::NAN);
+        if (rv - pv).abs() > CONFIDENCE_TOLERANCE {
+            out.push(format!("{path}: rust {rv} vs python {pv}"));
         }
-        _ => {
-            let leaf = path.rsplit('.').next().unwrap_or(path);
-            if leaf == "confidence" || leaf.ends_with("_confidence") {
-                let rv = rust.as_f64().unwrap_or(f64::NAN);
-                let pv = python.as_f64().unwrap_or(f64::NAN);
-                if (rv - pv).abs() > CONFIDENCE_TOLERANCE {
-                    out.push(format!("{path}: rust {rv} vs python {pv}"));
-                }
-            } else if rust != python {
-                out.push(format!("{path}: rust {rust} vs python {python}"));
-            }
-        }
+    } else if rust != python {
+        out.push(format!("{path}: rust {rust} vs python {python}"));
     }
 }
 

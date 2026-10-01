@@ -530,38 +530,48 @@ impl ClassificationDef {
             cls = cls.with_threshold(threshold as f32);
         }
 
-        let descriptions: HashMap<String, String> = obj
-            .get("label_descriptions")
-            .and_then(|v| v.as_object())
-            .map(|d| {
-                d.iter()
-                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
-                    .collect()
-            })
-            .unwrap_or_default();
-        if !descriptions.is_empty() {
+        if let Some(descriptions) = Self::read_descriptions(obj) {
             cls = cls.with_label_descriptions(descriptions);
         }
-
         if let Some(prompt) = obj.get("prompt").and_then(|v| v.as_str()) {
             cls.prompt = Some(prompt.to_string());
         }
-        if let Some(examples) = obj.get("examples").and_then(|v| v.as_array()) {
-            let pairs: Vec<(String, String)> = examples
-                .iter()
-                .filter_map(|e| {
-                    let pair = e.as_array()?;
-                    Some((
-                        pair.first()?.as_str()?.to_string(),
-                        pair.get(1)?.as_str()?.to_string(),
-                    ))
-                })
-                .collect();
-            if !pairs.is_empty() {
-                cls.examples = Some(pairs);
-            }
+        if let Some(examples) = Self::read_examples(obj) {
+            cls.examples = Some(examples);
         }
         cls
+    }
+
+    /// Read `label_descriptions`, ignoring non-string values.
+    fn read_descriptions(
+        obj: &serde_json::Map<String, serde_json::Value>,
+    ) -> Option<HashMap<String, String>> {
+        let map: HashMap<String, String> = obj
+            .get("label_descriptions")?
+            .as_object()?
+            .iter()
+            .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+            .collect();
+        (!map.is_empty()).then_some(map)
+    }
+
+    /// Read `examples` as `(input, output)` pairs, skipping malformed entries.
+    fn read_examples(
+        obj: &serde_json::Map<String, serde_json::Value>,
+    ) -> Option<Vec<(String, String)>> {
+        let pairs: Vec<(String, String)> = obj
+            .get("examples")?
+            .as_array()?
+            .iter()
+            .filter_map(|e| {
+                let pair = e.as_array()?;
+                Some((
+                    pair.first()?.as_str()?.to_string(),
+                    pair.get(1)?.as_str()?.to_string(),
+                ))
+            })
+            .collect();
+        (!pairs.is_empty()).then_some(pairs)
     }
 
     /// Set label descriptions.
