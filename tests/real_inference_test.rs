@@ -22,6 +22,41 @@ fn download_from_hub(repo_id: &str, filename: &str) -> PathBuf {
         .unwrap_or_else(|_| panic!("Failed to download {}", filename))
 }
 
+/// Assert one entity type came back as a well-formed span list.
+///
+/// This engine has randomly initialised weights, so quality is not assertable
+/// here -- only shape. What matters is that every requested type is present as
+/// an array of spans carrying text, a probability in range, and offsets: when
+/// count guidance failed to load the output was `{"entities": {}}` with no keys
+/// at all, and the previous `contains("entities")` check sailed past it.
+fn assert_spans_well_formed(
+    entities: &serde_json::Map<String, serde_json::Value>,
+    kind: &str,
+    result: &serde_json::Value,
+) {
+    let spans = entities
+        .get(kind)
+        .unwrap_or_else(|| panic!("missing {kind} in {result}"))
+        .as_array()
+        .unwrap_or_else(|| panic!("{kind} was not an array in {result}"));
+    for span in spans {
+        let text = span
+            .get("text")
+            .and_then(|t| t.as_str())
+            .unwrap_or_else(|| panic!("span without text in {kind}: {span}"));
+        assert!(!text.is_empty(), "empty span text in {kind}");
+        let conf = span
+            .get("confidence")
+            .and_then(|c| c.as_f64())
+            .unwrap_or_else(|| panic!("span without confidence in {kind}: {span}"));
+        assert!(
+            (0.0..=1.0).contains(&conf),
+            "{kind} confidence out of range: {conf}"
+        );
+        assert!(span.get("start").is_some() && span.get("end").is_some());
+    }
+}
+
 /// Test that the GLiNER2 tokenizer downloads and produces correct token IDs.
 #[test]
 fn test_gliner2_tokenizer_download() {
@@ -138,27 +173,7 @@ fn test_gliner2_pipeline_with_real_tokenizer() {
         .as_object()
         .expect("expected an entities object");
     for kind in ["person", "organization", "location"] {
-        let spans = entities
-            .get(kind)
-            .unwrap_or_else(|| panic!("missing {kind} in {result}"))
-            .as_array()
-            .unwrap_or_else(|| panic!("{kind} was not an array in {result}"));
-        for span in spans {
-            let text = span
-                .get("text")
-                .and_then(|t| t.as_str())
-                .unwrap_or_else(|| panic!("span without text in {kind}: {span}"));
-            assert!(!text.is_empty(), "empty span text in {kind}");
-            let conf = span
-                .get("confidence")
-                .and_then(|c| c.as_f64())
-                .unwrap_or_else(|| panic!("span without confidence in {kind}: {span}"));
-            assert!(
-                (0.0..=1.0).contains(&conf),
-                "{kind} confidence out of range: {conf}"
-            );
-            assert!(span.get("start").is_some() && span.get("end").is_some());
-        }
+        assert_spans_well_formed(entities, kind, &result);
     }
 
     println!("\n✅ GLiNER2 pipeline with real tokenizer works!");

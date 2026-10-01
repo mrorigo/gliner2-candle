@@ -1020,6 +1020,21 @@ pub(crate) fn extract_sample(
     Ok(JsonValue::Object(result))
 }
 
+/// Whether a multi-label head keeps `index`.
+///
+/// Anything at or above `threshold` is kept. A multi-label head still has to
+/// answer the question, so when nothing clears the bar the argmax is kept
+/// anyway (`_extract_classification_result`) -- otherwise a caller cannot
+/// distinguish "no label applies" from "the model declined". With five aspects
+/// at threshold 0.5 the top label scores 0.4647, so this path is the common one
+/// rather than an edge case.
+fn selected_multi_label(probs: &[f32], index: usize, threshold: f32) -> bool {
+    if probs[index] >= threshold {
+        return true;
+    }
+    probs[index] == probs.iter().copied().fold(f32::NEG_INFINITY, f32::max)
+}
+
 /// Classification decoding via the boundary classifier head.
 #[allow(clippy::too_many_arguments)]
 fn decode_classification(
@@ -1090,29 +1105,11 @@ fn decode_classification(
 
     if multi_label {
         let probs: Vec<f32> = logits.iter().map(|lg| sigmoid(*lg)).collect();
-        let mut chosen: Vec<usize> = probs
+        let selected: Vec<JsonValue> = group_specs
             .iter()
             .enumerate()
-            .filter(|(_, p)| **p >= threshold)
-            .map(|(i, _)| i)
-            .collect();
-        // A multi-label head still answers the question: when nothing clears
-        // the threshold, fall back to the argmax rather than returning nothing
-        // (`_extract_classification_result`). Without this a caller cannot
-        // distinguish "no label applies" from "the model declined".
-        if chosen.is_empty()
-            && let Some(best) = probs
-                .iter()
-                .enumerate()
-                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
-                .map(|(i, _)| i)
-        {
-            chosen.push(best);
-        }
-        let selected: Vec<JsonValue> = chosen
-            .iter()
-            .map(|&i| {
-                let spec = &group_specs[i];
+            .filter(|(i, _)| selected_multi_label(&probs, *i, threshold))
+            .map(|(i, spec)| {
                 if include_confidence {
                     json!({"label": spec.name, "confidence": probs[i]})
                 } else {
