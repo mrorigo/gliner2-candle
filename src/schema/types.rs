@@ -511,6 +511,59 @@ impl ClassificationDef {
         self
     }
 
+    /// Build from one entry of a serialized `classifications` array.
+    ///
+    /// `task` and `labels` are already read by the caller; this applies the
+    /// remaining keys. Absent or malformed values keep the defaults rather than
+    /// failing, matching how the rest of `from_dict` treats optional metadata.
+    pub fn from_json(
+        task: &str,
+        labels: Vec<String>,
+        obj: &serde_json::Map<String, serde_json::Value>,
+    ) -> Self {
+        let mut cls = Self::new(task, labels);
+
+        if let Some(multi) = obj.get("multi_label").and_then(|v| v.as_bool()) {
+            cls = cls.multi_label(multi);
+        }
+        if let Some(threshold) = obj.get("cls_threshold").and_then(|v| v.as_f64()) {
+            cls = cls.with_threshold(threshold as f32);
+        }
+
+        let descriptions: HashMap<String, String> = obj
+            .get("label_descriptions")
+            .and_then(|v| v.as_object())
+            .map(|d| {
+                d.iter()
+                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !descriptions.is_empty() {
+            cls = cls.with_label_descriptions(descriptions);
+        }
+
+        if let Some(prompt) = obj.get("prompt").and_then(|v| v.as_str()) {
+            cls.prompt = Some(prompt.to_string());
+        }
+        if let Some(examples) = obj.get("examples").and_then(|v| v.as_array()) {
+            let pairs: Vec<(String, String)> = examples
+                .iter()
+                .filter_map(|e| {
+                    let pair = e.as_array()?;
+                    Some((
+                        pair.first()?.as_str()?.to_string(),
+                        pair.get(1)?.as_str()?.to_string(),
+                    ))
+                })
+                .collect();
+            if !pairs.is_empty() {
+                cls.examples = Some(pairs);
+            }
+        }
+        cls
+    }
+
     /// Set label descriptions.
     pub fn with_label_descriptions(mut self, descs: HashMap<String, String>) -> Self {
         self.label_descriptions = Some(descs);
@@ -1215,48 +1268,9 @@ impl Schema {
                             })
                             .unwrap_or_default();
 
-                        let mut cls = ClassificationDef::new(task, labels);
-
-                        if let Some(multi) = cls_obj.get("multi_label").and_then(|v| v.as_bool()) {
-                            cls = cls.multi_label(multi);
-                        }
-                        if let Some(threshold) =
-                            cls_obj.get("cls_threshold").and_then(|v| v.as_f64())
-                        {
-                            cls = cls.with_threshold(threshold as f32);
-                        }
-                        if let Some(descs) = cls_obj.get("label_descriptions").and_then(|v| v.as_object())
-                        {
-                            let map: HashMap<String, String> = descs
-                                .iter()
-                                .filter_map(|(k, v)| {
-                                    v.as_str().map(|d| (k.clone(), d.to_string()))
-                                })
-                                .collect();
-                            if !map.is_empty() {
-                                cls = cls.with_label_descriptions(map);
-                            }
-                        }
-                        if let Some(prompt) = cls_obj.get("prompt").and_then(|v| v.as_str()) {
-                            cls.prompt = Some(prompt.to_string());
-                        }
-                        if let Some(examples) = cls_obj.get("examples").and_then(|v| v.as_array())
-                        {
-                            let pairs: Vec<(String, String)> = examples
-                                .iter()
-                                .filter_map(|e| {
-                                    let pair = e.as_array()?;
-                                    let input = pair.first()?.as_str()?;
-                                    let output = pair.get(1)?.as_str()?;
-                                    Some((input.to_string(), output.to_string()))
-                                })
-                                .collect();
-                            if !pairs.is_empty() {
-                                cls.examples = Some(pairs);
-                            }
-                        }
-
-                        schema.classifications.push(cls);
+                        schema
+                            .classifications
+                            .push(ClassificationDef::from_json(task, labels, cls_obj));
                     }
                 }
             }
