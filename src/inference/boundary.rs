@@ -502,7 +502,10 @@ fn decode_entities(
         // maximum-total-score non-overlapping subset.
         let resolved = resolve_flat_spans(hits.into_iter().map(|(st, e, p)| (p, st, e)).collect());
         hits = resolved.into_iter().map(|(p, st, e)| (st, e, p)).collect();
+        // The reference emits every declared type, empty when nothing clears
+        // the threshold, so a caller can tell "no matches" from "not asked".
         if hits.is_empty() {
+            decoded_entities.push((spec.name.clone(), Vec::new(), Vec::new()));
             continue;
         }
         let mut entries = Vec::with_capacity(hits.len());
@@ -788,6 +791,19 @@ fn decode_relations(
                     all_canonical_entity_spans,
                 );
 
+                // The reference lists every declared relation type, empty when
+                // no pair clears the threshold, so an absent key never has to
+                // mean "not requested". Build the map once and always write it
+                // back -- seeding it early and re-inserting only when pairs
+                // exist silently drops the key on models that find no pairs.
+                let mut rel_map = match result.remove("relation_extraction") {
+                    Some(JsonValue::Object(m)) => m,
+                    _ => serde_json::Map::new(),
+                };
+                rel_map
+                    .entry(rel.relation_name.clone())
+                    .or_insert_with(|| JsonValue::Array(Vec::new()));
+
                 let (pair_heads, pair_tails) = enumerate_relation_pairs(&head_cands, &tail_cands);
                 if !pair_heads.is_empty() {
                     let pair_scores =
@@ -828,16 +844,12 @@ fn decode_relations(
                         .sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
                     let entries: Vec<JsonValue> =
                         scored_entries.into_iter().map(|(_, obj)| obj).collect();
-                    let mut rel_map = match result.remove("relation_extraction") {
-                        Some(JsonValue::Object(m)) => m,
-                        _ => serde_json::Map::new(),
-                    };
                     rel_map.insert(rel.relation_name.clone(), JsonValue::Array(entries));
-                    result.insert(
-                        "relation_extraction".to_string(),
-                        JsonValue::Object(rel_map),
-                    );
                 }
+                result.insert(
+                    "relation_extraction".to_string(),
+                    JsonValue::Object(rel_map),
+                );
             }
         }
     };
@@ -1077,13 +1089,32 @@ fn decode_classification(
         .unwrap_or_else(|| format!("task_{group}"));
 
     if multi_label {
-        let selected: Vec<JsonValue> = group_specs
+        let probs: Vec<f32> = logits.iter().map(|lg| sigmoid(*lg)).collect();
+        let mut chosen: Vec<usize> = probs
             .iter()
-            .zip(&logits)
-            .filter(|(_, lg)| sigmoid(**lg) >= threshold)
-            .map(|(spec, &lg)| {
+            .enumerate()
+            .filter(|(_, p)| **p >= threshold)
+            .map(|(i, _)| i)
+            .collect();
+        // A multi-label head still answers the question: when nothing clears
+        // the threshold, fall back to the argmax rather than returning nothing
+        // (`_extract_classification_result`). Without this a caller cannot
+        // distinguish "no label applies" from "the model declined".
+        if chosen.is_empty()
+            && let Some(best) = probs
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+                .map(|(i, _)| i)
+        {
+            chosen.push(best);
+        }
+        let selected: Vec<JsonValue> = chosen
+            .iter()
+            .map(|&i| {
+                let spec = &group_specs[i];
                 if include_confidence {
-                    json!({"label": spec.name, "confidence": sigmoid(lg)})
+                    json!({"label": spec.name, "confidence": probs[i]})
                 } else {
                     json!(spec.name)
                 }
