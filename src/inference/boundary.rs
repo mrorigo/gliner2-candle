@@ -502,7 +502,10 @@ fn decode_entities(
         // maximum-total-score non-overlapping subset.
         let resolved = resolve_flat_spans(hits.into_iter().map(|(st, e, p)| (p, st, e)).collect());
         hits = resolved.into_iter().map(|(p, st, e)| (st, e, p)).collect();
+        // The reference emits every declared type, empty when nothing clears
+        // the threshold, so a caller can tell "no matches" from "not asked".
         if hits.is_empty() {
+            decoded_entities.push((spec.name.clone(), Vec::new(), Vec::new()));
             continue;
         }
         let mut entries = Vec::with_capacity(hits.len());
@@ -788,6 +791,19 @@ fn decode_relations(
                     all_canonical_entity_spans,
                 );
 
+                // The reference lists every declared relation type, empty when
+                // no pair clears the threshold, so an absent key never has to
+                // mean "not requested". Build the map once and always write it
+                // back -- seeding it early and re-inserting only when pairs
+                // exist silently drops the key on models that find no pairs.
+                let mut rel_map = match result.remove("relation_extraction") {
+                    Some(JsonValue::Object(m)) => m,
+                    _ => serde_json::Map::new(),
+                };
+                rel_map
+                    .entry(rel.relation_name.clone())
+                    .or_insert_with(|| JsonValue::Array(Vec::new()));
+
                 let (pair_heads, pair_tails) = enumerate_relation_pairs(&head_cands, &tail_cands);
                 if !pair_heads.is_empty() {
                     let pair_scores =
@@ -828,16 +844,12 @@ fn decode_relations(
                         .sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
                     let entries: Vec<JsonValue> =
                         scored_entries.into_iter().map(|(_, obj)| obj).collect();
-                    let mut rel_map = match result.remove("relation_extraction") {
-                        Some(JsonValue::Object(m)) => m,
-                        _ => serde_json::Map::new(),
-                    };
                     rel_map.insert(rel.relation_name.clone(), JsonValue::Array(entries));
-                    result.insert(
-                        "relation_extraction".to_string(),
-                        JsonValue::Object(rel_map),
-                    );
                 }
+                result.insert(
+                    "relation_extraction".to_string(),
+                    JsonValue::Object(rel_map),
+                );
             }
         }
     };
@@ -1008,6 +1020,21 @@ pub(crate) fn extract_sample(
     Ok(JsonValue::Object(result))
 }
 
+/// Whether a multi-label head keeps `index`.
+///
+/// Anything at or above `threshold` is kept. A multi-label head still has to
+/// answer the question, so when nothing clears the bar the argmax is kept
+/// anyway (`_extract_classification_result`) -- otherwise a caller cannot
+/// distinguish "no label applies" from "the model declined". With five aspects
+/// at threshold 0.5 the top label scores 0.4647, so this path is the common one
+/// rather than an edge case.
+fn selected_multi_label(probs: &[f32], index: usize, threshold: f32) -> bool {
+    if probs[index] >= threshold {
+        return true;
+    }
+    probs[index] == probs.iter().copied().fold(f32::NEG_INFINITY, f32::max)
+}
+
 /// Classification decoding via the boundary classifier head.
 #[allow(clippy::too_many_arguments)]
 fn decode_classification(
@@ -1059,19 +1086,32 @@ fn decode_classification(
         .and_then(|m| m.as_bool())
         .unwrap_or(false);
 
-    let task_name = batch
+    // Token index 2 holds the whole prompt string once descriptions, an
+    // instruction or few-shot examples are folded in, so recover the task name
+    // the same way the span path does. Falling back to the raw token would key
+    // the result by "intent [DESCRIPTION] duplicate_charge: ..." instead of
+    // "intent".
+    let prompt_str = batch
         .schema_tokens(sample_idx, group)
-        .and_then(|t| t.get(2).map(|s| s.to_string()))
+        .and_then(|t| t.get(2))
+        .cloned();
+    let task_name = prompt_str
+        .as_deref()
+        .and_then(|s| {
+            crate::inference::engine::GLiNER2::resolve_classification_task(&schema_json, s)
+        })
+        .or(prompt_str)
         .unwrap_or_else(|| format!("task_{group}"));
 
     if multi_label {
+        let probs: Vec<f32> = logits.iter().map(|lg| sigmoid(*lg)).collect();
         let selected: Vec<JsonValue> = group_specs
             .iter()
-            .zip(&logits)
-            .filter(|(_, lg)| sigmoid(**lg) >= threshold)
-            .map(|(spec, &lg)| {
+            .enumerate()
+            .filter(|(i, _)| selected_multi_label(&probs, *i, threshold))
+            .map(|(i, spec)| {
                 if include_confidence {
-                    json!({"label": spec.name, "confidence": sigmoid(lg)})
+                    json!({"label": spec.name, "confidence": probs[i]})
                 } else {
                     json!(spec.name)
                 }

@@ -511,6 +511,69 @@ impl ClassificationDef {
         self
     }
 
+    /// Build from one entry of a serialized `classifications` array.
+    ///
+    /// `task` and `labels` are already read by the caller; this applies the
+    /// remaining keys. Absent or malformed values keep the defaults rather than
+    /// failing, matching how the rest of `from_dict` treats optional metadata.
+    pub fn from_json(
+        task: &str,
+        labels: Vec<String>,
+        obj: &serde_json::Map<String, serde_json::Value>,
+    ) -> Self {
+        let mut cls = Self::new(task, labels);
+
+        if let Some(multi) = obj.get("multi_label").and_then(|v| v.as_bool()) {
+            cls = cls.multi_label(multi);
+        }
+        if let Some(threshold) = obj.get("cls_threshold").and_then(|v| v.as_f64()) {
+            cls = cls.with_threshold(threshold as f32);
+        }
+
+        if let Some(descriptions) = Self::read_descriptions(obj) {
+            cls = cls.with_label_descriptions(descriptions);
+        }
+        if let Some(prompt) = obj.get("prompt").and_then(|v| v.as_str()) {
+            cls.prompt = Some(prompt.to_string());
+        }
+        if let Some(examples) = Self::read_examples(obj) {
+            cls.examples = Some(examples);
+        }
+        cls
+    }
+
+    /// Read `label_descriptions`, ignoring non-string values.
+    fn read_descriptions(
+        obj: &serde_json::Map<String, serde_json::Value>,
+    ) -> Option<HashMap<String, String>> {
+        let map: HashMap<String, String> = obj
+            .get("label_descriptions")?
+            .as_object()?
+            .iter()
+            .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+            .collect();
+        (!map.is_empty()).then_some(map)
+    }
+
+    /// Read `examples` as `(input, output)` pairs, skipping malformed entries.
+    fn read_examples(
+        obj: &serde_json::Map<String, serde_json::Value>,
+    ) -> Option<Vec<(String, String)>> {
+        let pairs: Vec<(String, String)> = obj
+            .get("examples")?
+            .as_array()?
+            .iter()
+            .filter_map(|e| {
+                let pair = e.as_array()?;
+                Some((
+                    pair.first()?.as_str()?.to_string(),
+                    pair.get(1)?.as_str()?.to_string(),
+                ))
+            })
+            .collect();
+        (!pairs.is_empty()).then_some(pairs)
+    }
+
     /// Set label descriptions.
     pub fn with_label_descriptions(mut self, descs: HashMap<String, String>) -> Self {
         self.label_descriptions = Some(descs);
@@ -960,22 +1023,17 @@ impl Schema {
                 .classifications
                 .iter()
                 .map(|cls| {
-                    let mut obj = serde_json::Map::new();
-                    obj.insert(
-                        "task".to_string(),
-                        serde_json::Value::String(cls.task.clone()),
-                    );
-                    obj.insert(
-                        "labels".to_string(),
-                        serde_json::Value::Array(
-                            cls.labels
-                                .iter()
-                                .map(|l| serde_json::Value::String(l.clone()))
-                                .collect(),
-                        ),
-                    );
-                    if cls.multi_label {
-                        obj.insert("multi_label".to_string(), serde_json::Value::Bool(true));
+                    // The serde field names already match the keys the collator
+                    // reads, and `examples` serializes as [[input, output]],
+                    // which is what `build_classification_tokens` expects.
+                    // Building the map by hand previously dropped
+                    // `label_descriptions`, `prompt` and `examples` on the floor.
+                    let mut obj = match serde_json::to_value(cls) {
+                        Ok(serde_json::Value::Object(obj)) => obj,
+                        _ => serde_json::Map::new(),
+                    };
+                    if !cls.multi_label {
+                        obj.remove("multi_label");
                     }
                     let threshold = if cls.cls_threshold.is_finite() {
                         cls.cls_threshold.clamp(0.0, 1.0)
@@ -1220,18 +1278,9 @@ impl Schema {
                             })
                             .unwrap_or_default();
 
-                        let mut cls = ClassificationDef::new(task, labels);
-
-                        if let Some(multi) = cls_obj.get("multi_label").and_then(|v| v.as_bool()) {
-                            cls = cls.multi_label(multi);
-                        }
-                        if let Some(threshold) =
-                            cls_obj.get("cls_threshold").and_then(|v| v.as_f64())
-                        {
-                            cls = cls.with_threshold(threshold as f32);
-                        }
-
-                        schema.classifications.push(cls);
+                        schema
+                            .classifications
+                            .push(ClassificationDef::from_json(task, labels, cls_obj));
                     }
                 }
             }
@@ -1425,6 +1474,66 @@ mod tests {
         let dict = schema.to_dict();
         assert!(dict.get("entities").is_some());
         assert!(dict.get("classifications").is_some());
+    }
+
+    /// `to_dict` used to hand-build the classification map field by field and
+    /// silently drop `label_descriptions`, `prompt` and `examples`. The collator
+    /// reads all three, so a schema built through `SchemaBuilder` never reached
+    /// the model with any of them. Going through `to_dict` here is the point:
+    /// tests that hand-build a `serde_json::Value` cannot catch this class of bug.
+    #[test]
+    fn test_to_dict_preserves_classification_prompt_metadata() {
+        let mut descriptions = HashMap::new();
+        descriptions.insert(
+            "card_lost".to_string(),
+            "the physical card is missing".to_string(),
+        );
+        let cls = ClassificationDef::new("intent", vec!["card_lost".to_string()])
+            .with_label_descriptions(descriptions);
+        let cls = ClassificationDef {
+            prompt: Some("What does the customer want?".to_string()),
+            examples: Some(vec![(
+                "my card is gone".to_string(),
+                "card_lost".to_string(),
+            )]),
+            ..cls
+        };
+        let schema = Schema::new().classifications(vec![cls]);
+
+        let head = &schema.to_dict()["classifications"][0];
+        assert_eq!(
+            head["label_descriptions"]["card_lost"],
+            "the physical card is missing"
+        );
+        assert_eq!(head["prompt"], "What does the customer want?");
+        assert_eq!(head["examples"][0][0], "my card is gone");
+        assert_eq!(head["examples"][0][1], "card_lost");
+    }
+
+    #[test]
+    fn test_from_dict_reads_classification_prompt_metadata() {
+        let dict = serde_json::json!({
+            "classifications": [{
+                "task": "intent",
+                "labels": ["card_lost"],
+                "label_descriptions": {"card_lost": "the physical card is missing"},
+                "prompt": "What does the customer want?",
+                "examples": [["my card is gone", "card_lost"]]
+            }]
+        });
+
+        let schema = Schema::from_dict(&dict).expect("valid schema");
+        let cls = &schema.classifications[0];
+
+        assert_eq!(
+            cls.label_descriptions.as_ref().unwrap()["card_lost"],
+            "the physical card is missing"
+        );
+        assert_eq!(cls.prompt.as_deref(), Some("What does the customer want?"));
+        assert_eq!(
+            cls.examples.as_ref().unwrap(),
+            &vec![("my card is gone".to_string(), "card_lost".to_string())]
+        );
     }
 
     #[test]

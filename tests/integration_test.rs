@@ -218,7 +218,9 @@ fn test_relation_threshold_metadata_pipeline() {
     let config = ExtractorConfig::new("bert-base-uncased");
     let engine = GLiNER2::new(&config).expect("Failed to create engine");
 
-    // Threshold at 1.0 should suppress all relation spans after sigmoid.
+    // A per-relation threshold of 1.0 is the strictest the filter can be.
+    // Sigmoid saturates at 1.0, so inclusive comparison still lets the top
+    // pair through -- see the assertion below.
     let schema = SchemaBuilder::new()
         .relation("works_for")
         .threshold(1.0)
@@ -249,10 +251,22 @@ fn test_relation_threshold_metadata_pipeline() {
         .cloned()
         .unwrap_or_default();
 
-    assert!(
-        rels.is_empty(),
-        "Expected empty relation list at threshold=1.0, got: {rels:?}"
-    );
+    // The threshold is inclusive: upstream keeps a pair when
+    // `score >= threshold` (`models/boundary/engine.py`), so a pair sitting at
+    // exactly 1.0 survives a threshold of 1.0. This test previously asserted
+    // the opposite and passed only because these randomly initialised weights
+    // produce scores just under the boundary.
+    //
+    // What is worth asserting here is that the filter is applied at all.
+    for pair in &rels {
+        let score = pair["head"]["confidence"]
+            .as_f64()
+            .expect("head confidence");
+        assert!(
+            score >= 1.0,
+            "relation below its threshold survived: {score} in {pair:?}"
+        );
+    }
 }
 
 /// Test structure dtype='str' returns a single value (or null), not a list.

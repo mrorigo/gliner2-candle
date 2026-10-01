@@ -1,14 +1,19 @@
 // Rust guideline compliant 2026-04-03
 //! Count embedding layer for GLiNER2.
 //!
-//! This implements the full count_embed layer with GRU + Transformer architecture
-//! that transforms entity embeddings based on predicted count.
+//! Two checkpoint variants exist upstream, both keyed off the same
+//! `pos_embedding` + `gru` trunk and differing only in what consumes the GRU
+//! output:
 //!
-//! Architecture:
-//! - Position embeddings for count positions
-//! - GRU layer for sequential processing
-//! - Transformer with downscaling (768→128→768)
-//! - Output projection
+//! | variant | upstream | tail | tensors |
+//! |---------|----------|------|---------|
+//! | [`CountLayer::Lstm`] | `layers.py::CountLSTM` | concat + 2-layer MLP | 9 |
+//! | [`CountLayer::V2`] | `layers.py::CountLSTMv2` | `DownscaledTransformer` | 37 |
+//!
+//! Which one a checkpoint ships is decided by its weight keys, not by
+//! `counting_layer` in `config.json`: `gliner2-base-v1` and
+//! `GLiNER2.5-Decide` both declare `count_lstm`, but only the former carries
+//! the transformer block.
 
 use candle_core::{DType, Device, Result, Tensor};
 use candle_nn::{Embedding, LayerNorm, Linear, Module, VarBuilder};
@@ -21,6 +26,9 @@ pub struct CountEmbedOutput {
     /// Predicted count value
     pub pred_count: usize,
 }
+
+/// The count positions a checkpoint supports.
+pub const MAX_COUNT: usize = 20;
 
 /// Multi-head attention for the transformer.
 struct MultiHeadAttention {
@@ -232,17 +240,96 @@ impl GRULayer {
     }
 }
 
-/// Full count embedding layer with GRU + Transformer.
-pub struct CountEmbedLayer {
+/// The `pos_embedding` + `gru` trunk both upstream variants share.
+///
+/// Returns the GRU output alongside the broadcast query embeddings, because
+/// `CountLSTM` concatenates them while `CountLSTMv2` adds them.
+struct GruTrunk {
     pos_embedding: Embedding,
     gru: GRULayer,
+    hidden_size: usize,
+    device: Device,
+}
+
+impl GruTrunk {
+    fn load(vb: VarBuilder, hidden_size: usize, device: Device) -> Result<Self> {
+        Ok(Self {
+            pos_embedding: candle_nn::embedding(MAX_COUNT, hidden_size, vb.pp("pos_embedding"))?,
+            gru: GRULayer::load(vb.pp("gru"), hidden_size, hidden_size)?,
+            hidden_size,
+            device,
+        })
+    }
+
+    /// Run the count-step sequence: positional embeddings in, per-step query
+    /// embeddings out.
+    fn run(&self, entity_embs: &Tensor, pred_count: usize) -> Result<(Tensor, Tensor)> {
+        let num_types = entity_embs.dims()[0];
+        let count = pred_count.min(MAX_COUNT);
+
+        let pos_ids: Vec<u32> = (0..count).map(|i| i as u32).collect();
+        let pos_embs =
+            self.pos_embedding
+                .forward(&Tensor::from_slice(&pos_ids, (count,), &self.device)?)?;
+
+        let query = entity_embs
+            .unsqueeze(0)?
+            .broadcast_as((count, num_types, self.hidden_size))?;
+        let gru_out = self.gru.forward(
+            &pos_embs
+                .unsqueeze(1)?
+                .broadcast_as((count, num_types, self.hidden_size))?,
+            Some(entity_embs),
+        )?;
+
+        Ok((gru_out, query))
+    }
+}
+
+/// `layers.py::CountLSTM`: `projector(concat([gru_out, query]))`.
+///
+/// Ships as `count_embed.{pos_embedding, gru, projector.{0,2}}` — 9 tensors,
+/// with no transformer block.
+pub struct CountLstmLayer {
+    trunk: GruTrunk,
+    projector_0: Linear,
+    projector_2: Linear,
+}
+
+impl CountLstmLayer {
+    fn from_var_builder(vb: VarBuilder, hidden_size: usize, device: Device) -> Result<Self> {
+        let trunk = GruTrunk::load(vb.clone(), hidden_size, device)?;
+        // candle stores Linear weight as (out, in): projector.0 is 4*hidden
+        // wide, projector.2 maps back down to hidden.
+        let projector = vb.pp("projector");
+        Ok(Self {
+            trunk,
+            projector_0: candle_nn::linear(2 * hidden_size, 4 * hidden_size, projector.pp("0"))?,
+            projector_2: candle_nn::linear(4 * hidden_size, hidden_size, projector.pp("2"))?,
+        })
+    }
+
+    fn forward(&self, entity_embs: &Tensor, pred_count: usize) -> Result<CountEmbedOutput> {
+        let (gru_out, query) = self.trunk.run(entity_embs, pred_count)?;
+        let concat = Tensor::cat(&[gru_out, query], 2)?;
+        let out = self
+            .projector_2
+            .forward(&self.projector_0.forward(&concat)?.relu()?)?;
+        Ok(CountEmbedOutput {
+            embeddings: out,
+            pred_count: pred_count.min(MAX_COUNT),
+        })
+    }
+}
+
+/// `layers.py::CountLSTMv2`: GRU + `DownscaledTransformer`.
+pub struct CountEmbedLayer {
+    trunk: GruTrunk,
     in_projector: Linear,
     transformer_layers: Vec<TransformerEncoderLayer>,
     out_projector_0: Linear,
     out_projector_2: Linear,
     out_projector_4: Linear,
-    hidden_size: usize,
-    device: Device,
 }
 
 impl CountEmbedLayer {
@@ -251,7 +338,6 @@ impl CountEmbedLayer {
     /// # Arguments
     ///
     /// * `hidden_size` - Entity embedding size.
-    /// * `max_count` - Maximum supported count positions.
     /// * `device` - Target device for model parameters.
     ///
     /// # Returns
@@ -261,10 +347,10 @@ impl CountEmbedLayer {
     /// # Errors
     ///
     /// Returns an error if layer initialization fails.
-    pub fn new(hidden_size: usize, max_count: usize, device: Device) -> Result<Self> {
+    pub fn new(hidden_size: usize, device: Device) -> Result<Self> {
         let varmap = candle_nn::VarMap::new();
         let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
-        Self::from_var_builder(vb, hidden_size, max_count, device)
+        Self::from_var_builder(vb, hidden_size, device)
     }
 
     /// Create a count embedding layer from VarBuilder with loaded weights.
@@ -283,17 +369,9 @@ impl CountEmbedLayer {
     /// # Errors
     ///
     /// Returns an error if required weights are missing or invalid.
-    pub fn from_var_builder(
-        vb: VarBuilder,
-        hidden_size: usize,
-        max_count: usize,
-        device: Device,
-    ) -> Result<Self> {
-        // Load position embeddings
-        let pos_embedding = candle_nn::embedding(max_count, hidden_size, vb.pp("pos_embedding"))?;
-
-        // Load GRU
-        let gru = GRULayer::load(vb.pp("gru"), hidden_size, hidden_size)?;
+    pub fn from_var_builder(vb: VarBuilder, hidden_size: usize, device: Device) -> Result<Self> {
+        // Load position embeddings + GRU (shared with CountLSTM)
+        let trunk = GruTrunk::load(vb.clone(), hidden_size, device)?;
 
         // Load transformer components
         let in_projector =
@@ -329,15 +407,12 @@ impl CountEmbedLayer {
         )?;
 
         Ok(Self {
-            pos_embedding,
-            gru,
+            trunk,
             in_projector,
             transformer_layers,
             out_projector_0,
             out_projector_2,
             out_projector_4,
-            hidden_size,
-            device,
         })
     }
 
@@ -354,40 +429,11 @@ impl CountEmbedLayer {
     ///
     /// Returns an error if tensor operations fail.
     pub fn forward(&self, entity_embs: &Tensor, pred_count: usize) -> Result<CountEmbedOutput> {
-        let num_entity_types = entity_embs.dims()[0];
-        let actual_count = pred_count.min(20);
+        let (gru_out, query) = self.trunk.run(entity_embs, pred_count)?;
 
-        // Get position embeddings for each count position
-        let pos_ids: Vec<u32> = (0..actual_count).map(|i| i as u32).collect();
-        let pos_ids_tensor = Tensor::from_slice(&pos_ids, (actual_count,), &self.device)?;
-        let pos_embs = self.pos_embedding.forward(&pos_ids_tensor)?; // (count, hidden)
-
-        // Expand entity embeddings: (num_types, hidden) -> (count, num_types, hidden)
-        let entity_embs_expanded = entity_embs.unsqueeze(0)?.broadcast_as((
-            actual_count,
-            num_entity_types,
-            self.hidden_size,
-        ))?;
-
-        // Expand position embeddings: (count, hidden) -> (count, num_types, hidden)
-        let pos_embs_expanded = pos_embs.unsqueeze(1)?.broadcast_as((
-            actual_count,
-            num_entity_types,
-            self.hidden_size,
-        ))?;
-
-        // GRU input is positional sequence (matching CountLSTMv2)
-        let gru_input = pos_embs_expanded;
-
-        // Run GRU with initial hidden state from entity embeddings (matching Python CountLSTMv2)
-        let gru_output = self.gru.forward(&gru_input, Some(entity_embs))?;
-        let transformer_input = gru_output.add(&entity_embs_expanded)?;
-
-        // CountLSTMv2 path:
-        // x = transformer(output + pc_emb_broadcast), where transformer is batch_first=True
-        let projected = self.in_projector.forward(&transformer_input)?; // (count, num_types, 128)
-
-        let mut x = projected;
+        // CountLSTMv2: x = transformer(gru_out + query), batch_first=True
+        let transformer_input = gru_out.add(&query)?;
+        let mut x = self.in_projector.forward(&transformer_input)?; // (count, num_types, 128)
         for layer in &self.transformer_layers {
             x = layer.forward(&x)?;
         }
@@ -403,7 +449,92 @@ impl CountEmbedLayer {
 
         Ok(CountEmbedOutput {
             embeddings: out,
-            pred_count: actual_count,
+            pred_count: pred_count.min(MAX_COUNT),
         })
+    }
+}
+
+/// Which count-aware projection a checkpoint ships.
+///
+/// Dispatching on an enum rather than on `config.counting_layer`: that field is
+/// `count_lstm` for every span checkpoint, including the ones that carry the
+/// `CountLSTMv2` transformer block. The weights are the only reliable signal,
+/// which is why [`CountLayer::from_var_builder`] probes for both layouts.
+pub enum CountLayer {
+    /// `layers.py::CountLSTM` — GRU + concat + 2-layer MLP.
+    Lstm(CountLstmLayer),
+    /// `layers.py::CountLSTMv2` — GRU + `DownscaledTransformer`.
+    V2(CountEmbedLayer),
+}
+
+impl CountLayer {
+    /// A randomly initialized layer, for use before weights are loaded.
+    ///
+    /// `rebuild_model` replaces this once the checkpoint's real layout is known.
+    /// `CountLSTM` is the smaller of the two, so it is the cheaper placeholder.
+    pub fn placeholder(hidden_size: usize, device: Device) -> Self {
+        let varmap = candle_nn::VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+        Self::Lstm(
+            CountLstmLayer::from_var_builder(vb, hidden_size, device)
+                .expect("placeholder CountLSTM shapes are always valid"),
+        )
+    }
+
+    /// Build whichever variant the weights describe, or `Ok(None)` if the
+    /// checkpoint ships no count-aware projection at all.
+    ///
+    /// The v2 probe checks `transformer.in_projector.weight`, which
+    /// `CountLSTM` checkpoints do not have; the v1 probe checks
+    /// `projector.0.weight`, which they do.
+    pub fn from_var_builder(
+        vb: VarBuilder,
+        hidden_size: usize,
+        device: Device,
+    ) -> Result<Option<Self>> {
+        const DOWNSCALED_DIM: usize = 128;
+
+        // candle stores Linear weight as (out, in).
+        if vb
+            .pp("transformer")
+            .pp("in_projector")
+            .get((DOWNSCALED_DIM, hidden_size), "weight")
+            .is_ok()
+        {
+            return CountEmbedLayer::from_var_builder(vb, hidden_size, device)
+                .map(|layer| Some(Self::V2(layer)))
+                .map_err(|e| candle_core::Error::Msg(format!("count_embed v2: {e}")));
+        }
+
+        if vb
+            .pp("projector")
+            .pp("0")
+            .get((4 * hidden_size, 2 * hidden_size), "weight")
+            .is_ok()
+        {
+            return CountLstmLayer::from_var_builder(vb, hidden_size, device)
+                .map(|layer| Some(Self::Lstm(layer)))
+                .map_err(|e| candle_core::Error::Msg(format!("count_embed lstm: {e}")));
+        }
+
+        Ok(None)
+    }
+
+    /// Transform query embeddings into count-aware embeddings.
+    ///
+    /// Returns `(pred_count, num_entity_types, hidden)`.
+    pub fn forward(&self, entity_embs: &Tensor, pred_count: usize) -> Result<CountEmbedOutput> {
+        match self {
+            Self::Lstm(layer) => layer.forward(entity_embs, pred_count),
+            Self::V2(layer) => layer.forward(entity_embs, pred_count),
+        }
+    }
+
+    /// Which upstream class this layer corresponds to. Used in error messages.
+    pub fn variant(&self) -> &'static str {
+        match self {
+            Self::Lstm(_) => "CountLSTM",
+            Self::V2(_) => "CountLSTMv2",
+        }
     }
 }

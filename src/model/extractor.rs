@@ -37,7 +37,7 @@ use crate::config::ExtractorConfig;
 use crate::error::{GlinerError, Result};
 use crate::model::candle_encoder::CandleEncoder;
 use crate::model::classifier::ClassifierHead;
-use crate::model::count_embed::CountEmbedLayer;
+use crate::model::count_embed::CountLayer;
 use crate::model::count_pred::CountPredictionLayer;
 use crate::model::loading::ModelLoader;
 use crate::model::span_rep::{SpanRepOutput, SpanRepresentationLayer};
@@ -166,12 +166,13 @@ pub struct Extractor {
     pub count_pred: CountPredictionLayer,
     /// Count embedding layer for entity scoring.
     ///
-    /// `None` when the checkpoint ships no compatible `count_embed.*` weights.
-    /// Newer checkpoints (`counting_layer: "count_lstm"`) replace the historical
-    /// GRU+transformer block with a plain GRU + MLP projector, which this port does
-    /// not implement. Count guidance is then unavailable, so entity scoring falls
-    /// back to returning no spans. Classification decoding never uses this module.
-    pub count_embed: Option<CountEmbedLayer>,
+    /// `None` only when the checkpoint ships no count-aware projection at all.
+    /// Both upstream variants are implemented (`CountLSTM` and `CountLSTMv2`);
+    /// the weights decide which is loaded, since every span checkpoint declares
+    /// `counting_layer: "count_lstm"` regardless of what it actually contains.
+    /// Entity scoring needs this module, so a checkpoint without it cannot
+    /// extract spans, relations or structures. Classification never uses it.
+    pub count_embed: Option<CountLayer>,
     /// Classifier head.
     pub classifier: ClassifierHead,
     /// GLiNER2.5 boundary model (populated at weight-load time; `None` for
@@ -235,7 +236,10 @@ impl Extractor {
         // Initialize submodules
         let span_rep = SpanRepresentationLayer::from_config(config, device.clone())?;
         let count_pred = CountPredictionLayer::from_config(config, device.clone())?;
-        let count_embed = CountEmbedLayer::new(config.hidden_size, 20, device.clone()).ok();
+        // Placeholder until weights are loaded: pick whichever layout the
+        // VarBuilder will supply. `rebuild_model` replaces this with the real
+        // layer (or `None` when the checkpoint has no count-aware weights).
+        let count_embed = Some(CountLayer::placeholder(config.hidden_size, device.clone()));
         let classifier = ClassifierHead::from_config(config, device.clone())?;
 
         Ok(Self {

@@ -90,6 +90,29 @@ pub struct ExtractorCollator {
 }
 
 impl ExtractorCollator {
+    /// Ensure text ends with sentence punctuation before collation.
+    ///
+    /// Port of `gliner2/processor.py::_normalize_text`. The reference does this
+    /// inside `_collate_batch` for every record, so a trailing `.`/`!`/`?`
+    /// becomes an extra word — and therefore an extra subword — in the encoder
+    /// input. Skipping it shifts every downstream embedding: on
+    /// `gliner2-base-v1` the `intent`/`severity` pair moves from `medium`
+    /// (0.9399) to `high`, which is exactly the classification drift this
+    /// collator otherwise matches.
+    ///
+    /// The appended word maps past the end of the original string, so callers
+    /// must keep the original text for character offsets.
+    fn normalize_text(text: &str) -> String {
+        if text.is_empty() {
+            return ".".to_string();
+        }
+        if text.ends_with('.') || text.ends_with('!') || text.ends_with('?') {
+            text.to_string()
+        } else {
+            format!("{text}.")
+        }
+    }
+
     /// Create a new collator.
     ///
     /// # Arguments
@@ -289,8 +312,11 @@ impl ExtractorCollator {
 
     /// Process a single sample into tokenized form.
     fn process_sample(&self, text: &str, schema: &JsonValue) -> Result<ProcessedSample> {
-        // Tokenize text with whitespace tokenizer for span boundaries
-        let tokens = self.tokenizer.tokenize(text);
+        // Tokenize text with whitespace tokenizer for span boundaries.
+        // The reference normalizes to terminal punctuation first
+        // (`_normalize_text`), so the word count -- and the encoder input --
+        // only matches if we do the same.
+        let tokens = self.tokenizer.tokenize(&Self::normalize_text(text));
         let text_tokens: Vec<String> = tokens.iter().map(|t| t.text.clone()).collect();
         let (start_mapping, end_mapping) = WhitespaceTokenizer::build_mappings(&tokens);
 
@@ -482,7 +508,8 @@ impl ExtractorCollator {
             };
 
             if !entity_names.is_empty() {
-                let tokens = self.build_entity_tokens(&entity_names, entities);
+                let tokens =
+                    self.build_entity_tokens(&entity_names, schema.get("entity_descriptions"));
                 schema_tokens_list.push(tokens);
                 task_types.push("entities".to_string());
                 structure_labels.push(JsonValue::Array(Vec::new()));
@@ -584,29 +611,45 @@ impl ExtractorCollator {
     }
 
     /// Build entity schema tokens.
+    ///
+    /// Descriptions come from the schema's sibling `entity_descriptions` key,
+    /// not from the values inside `entities` — upstream reads
+    /// `schema["entity_descriptions"]` (processor.py::_process_entities) and
+    /// uses the inline `entities` values only as training labels.
+    ///
+    /// Like the classification path, descriptions are folded into the single
+    /// prompt string at token index 2. Emitting them as separate top-level
+    /// tokens would change the sequence and inflate the structural-marker count,
+    /// since the marker scan treats any `[...]` token as a marker.
     fn build_entity_tokens(
         &self,
         entity_names: &[String],
-        entities_value: &JsonValue,
+        entity_descriptions: Option<&JsonValue>,
     ) -> Vec<String> {
+        let descriptions: Option<serde_json::Map<String, JsonValue>> =
+            entity_descriptions.and_then(|v| v.as_object()).cloned();
+
+        let mut prompt_str = "entities".to_string();
+        if let Some(descriptions) = &descriptions {
+            for name in entity_names {
+                if let Some(desc) = descriptions.get(name).and_then(|v| v.as_str())
+                    && !desc.is_empty()
+                {
+                    prompt_str.push_str(&format!(" {} {name}: {desc}", special_tokens::DESC_TOKEN));
+                }
+            }
+        }
+
         let mut tokens = vec![
             special_tokens::OPEN_PAREN.to_string(),
             special_tokens::P_TOKEN.to_string(),
-            "entities".to_string(),
+            prompt_str,
             special_tokens::OPEN_PAREN.to_string(),
         ];
 
         for name in entity_names {
             tokens.push(special_tokens::E_TOKEN.to_string());
             tokens.push(name.clone());
-
-            // Add description if available
-            if let Some(desc) = entities_value.get(name).and_then(|v| v.as_str())
-                && !desc.is_empty()
-            {
-                tokens.push(special_tokens::DESC_TOKEN.to_string());
-                tokens.push(format!("{name}: {desc}"));
-            }
         }
 
         tokens.push(special_tokens::CLOSE_PAREN.to_string());
@@ -875,20 +918,44 @@ mod tests {
         let collator = ExtractorCollator::new(tokenizer, false);
 
         let entities = vec!["person".to_string(), "company".to_string()];
-        let entities_obj = serde_json::json!({
+        let descriptions = serde_json::json!({
             "person": "Names of people",
             "company": "Organization names"
         });
 
-        let tokens = collator.build_entity_tokens(&entities, &entities_obj);
+        let tokens = collator.build_entity_tokens(&entities, Some(&descriptions));
 
-        assert!(tokens.contains(&"(".to_string()));
-        assert!(tokens.contains(&"[P]".to_string()));
-        assert!(tokens.contains(&"entities".to_string()));
-        assert!(tokens.contains(&"[E]".to_string()));
-        assert!(tokens.contains(&"person".to_string()));
-        assert!(tokens.contains(&"company".to_string()));
-        assert!(tokens.contains(&")".to_string()));
+        assert_eq!(tokens[0], "(");
+        assert_eq!(tokens[1], "[P]");
+        // Descriptions fold into the single prompt string at index 2, matching
+        // gliner2/processor.py::_transform_schema. Emitting them as separate
+        // top-level tokens would shift the structural-marker indices.
+        assert_eq!(
+            tokens[2],
+            "entities [DESCRIPTION] person: Names of people [DESCRIPTION] company: Organization names"
+        );
+        assert_eq!(tokens[3], "(");
+        assert_eq!(tokens[4], "[E]");
+        assert_eq!(tokens[5], "person");
+        assert_eq!(tokens[6], "[E]");
+        assert_eq!(tokens[7], "company");
+        assert_eq!(tokens[8], ")");
+        assert_eq!(tokens[9], ")");
+        assert_eq!(tokens.len(), 10);
+    }
+
+    #[test]
+    fn test_entity_token_building_ignores_inline_entity_values() {
+        // Upstream reads descriptions from the sibling `entity_descriptions`
+        // key; the inline `entities` values are training labels only.
+        let tokenizer = WhitespaceTokenizer::new();
+        let collator = ExtractorCollator::new(tokenizer, false);
+        let entities = vec!["person".to_string()];
+
+        let tokens = collator.build_entity_tokens(&entities, None);
+
+        assert_eq!(tokens[2], "entities");
+        assert_eq!(tokens.len(), 8);
     }
 
     #[test]

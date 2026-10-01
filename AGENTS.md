@@ -150,6 +150,13 @@ All projectors are Linear+GELU+Linear (no LayerNorm).
 
 ## 🐛 Debugging Notes (resolved — keep for reference)
 
+Entries below are historical: each describes a bug that is now fixed. They are
+kept because the reasoning is reusable and because "this was already diagnosed
+once" is worth more than a clean-looking file. The current state of the count
+path is described above; the schema/encoder path is covered by
+`tests/parity_test.rs`, which gates all seven in-scope checkpoints against the
+Python reference (19 cases each).
+
 ### Fixed: Wrong/merged entity extraction (GLiNER2.5)
 Root causes, in the order they were found and fixed:
 1. **Relative-position sign flip**: candle-transformers' `debertav2` computes
@@ -222,19 +229,35 @@ keys) AND the Python runtime:
 - Rust port needs: schema AttributeGroup + hidden queries, an
   explicit-spans scoring path in boundary.rs, post-decode attachment
 
-### Fixed: `count_embed` is optional (unblocks Decide)
-`loading.rs` used to load `count_embed` unconditionally and
-`CountEmbedLayer::from_var_builder` hardcodes the historical
-`count_embed.transformer.*` block (in_projector 768→128, 2 layers,
-out_projector 896). Decide ships `counting_layer: "count_lstm"` instead:
-`count_embed.gru` + `count_embed.projector.{0,2}` only
-(`layers.py::CountLSTM`), so load died on a missing tensor.
+### Fixed: both count_embed variants load (CountLSTM + CountLSTMv2)
+`loading.rs` used to load `count_embed` unconditionally, and the probe that
+guarded it asked for `transformer.in_projector.weight` with shape
+`(hidden, 128)` — but candle stores Linear weight as `(out, in)`, so the
+checkpoint's `(128, hidden)` never matched. The probe failed, `count_embed`
+became `None`, and span/relation/structure decoding returned empty results with
+no error on **every** checkpoint. `tests/real_inference_test.rs` passed through
+it because it only asserted the output string contains `"entities"`.
 
-`Extractor.count_embed` is now `Option<CountEmbedLayer>`, probed via
-`count_embed.transformer.in_projector.weight`. Consequence: on checkpoints with
-no compatible count_embed the **count-guided entity scorer returns no spans**
-(`engine.rs` entity/structure/relation paths bail early). Classification never
-touches it. Adding the new `CountLSTM` is the obvious follow-up.
+`count_embed` now resolves to a `CountLayer` enum. Both upstream layouts share
+a `GruTrunk` (`pos_embedding` + GRU):
+
+| variant | upstream | tail | tensors |
+|---|---|---|---|
+| `CountLayer::Lstm` | `layers.py::CountLSTM` | `concat([gru, query])` → 2-layer MLP | 9 |
+| `CountLayer::V2` | `layers.py::CountLSTMv2` | `DownscaledTransformer` | 37 |
+
+Dispatch is on **weight keys, not `counting_layer`**: every span checkpoint
+declares `count_lstm`, except `gliner2-base-v1` which declares
+`count_lstm_v2`. `config.counting_layer` is parsed (and `count_lstm_v2` is a
+valid value again) but only cross-checks the load, warning on disagreement.
+
+A checkpoint with no `count_embed.*` at all still cannot run span, relation or
+structure decoding; `GLiNER2::require_count_embed` raises a `GlinerError`
+naming it rather than returning an empty result. Classification never needs it.
+
+When touching either `forward`, compare against Python: a dropped `relu()` in
+the v2 out-projection saturates every span score to 1.0 while short inputs still
+look plausible.
 
 ### Fixed: never infer architecture from the model name
 `Architecture::detect` used to name-match `gliner2.5` before looking at

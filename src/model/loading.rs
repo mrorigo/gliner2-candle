@@ -158,45 +158,46 @@ impl ModelLoader {
 
     /// Load the optional count-embedding layer.
     ///
-    /// Returns `Ok(None)` when the checkpoint ships no compatible weights.
-    /// Checkpoints with `counting_layer: "count_lstm"` (e.g. the GLiNER2.5-Decide
-    /// family) ship `count_embed.gru` + `count_embed.projector` instead of the
-    /// historical `count_embed.transformer.*` block this port implements, so the
-    /// probe below finds nothing and count guidance is simply unavailable. That
-    /// leaves the count-guided entity scorer with no weights; classification
-    /// decoding never touches this module.
+    /// Returns `Ok(None)` only when the checkpoint ships no count-aware
+    /// projection whatsoever. Both upstream variants are supported, and which
+    /// one is used is decided by probing the weights rather than by
+    /// `counting_layer` in `config.json`: `gliner2-base-v1` declares
+    /// `count_lstm_v2` and ships the transformer block, while
+    /// `gliner2-large-v1` and `GLiNER2.5-Decide` declare `count_lstm` and ship
+    /// the plain MLP projector. The declared value only cross-checks the load.
     fn load_count_embed(
         &self,
         vb: VarBuilder,
-    ) -> Result<Option<crate::model::count_embed::CountEmbedLayer>> {
-        let count_embed_vb = vb.pp("count_embed");
-        let hidden = self.config.hidden_size;
-        const MAX_COUNT: usize = 20;
-        const IN_PROJECTOR_DIM: usize = 128;
-
-        if count_embed_vb
-            .get((MAX_COUNT, hidden), "pos_embedding.weight")
-            .is_err()
-        {
-            return Ok(None);
-        }
-        if count_embed_vb
-            .pp("transformer")
-            .pp("in_projector")
-            .get((hidden, IN_PROJECTOR_DIM), "weight")
-            .is_err()
-        {
-            return Ok(None);
-        }
-
-        crate::model::count_embed::CountEmbedLayer::from_var_builder(
-            count_embed_vb,
-            hidden,
-            MAX_COUNT,
+    ) -> Result<Option<crate::model::count_embed::CountLayer>> {
+        let layer = crate::model::count_embed::CountLayer::from_var_builder(
+            vb.pp("count_embed"),
+            self.config.hidden_size,
             self.device.clone(),
         )
-        .map(Some)
-        .map_err(|e| GlinerError::model_loading(format!("Failed to rebuild count_embed: {e}")))
+        .map_err(|e| GlinerError::model_loading(format!("Failed to rebuild count_embed: {e}")))?;
+
+        // The declared layer only cross-checks what the weights said. A
+        // disagreement is logged rather than fatal: the weights are
+        // authoritative, and a mismatch is worth seeing instead of silently
+        // resolving either way.
+        if let Some(layer) = &layer {
+            use crate::config::CountingLayerType;
+            let declared = self.config.counting_layer;
+            let agrees = matches!(
+                (declared, layer.variant()),
+                (CountingLayerType::CountLstm, "CountLSTM")
+                    | (CountingLayerType::CountLstmV2, "CountLSTMv2")
+                    | (CountingLayerType::Linear, _)
+            );
+            if !agrees {
+                tracing::warn!(
+                    declared = %declared,
+                    loaded = layer.variant(),
+                    "count_embed weights do not match the declared counting_layer; using the weights"
+                );
+            }
+        }
+        Ok(layer)
     }
 
     /// Rebuild model components with weights from VarBuilder.

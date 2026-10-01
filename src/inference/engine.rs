@@ -225,9 +225,10 @@ impl GLiNER2 {
             {
                 // config.json is authoritative: "span" vs "boundary". Name matching
                 // alone misreads e.g. "GLiNER2.5-Decide", which is a span checkpoint.
-                config.architecture =
-                    crate::config::Architecture::from_hf_config_json(&hf_config_str);
-                // Parse boundary config for GLiNER2.5
+                // Model-level keys (counting layer, max width, max length, token
+                // pooling) come from the same file; boundary knobs only matter
+                // for GLiNER2.5.
+                config.apply_hf_config_json(&hf_config_str);
                 config.boundary =
                     crate::config::BoundaryConfig::from_hf_config_json(&hf_config_str);
             }
@@ -252,7 +253,8 @@ impl GLiNER2 {
                     config.intermediate_size = is as usize;
                 }
             }
-        } else {
+        } else if let Ok(hf_config_str) = std::fs::read_to_string(input.join("config.json")) {
+            config.apply_hf_config_json(&hf_config_str);
             config.boundary =
                 crate::config::BoundaryConfig::detect(input.to_string_lossy().as_ref());
         }
@@ -1287,9 +1289,7 @@ impl GLiNER2 {
 
         // Step 3: Transform entity embeddings using count_embed
         // Output shape: (pred_count, num_entity_types, hidden)
-        let Some(count_embed) = self.model.count_embed.as_ref() else {
-            return Ok(JsonValue::Object(entities));
-        };
+        let count_embed = Self::require_count_embed(&self.model)?;
         let Some(inputs) = Self::prepare_span_score_inputs(
             count_embed,
             &entity_embs_tensor,
@@ -1604,9 +1604,7 @@ impl GLiNER2 {
             schema_tokens_embs,
             &self.model,
         );
-        let Some(count_embed) = self.model.count_embed.as_ref() else {
-            return Ok(JsonValue::Array(Vec::new()));
-        };
+        let count_embed = Self::require_count_embed(&self.model)?;
         let Some(inputs) = Self::prepare_span_score_inputs(
             count_embed,
             &field_embs_tensor,
@@ -1769,9 +1767,7 @@ impl GLiNER2 {
             schema_tokens_embs,
             &self.model,
         );
-        let Some(count_embed) = self.model.count_embed.as_ref() else {
-            return Ok(JsonValue::Array(Vec::new()));
-        };
+        let count_embed = Self::require_count_embed(&self.model)?;
         let Some(inputs) = Self::prepare_span_score_inputs(
             count_embed,
             &field_embs_tensor,
@@ -1880,7 +1876,7 @@ impl GLiNER2 {
     /// caller cannot produce a scored span and should return its empty value,
     /// which is what every call site did inline before this was factored out.
     fn prepare_span_score_inputs(
-        count_embed: &crate::model::count_embed::CountEmbedLayer,
+        count_embed: &crate::model::count_embed::CountLayer,
         field_embs: &Tensor,
         pred_count: usize,
         span_outputs: &crate::model::span_rep::SpanRepOutput,
@@ -2122,7 +2118,10 @@ impl GLiNER2 {
     /// enough. Prefers the longest task that prefixes the string, and requires the
     /// remainder to be empty or start with `':'`/`' '` so that `intent` does not
     /// shadow `intensity`.
-    fn resolve_classification_task(schema_json: &JsonValue, prompt_str: &str) -> Option<String> {
+    pub(crate) fn resolve_classification_task(
+        schema_json: &JsonValue,
+        prompt_str: &str,
+    ) -> Option<String> {
         let items = schema_json.get("classifications")?.as_array()?;
         let mut best: Option<&str> = None;
         for item in items {
@@ -2186,6 +2185,24 @@ impl GLiNER2 {
     // Helper Methods
     // -------------------------------------------------------------------------
 
+    /// Error for a task that needs count guidance the checkpoint does not carry.
+    ///
+    /// Span, relation and structure scoring all pass entity embeddings through
+    /// the count-aware projection. A checkpoint without one cannot run them, and
+    /// returning an empty result instead made "this model cannot extract" look
+    /// exactly like "this text contains nothing".
+    fn require_count_embed<'a>(
+        model: &'a Extractor,
+    ) -> Result<&'a crate::model::count_embed::CountLayer> {
+        model.count_embed.as_ref().ok_or_else(|| {
+            GlinerError::inference(format!(
+                "checkpoint '{}' has no count-aware projection (count_embed.*), so span, \
+                 relation and structure extraction are unavailable; classification still works",
+                model.config.model_name
+            ))
+        })
+    }
+
     /// Build an entity schema from entity type names.
     ///
     /// # Arguments
@@ -2224,6 +2241,15 @@ impl GLiNER2 {
     // -------------------------------------------------------------------------
     // Configuration
     // -------------------------------------------------------------------------
+
+    /// Whether a count-aware projection was loaded.
+    ///
+    /// Count guidance is required for span, relation and structure decoding, so
+    /// `false` means those tasks cannot run on this checkpoint and only
+    /// classification is available.
+    pub fn has_count_embed(&self) -> bool {
+        self.model.count_embed.is_some()
+    }
 
     /// Get the model configuration.
     pub fn config(&self) -> &ExtractorConfig {
