@@ -204,6 +204,24 @@ def run_case(model: Any, case: dict[str, Any]) -> Any:
             key,
         )
 
+    if kind == "structure_multi":
+        # Several structures in one schema: exercises group ordering as well as
+        # field ordering within each group.
+        schema = {
+            "json_structures": [
+                {name: {f: "" for f in fields}}
+                for name, fields in case["structures"].items()
+            ]
+        }
+        raw = model.extract(
+            text,
+            schema,
+            threshold=case.get("threshold", 0.0),
+            include_confidence=True,
+            include_spans=True,
+        )
+        return {name: _norm_structure(raw, name) for name in case["structures"]}
+
     raise ValueError(f"unknown case kind: {kind}")
 
 

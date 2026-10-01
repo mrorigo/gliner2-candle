@@ -129,13 +129,37 @@ fn test_gliner2_pipeline_with_real_tokenizer() {
     println!("Extraction results:");
     println!("{:#?}", result);
 
-    // Verify we got a valid result structure
-    let result_str = format!("{:?}", result);
-    assert!(
-        result_str.contains("entities"),
-        "Expected entity extraction results, got: {}",
-        result_str
-    );
+    // This engine has randomly initialised weights (no checkpoint is loaded),
+    // so only structure can be asserted -- never quality. What matters is that
+    // every requested type comes back as an array: when count guidance failed
+    // to load, the output was `{"entities": {}}` with no keys at all, and the
+    // previous `contains("entities")` check sailed straight past it.
+    let entities = result["entities"]
+        .as_object()
+        .expect("expected an entities object");
+    for kind in ["person", "organization", "location"] {
+        let spans = entities
+            .get(kind)
+            .unwrap_or_else(|| panic!("missing {kind} in {result}"))
+            .as_array()
+            .unwrap_or_else(|| panic!("{kind} was not an array in {result}"));
+        for span in spans {
+            let text = span
+                .get("text")
+                .and_then(|t| t.as_str())
+                .unwrap_or_else(|| panic!("span without text in {kind}: {span}"));
+            assert!(!text.is_empty(), "empty span text in {kind}");
+            let conf = span
+                .get("confidence")
+                .and_then(|c| c.as_f64())
+                .unwrap_or_else(|| panic!("span without confidence in {kind}: {span}"));
+            assert!(
+                (0.0..=1.0).contains(&conf),
+                "{kind} confidence out of range: {conf}"
+            );
+            assert!(span.get("start").is_some() && span.get("end").is_some());
+        }
+    }
 
     println!("\n✅ GLiNER2 pipeline with real tokenizer works!");
 }
@@ -283,12 +307,37 @@ fn test_real_gliner2_model_loading() {
     println!("Extraction results:");
     println!("{:#?}", result);
 
-    // Verify we got meaningful results with real weights
-    let result_str = format!("{:?}", result);
+    // This test loads real weights, so it can assert quality. The old check was
+    // `contains("entities")`, which passed for months while count guidance
+    // silently failed to load and every span scored empty -- the key existed and
+    // every value did not.
+    let entities = result["entities"]
+        .as_object()
+        .expect("expected an entities object");
+    let texts_for = |kind: &str| -> Vec<String> {
+        entities
+            .get(kind)
+            .and_then(|v| v.as_array())
+            .unwrap_or_else(|| panic!("expected a {kind} array, got {result}"))
+            .iter()
+            .filter_map(|s| s.get("text").and_then(|t| t.as_str()))
+            .map(str::to_lowercase)
+            .collect()
+    };
+    let people = texts_for("person");
     assert!(
-        result_str.contains("entities"),
-        "Expected entity extraction results, got: {}",
-        result_str
+        people.iter().any(|t| t == "tim cook"),
+        "expected 'Tim Cook' among person spans, got {people:?}"
+    );
+    let orgs = texts_for("organization");
+    assert!(
+        orgs.iter().any(|t| t == "apple"),
+        "expected 'Apple' among organization spans, got {orgs:?}"
+    );
+    let places = texts_for("location");
+    assert!(
+        places.iter().any(|t| t == "cupertino"),
+        "expected 'Cupertino' among location spans, got {places:?}"
     );
 
     println!("\n✅ Real GLiNER2 inference with trained weights works!");

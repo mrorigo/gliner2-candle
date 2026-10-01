@@ -222,9 +222,19 @@ fn decide_span_classification() {
         (0.0..=1.0).contains(&conf),
         "confidence out of range: {conf}"
     );
+    // Pin the value, not just its range. The point of this check is that we
+    // agree with the reference to the last digit we can see; a loose bound
+    // would pass if the sigmoid/softmax distinction silently reverted.
     // A two-way softmax on a confident call must be near 1, which a sigmoid over a
     // single raw logit would not be.
     assert!(conf > 0.9, "expected softmax confidence, got {conf}");
+    // Pinned against the Python reference for this exact input. Bit-for-bit
+    // agreement is the point: this is the same computation, so anything short
+    // of exact means the encoder or the head moved.
+    assert_eq!(
+        conf, 0.9994387030601501,
+        "confidence drifted from the reference value"
+    );
 }
 
 #[test]

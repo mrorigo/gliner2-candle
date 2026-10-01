@@ -52,8 +52,14 @@ pub const DEFAULT_ATTENTION_DROPOUT_PROB: f32 = 0.1;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CountingLayerType {
-    /// LSTM-based counting layer.
+    /// `layers.py::CountLSTM` -- GRU + concat + 2-layer MLP projector.
     CountLstm,
+    /// `layers.py::CountLSTMv2` -- GRU + `DownscaledTransformer`.
+    ///
+    /// `gliner2-base-v1` declares this while `gliner2-large-v1` and
+    /// `GLiNER2.5-Decide` declare [`CountingLayerType::CountLstm`], so the two
+    /// cannot be told apart from the config alone.
+    CountLstmV2,
     /// Linear-based counting layer.
     Linear,
 }
@@ -62,6 +68,7 @@ impl std::fmt::Display for CountingLayerType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             CountingLayerType::CountLstm => write!(f, "count_lstm"),
+            CountingLayerType::CountLstmV2 => write!(f, "count_lstm_v2"),
             CountingLayerType::Linear => write!(f, "linear"),
         }
     }
@@ -73,9 +80,11 @@ impl std::str::FromStr for CountingLayerType {
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
         match s {
             "count_lstm" => Ok(CountingLayerType::CountLstm),
+            "count_lstm_v2" => Ok(CountingLayerType::CountLstmV2),
             "linear" => Ok(CountingLayerType::Linear),
             _ => Err(GlinerError::config(format!(
-                "Unknown counting layer type: {s}. Expected 'count_lstm' or 'linear'"
+                "Unknown counting layer type: {s}. \
+                 Expected 'count_lstm', 'count_lstm_v2' or 'linear'"
             ))),
         }
     }
@@ -568,6 +577,58 @@ impl ExtractorConfig {
         ConfigBuilder::default()
     }
 
+    /// Apply the model-level keys of an HF `config.json` in place.
+    ///
+    /// Encoder dimensions live in a separate `encoder_config/config.json` and
+    /// are handled by the loader; everything a checkpoint declares at the top
+    /// level is read here so no setting is silently left at its default.
+    /// Unknown keys are ignored and unparseable values keep the default, since
+    /// a config quirk must not stop a checkpoint from loading.
+    ///
+    /// Recognised: `architecture`, `counting_layer`, `max_width`, `max_len`,
+    /// `token_pooling`, and `span_head.max_width`. Not `model_name` -- see the
+    /// note on the method body.
+    pub fn apply_hf_config_json(&mut self, json_str: &str) {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(json_str) else {
+            return;
+        };
+        self.architecture = Architecture::from_hf_config_json(json_str);
+
+        if let Some(layer) = v
+            .get("counting_layer")
+            .and_then(|x| x.as_str())
+            .and_then(|s| s.parse::<CountingLayerType>().ok())
+        {
+            self.counting_layer = layer;
+        }
+        if let Some(width) = v
+            .get("max_width")
+            .and_then(|x| x.as_u64())
+            .or_else(|| {
+                v.get("span_head")
+                    .and_then(|h| h.get("max_width"))
+                    .and_then(|x| x.as_u64())
+            })
+        {
+            self.max_width = width as usize;
+        }
+        // `max_len: null` means "no limit", which is already the default; a
+        // number caps input length and must be honoured.
+        self.max_len = v.get("max_len").and_then(|x| x.as_u64()).map(|x| x as usize);
+        if let Some(pooling) = v
+            .get("token_pooling")
+            .and_then(|x| x.as_str())
+            .and_then(|s| s.parse::<TokenPoolingStrategy>().ok())
+        {
+            self.token_pooling = pooling;
+        }
+        // `model_name` is deliberately NOT taken from config.json. It is the
+        // repository this engine loads weights *and tokenizer files* from, so
+        // overwriting it with the encoder's own name (e.g.
+        // "microsoft/deberta-v3-base") points the tokenizer lookup at a
+        // different repo and quietly breaks subword alignment.
+    }
+
     /// Load config from a JSON file.
     ///
     /// # Errors
@@ -648,12 +709,14 @@ impl ExtractorConfig {
             if max_len == 0 {
                 return Err(GlinerError::config("max_len must be > 0 or None"));
             }
-            if max_len > self.max_position_embeddings {
-                return Err(GlinerError::config(format!(
-                    "max_len ({max_len}) exceeds max_position_embeddings ({})",
-                    self.max_position_embeddings
-                )));
-            }
+            // Deliberately no `max_len <= max_position_embeddings` check.
+            // `max_position_embeddings` is inherited from BERT and is not an
+            // input cap here: these encoders use relative positions
+            // (`position_buckets: 256`, `max_relative_positions: -1`), so
+            // arbitrarily long inputs are fine and distances are bucketed
+            // logarithmically past 128. Every GLiNER2.5 checkpoint declares
+            // `max_len: 4096` against `max_position_embeddings: 512`, so that
+            // check rejected the majority of the model family.
         }
         Ok(())
     }
@@ -1005,10 +1068,90 @@ mod tests {
     }
 
     #[test]
+    fn test_apply_hf_config_json_reads_model_level_keys() {
+        let json = r#"{
+            "architecture": "boundary",
+            "counting_layer": "count_lstm_v2",
+            "max_width": 12,
+            "max_len": 4096,
+            "token_pooling": "mean"
+        }"#;
+        let mut config = ExtractorConfig::new("local/path");
+        config.apply_hf_config_json(json);
+
+        assert_eq!(config.architecture, Architecture::Gliner25);
+        assert_eq!(config.counting_layer, CountingLayerType::CountLstmV2);
+        assert_eq!(config.max_width, 12);
+        assert_eq!(config.max_len, Some(4096));
+        assert_eq!(config.token_pooling, TokenPoolingStrategy::Mean);
+    }
+
+    #[test]
+    fn test_apply_hf_config_json_leaves_model_name_alone() {
+        // config.json's `model_name` names the *encoder* repo. This field is the
+        // repo we load weights and tokenizer files from, so overwriting it sends
+        // the tokenizer lookup somewhere else.
+        let mut config = ExtractorConfig::new("fastino/gliner2.5-base-v1");
+        config.apply_hf_config_json(r#"{"model_name": "microsoft/deberta-v3-base"}"#);
+        assert_eq!(config.model_name, "fastino/gliner2.5-base-v1");
+    }
+
+    #[test]
+    fn test_validate_allows_max_len_beyond_position_embeddings() {
+        // DeBERTa positions are relative, so `max_position_embeddings` is not
+        // an input cap. Every GLiNER2.5 checkpoint declares max_len 4096
+        // against a 512 limit, and rejecting that would refuse most of the
+        // family at load time.
+        let mut config = ExtractorConfig::new("x");
+        config.max_len = Some(4096);
+        config.max_position_embeddings = 512;
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_rejects_zero_max_len() {
+        let mut config = ExtractorConfig::new("x");
+        config.max_len = Some(0);
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_apply_hf_config_json_max_len_null_means_unlimited() {
+        // `max_len: null` is what every span checkpoint ships; it must clear a
+        // previously set limit rather than leave it in place.
+        let mut config = ExtractorConfig::new("x");
+        config.max_len = Some(128);
+        config.apply_hf_config_json(r#"{"max_len": null}"#);
+        assert_eq!(config.max_len, None);
+    }
+
+    #[test]
+    fn test_apply_hf_config_json_tolerates_garbage() {
+        let mut config = ExtractorConfig::new("x");
+        config.max_width = 8;
+        config.apply_hf_config_json("not json at all");
+        config.apply_hf_config_json(r#"{"max_width": "wide", "counting_layer": 7}"#);
+        assert_eq!(config.max_width, 8);
+    }
+
+    #[test]
+    fn test_apply_hf_config_json_reads_span_head_max_width() {
+        let mut config = ExtractorConfig::new("x");
+        config.apply_hf_config_json(r#"{"span_head": {"max_width": 16}}"#);
+        assert_eq!(config.max_width, 16);
+    }
+
+    #[test]
     fn test_counting_layer_from_str() {
         assert_eq!(
             "count_lstm".parse::<CountingLayerType>().unwrap(),
             CountingLayerType::CountLstm
+        );
+        // gliner2-base-v1 ships this spelling; it must not fall through to the
+        // default and hide which layer a checkpoint actually uses.
+        assert_eq!(
+            "count_lstm_v2".parse::<CountingLayerType>().unwrap(),
+            CountingLayerType::CountLstmV2
         );
         assert_eq!(
             "linear".parse::<CountingLayerType>().unwrap(),
