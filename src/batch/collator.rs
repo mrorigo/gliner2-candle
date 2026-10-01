@@ -90,6 +90,29 @@ pub struct ExtractorCollator {
 }
 
 impl ExtractorCollator {
+    /// Ensure text ends with sentence punctuation before collation.
+    ///
+    /// Port of `gliner2/processor.py::_normalize_text`. The reference does this
+    /// inside `_collate_batch` for every record, so a trailing `.`/`!`/`?`
+    /// becomes an extra word — and therefore an extra subword — in the encoder
+    /// input. Skipping it shifts every downstream embedding: on
+    /// `gliner2-base-v1` the `intent`/`severity` pair moves from `medium`
+    /// (0.9399) to `high`, which is exactly the classification drift this
+    /// collator otherwise matches.
+    ///
+    /// The appended word maps past the end of the original string, so callers
+    /// must keep the original text for character offsets.
+    fn normalize_text(text: &str) -> String {
+        if text.is_empty() {
+            return ".".to_string();
+        }
+        if text.ends_with('.') || text.ends_with('!') || text.ends_with('?') {
+            text.to_string()
+        } else {
+            format!("{text}.")
+        }
+    }
+
     /// Create a new collator.
     ///
     /// # Arguments
@@ -289,8 +312,11 @@ impl ExtractorCollator {
 
     /// Process a single sample into tokenized form.
     fn process_sample(&self, text: &str, schema: &JsonValue) -> Result<ProcessedSample> {
-        // Tokenize text with whitespace tokenizer for span boundaries
-        let tokens = self.tokenizer.tokenize(text);
+        // Tokenize text with whitespace tokenizer for span boundaries.
+        // The reference normalizes to terminal punctuation first
+        // (`_normalize_text`), so the word count -- and the encoder input --
+        // only matches if we do the same.
+        let tokens = self.tokenizer.tokenize(&Self::normalize_text(text));
         let text_tokens: Vec<String> = tokens.iter().map(|t| t.text.clone()).collect();
         let (start_mapping, end_mapping) = WhitespaceTokenizer::build_mappings(&tokens);
 
