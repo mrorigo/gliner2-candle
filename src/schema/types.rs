@@ -960,22 +960,17 @@ impl Schema {
                 .classifications
                 .iter()
                 .map(|cls| {
-                    let mut obj = serde_json::Map::new();
-                    obj.insert(
-                        "task".to_string(),
-                        serde_json::Value::String(cls.task.clone()),
-                    );
-                    obj.insert(
-                        "labels".to_string(),
-                        serde_json::Value::Array(
-                            cls.labels
-                                .iter()
-                                .map(|l| serde_json::Value::String(l.clone()))
-                                .collect(),
-                        ),
-                    );
-                    if cls.multi_label {
-                        obj.insert("multi_label".to_string(), serde_json::Value::Bool(true));
+                    // The serde field names already match the keys the collator
+                    // reads, and `examples` serializes as [[input, output]],
+                    // which is what `build_classification_tokens` expects.
+                    // Building the map by hand previously dropped
+                    // `label_descriptions`, `prompt` and `examples` on the floor.
+                    let mut obj = match serde_json::to_value(cls) {
+                        Ok(serde_json::Value::Object(obj)) => obj,
+                        _ => serde_json::Map::new(),
+                    };
+                    if !cls.multi_label {
+                        obj.remove("multi_label");
                     }
                     let threshold = if cls.cls_threshold.is_finite() {
                         cls.cls_threshold.clamp(0.0, 1.0)
@@ -1230,6 +1225,36 @@ impl Schema {
                         {
                             cls = cls.with_threshold(threshold as f32);
                         }
+                        if let Some(descs) = cls_obj.get("label_descriptions").and_then(|v| v.as_object())
+                        {
+                            let map: HashMap<String, String> = descs
+                                .iter()
+                                .filter_map(|(k, v)| {
+                                    v.as_str().map(|d| (k.clone(), d.to_string()))
+                                })
+                                .collect();
+                            if !map.is_empty() {
+                                cls = cls.with_label_descriptions(map);
+                            }
+                        }
+                        if let Some(prompt) = cls_obj.get("prompt").and_then(|v| v.as_str()) {
+                            cls.prompt = Some(prompt.to_string());
+                        }
+                        if let Some(examples) = cls_obj.get("examples").and_then(|v| v.as_array())
+                        {
+                            let pairs: Vec<(String, String)> = examples
+                                .iter()
+                                .filter_map(|e| {
+                                    let pair = e.as_array()?;
+                                    let input = pair.first()?.as_str()?;
+                                    let output = pair.get(1)?.as_str()?;
+                                    Some((input.to_string(), output.to_string()))
+                                })
+                                .collect();
+                            if !pairs.is_empty() {
+                                cls.examples = Some(pairs);
+                            }
+                        }
 
                         schema.classifications.push(cls);
                     }
@@ -1425,6 +1450,63 @@ mod tests {
         let dict = schema.to_dict();
         assert!(dict.get("entities").is_some());
         assert!(dict.get("classifications").is_some());
+    }
+
+    /// `to_dict` used to hand-build the classification map field by field and
+    /// silently drop `label_descriptions`, `prompt` and `examples`. The collator
+    /// reads all three, so a schema built through `SchemaBuilder` never reached
+    /// the model with any of them. Going through `to_dict` here is the point:
+    /// tests that hand-build a `serde_json::Value` cannot catch this class of bug.
+    #[test]
+    fn test_to_dict_preserves_classification_prompt_metadata() {
+        let mut descriptions = HashMap::new();
+        descriptions.insert(
+            "card_lost".to_string(),
+            "the physical card is missing".to_string(),
+        );
+        let cls = ClassificationDef::new("intent", vec!["card_lost".to_string()])
+            .with_label_descriptions(descriptions);
+        let cls = ClassificationDef {
+            prompt: Some("What does the customer want?".to_string()),
+            examples: Some(vec![(
+                "my card is gone".to_string(),
+                "card_lost".to_string(),
+            )]),
+            ..cls
+        };
+        let schema = Schema::new().classifications(vec![cls]);
+
+        let head = &schema.to_dict()["classifications"][0];
+        assert_eq!(head["label_descriptions"]["card_lost"], "the physical card is missing");
+        assert_eq!(head["prompt"], "What does the customer want?");
+        assert_eq!(head["examples"][0][0], "my card is gone");
+        assert_eq!(head["examples"][0][1], "card_lost");
+    }
+
+    #[test]
+    fn test_from_dict_reads_classification_prompt_metadata() {
+        let dict = serde_json::json!({
+            "classifications": [{
+                "task": "intent",
+                "labels": ["card_lost"],
+                "label_descriptions": {"card_lost": "the physical card is missing"},
+                "prompt": "What does the customer want?",
+                "examples": [["my card is gone", "card_lost"]]
+            }]
+        });
+
+        let schema = Schema::from_dict(&dict).expect("valid schema");
+        let cls = &schema.classifications[0];
+
+        assert_eq!(
+            cls.label_descriptions.as_ref().unwrap()["card_lost"],
+            "the physical card is missing"
+        );
+        assert_eq!(cls.prompt.as_deref(), Some("What does the customer want?"));
+        assert_eq!(
+            cls.examples.as_ref().unwrap(),
+            &vec![("my card is gone".to_string(), "card_lost".to_string())]
+        );
     }
 
     #[test]

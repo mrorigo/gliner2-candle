@@ -1,0 +1,139 @@
+{
+  "cases": [
+    {
+      "id": "apple_entities",
+      "kind": "entities",
+      "text": "Apple CEO Tim Cook announced new products at the headquarters in Cupertino, California.",
+      "entities": ["person", "organization", "location"],
+      "threshold": 0.5
+    },
+    {
+      "id": "apple_entities_low_threshold",
+      "kind": "entities",
+      "text": "Apple CEO Tim Cook announced new products at the headquarters in Cupertino, California.",
+      "entities": ["person", "organization", "location"],
+      "threshold": 0.05
+    },
+    {
+      "id": "entities_with_descriptions",
+      "kind": "entities_described",
+      "text": "Apple CEO Tim Cook announced new products at the headquarters in Cupertino, California.",
+      "entities": ["person", "organization", "location"],
+      "entity_descriptions": {
+        "person": "a human being, typically a named individual",
+        "organization": "a company, agency or institution",
+        "location": "a city, country or geographic place"
+      },
+      "threshold": 0.05
+    },
+    {
+      "id": "microsoft_entities",
+      "kind": "entities",
+      "text": "Microsoft was founded by Bill Gates in Albuquerque.",
+      "entities": ["person", "organization", "location"],
+      "threshold": 0.5
+    },
+    {
+      "id": "amount_entities",
+      "kind": "entities",
+      "text": "Charged twice, 49 EUR both times",
+      "entities": ["amount"],
+      "threshold": 0.5
+    },
+    {
+      "id": "class_sentiment",
+      "kind": "classifications",
+      "text": "I love this product.",
+      "classifications": {
+        "sentiment": {
+          "labels": ["positive", "negative", "neutral"],
+          "multi_label": false
+        }
+      }
+    },
+    {
+      "id": "class_sentiment_multi_label",
+      "kind": "classifications",
+      "text": "The app is polished but expensive and occasionally crashes.",
+      "classifications": {
+        "sentiment": {
+          "labels": ["positive", "negative", "neutral"],
+          "multi_label": true
+        }
+      }
+    },
+    {
+      "id": "class_intent_described",
+      "kind": "classifications",
+      "text": "Charged twice, 49 EUR both times",
+      "classifications": {
+        "intent": {
+          "labels": ["duplicate_charge", "refund_request", "other"],
+          "multi_label": false,
+          "label_descriptions": {
+            "duplicate_charge": "the customer was billed more than once for one order",
+            "refund_request": "the customer wants their money back",
+            "other": "anything else"
+          }
+        }
+      }
+    },
+    {
+      "id": "class_two_heads",
+      "kind": "classifications",
+      "text": "Charged twice, 49 EUR both times",
+      "classifications": {
+        "intent": {
+          "labels": ["duplicate_charge", "refund_request", "other"],
+          "multi_label": false,
+          "label_descriptions": {
+            "duplicate_charge": "the customer was billed more than once for one order",
+            "refund_request": "the customer wants their money back",
+            "other": "anything else"
+          }
+        },
+        "severity": {
+          "labels": ["low", "medium", "high"],
+          "multi_label": false
+        }
+      }
+    },
+    {
+      "id": "class_with_prompt_and_examples",
+      "kind": "classifications",
+      "text": "Charged twice, 49 EUR both times",
+      "classifications": {
+        "intent": {
+          "labels": ["duplicate_charge", "refund_request", "other"],
+          "multi_label": false,
+          "prompt": "What does the customer want?",
+          "examples": [
+            ["charged twice for one order", "duplicate_charge"],
+            ["please refund my payment", "refund_request"]
+          ]
+        }
+      }
+    },
+    {
+      "id": "relations_works_for",
+      "kind": "relations",
+      "text": "Apple CEO Tim Cook announced new products at the headquarters in Cupertino, California.",
+      "relations": ["works_for"],
+      "threshold": 0.3
+    },
+    {
+      "id": "structure_product_info",
+      "kind": "structure",
+      "text": "Apple announced iPhone in Cupertino, California.",
+      "structure": { "product_info": ["name", "company"] },
+      "threshold": 0.0
+    },
+    {
+      "id": "structure_profile",
+      "kind": "structure",
+      "text": "Microsoft was founded by Bill Gates in Albuquerque.",
+      "structure": { "profile": ["name", "company"] },
+      "threshold": 0.0
+    }
+  ]
+}

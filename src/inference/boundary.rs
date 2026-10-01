@@ -1059,9 +1059,21 @@ fn decode_classification(
         .and_then(|m| m.as_bool())
         .unwrap_or(false);
 
-    let task_name = batch
+    // Token index 2 holds the whole prompt string once descriptions, an
+    // instruction or few-shot examples are folded in, so recover the task name
+    // the same way the span path does. Falling back to the raw token would key
+    // the result by "intent [DESCRIPTION] duplicate_charge: ..." instead of
+    // "intent".
+    let prompt_str = batch
         .schema_tokens(sample_idx, group)
-        .and_then(|t| t.get(2).map(|s| s.to_string()))
+        .and_then(|t| t.get(2))
+        .cloned();
+    let task_name = prompt_str
+        .as_deref()
+        .and_then(|s| {
+            crate::inference::engine::GLiNER2::resolve_classification_task(&schema_json, s)
+        })
+        .or(prompt_str)
         .unwrap_or_else(|| format!("task_{group}"));
 
     if multi_label {

@@ -1880,7 +1880,7 @@ impl GLiNER2 {
     /// caller cannot produce a scored span and should return its empty value,
     /// which is what every call site did inline before this was factored out.
     fn prepare_span_score_inputs(
-        count_embed: &crate::model::count_embed::CountEmbedLayer,
+        count_embed: &crate::model::count_embed::CountLayer,
         field_embs: &Tensor,
         pred_count: usize,
         span_outputs: &crate::model::span_rep::SpanRepOutput,
@@ -2122,7 +2122,10 @@ impl GLiNER2 {
     /// enough. Prefers the longest task that prefixes the string, and requires the
     /// remainder to be empty or start with `':'`/`' '` so that `intent` does not
     /// shadow `intensity`.
-    fn resolve_classification_task(schema_json: &JsonValue, prompt_str: &str) -> Option<String> {
+    pub(crate) fn resolve_classification_task(
+        schema_json: &JsonValue,
+        prompt_str: &str,
+    ) -> Option<String> {
         let items = schema_json.get("classifications")?.as_array()?;
         let mut best: Option<&str> = None;
         for item in items {
@@ -2224,6 +2227,15 @@ impl GLiNER2 {
     // -------------------------------------------------------------------------
     // Configuration
     // -------------------------------------------------------------------------
+
+    /// Whether a count-aware projection was loaded.
+    ///
+    /// Count guidance is required for span, relation and structure decoding, so
+    /// `false` means those tasks cannot run on this checkpoint and only
+    /// classification is available.
+    pub fn has_count_embed(&self) -> bool {
+        self.model.count_embed.is_some()
+    }
 
     /// Get the model configuration.
     pub fn config(&self) -> &ExtractorConfig {

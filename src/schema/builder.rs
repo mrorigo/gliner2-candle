@@ -143,28 +143,38 @@ impl SchemaBuilder {
         self
     }
 
-    /// Add entities with descriptions from a HashMap.
+    /// Add entities with descriptions.
+    ///
+    /// Accepts any `(name, description)` iterable. Order is significant: it
+    /// becomes the entity order in the prompt, and therefore the `[E]` slot
+    /// order. Passing a `HashMap` yields a nondeterministic order (and a
+    /// nondeterministic prompt, since descriptions are folded into it), so
+    /// prefer a `Vec`.
     ///
     /// # Arguments
     ///
-    /// * `entities` - A HashMap mapping entity names to descriptions.
+    /// * `entities` - `(name, description)` pairs, in the order they should
+    ///   appear in the schema.
     ///
     /// # Example
     ///
     /// ```
     /// use gliner2_candle::schema::builder::SchemaBuilder;
-    /// use std::collections::HashMap;
-    ///
-    /// let mut entities = HashMap::new();
-    /// entities.insert("person".to_string(), "Names of people".to_string());
-    /// entities.insert("company".to_string(), "Organization names".to_string());
     ///
     /// let schema = SchemaBuilder::new()
-    ///     .entities_with_descriptions(entities)
+    ///     .entities_with_descriptions(vec![
+    ///         ("person".to_string(), "Names of people".to_string()),
+    ///         ("company".to_string(), "Organization names".to_string()),
+    ///     ])
     ///     .build()
     ///     .unwrap();
+    ///
+    /// assert_eq!(schema.entities[0].name, "person");
     /// ```
-    pub fn entities_with_descriptions(mut self, entities: HashMap<String, String>) -> Self {
+    pub fn entities_with_descriptions<I>(mut self, entities: I) -> Self
+    where
+        I: IntoIterator<Item = (String, String)>,
+    {
         for (name, desc) in entities {
             if !self.entity_order.contains(&name) {
                 self.entity_order.push(name.clone());
