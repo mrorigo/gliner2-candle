@@ -69,12 +69,27 @@ Also supported: labels carrying descriptions (`.label_descriptions(..)`),
 a per-task instruction (`.prompt(..)`), few-shot `.examples(..)`, and ordinal
 scales passed as ordinary strings.
 
-> **Entity extraction is unavailable on Decide checkpoints.** They ship
-> `counting_layer: "count_lstm"` (GRU + MLP projector) instead of the
-> GRU+transformer `count_embed` block this port implements, so the
-> count-guided span scorer has no weights to load and returns no spans.
-> Classification is unaffected. Use `gliner2-base-v1` / `gliner2-large-v1` for
-> entity extraction.
+Both count-aware layouts upstream ships are implemented — `CountLSTM`
+(GRU + MLP projector) and `CountLSTMv2` (GRU + `DownscaledTransformer`) — so
+every span checkpoint in the family loads its count-guided scorer and can
+extract entities, relations and structures. Which one a checkpoint carries is
+decided from its weight keys, not from `counting_layer` in `config.json`:
+`gliner2-base-v1` declares `count_lstm_v2` and ships the transformer block,
+while `gliner2-large-v1` and `GLiNER2.5-Decide` declare `count_lstm` and ship
+the MLP projector.
+
+A checkpoint with no `count_embed.*` weights at all cannot run span, relation
+or structure decoding; that now raises an error naming the checkpoint instead
+of returning an empty result, so "the model found nothing" is never ambiguous
+with "the model cannot do this".
+
+> **Adding a classification head shifts the confidence of the heads already
+> present.** Heads share one encoder pass, so a second head lengthens the prompt
+> and moves the contextual state the first head reads. This matches the Python
+> reference to float32 precision, so it is inherent rather than a port defect —
+> but it does mean thresholds are only valid for the head set they were
+> calibrated against. Add a head and expect every existing threshold to need
+> recalibrating.
 
 ## 🚀 GLiNER2.5 Support (boundary architecture)
 
