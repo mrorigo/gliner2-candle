@@ -1491,7 +1491,10 @@ mod tests {
         let schema = Schema::new().classifications(vec![cls]);
 
         let head = &schema.to_dict()["classifications"][0];
-        assert_eq!(head["label_descriptions"]["card_lost"], "the physical card is missing");
+        assert_eq!(
+            head["label_descriptions"]["card_lost"],
+            "the physical card is missing"
+        );
         assert_eq!(head["prompt"], "What does the customer want?");
         assert_eq!(head["examples"][0][0], "my card is gone");
         assert_eq!(head["examples"][0][1], "card_lost");

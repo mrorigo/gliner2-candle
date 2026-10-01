@@ -156,7 +156,7 @@ impl ModelLoader {
         Ok(())
     }
 
-/// Load the optional count-embedding layer.
+    /// Load the optional count-embedding layer.
     ///
     /// Returns `Ok(None)` only when the checkpoint ships no count-aware
     /// projection whatsoever. Both upstream variants are supported, and which

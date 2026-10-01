@@ -268,16 +268,19 @@ impl GruTrunk {
         let count = pred_count.min(MAX_COUNT);
 
         let pos_ids: Vec<u32> = (0..count).map(|i| i as u32).collect();
-        let pos_embs = self
-            .pos_embedding
-            .forward(&Tensor::from_slice(&pos_ids, (count,), &self.device)?)?;
+        let pos_embs =
+            self.pos_embedding
+                .forward(&Tensor::from_slice(&pos_ids, (count,), &self.device)?)?;
 
         let query = entity_embs
             .unsqueeze(0)?
             .broadcast_as((count, num_types, self.hidden_size))?;
-        let gru_out = self.gru.forward(&pos_embs.unsqueeze(1)?.broadcast_as(
-            (count, num_types, self.hidden_size),
-        )?, Some(entity_embs))?;
+        let gru_out = self.gru.forward(
+            &pos_embs
+                .unsqueeze(1)?
+                .broadcast_as((count, num_types, self.hidden_size))?,
+            Some(entity_embs),
+        )?;
 
         Ok((gru_out, query))
     }
@@ -309,7 +312,9 @@ impl CountLstmLayer {
     fn forward(&self, entity_embs: &Tensor, pred_count: usize) -> Result<CountEmbedOutput> {
         let (gru_out, query) = self.trunk.run(entity_embs, pred_count)?;
         let concat = Tensor::cat(&[gru_out, query], 2)?;
-        let out = self.projector_2.forward(&self.projector_0.forward(&concat)?.relu()?)?;
+        let out = self
+            .projector_2
+            .forward(&self.projector_0.forward(&concat)?.relu()?)?;
         Ok(CountEmbedOutput {
             embeddings: out,
             pred_count: pred_count.min(MAX_COUNT),

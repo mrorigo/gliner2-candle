@@ -259,7 +259,9 @@ fn test_relation_threshold_metadata_pipeline() {
     //
     // What is worth asserting here is that the filter is applied at all.
     for pair in &rels {
-        let score = pair["head"]["confidence"].as_f64().expect("head confidence");
+        let score = pair["head"]["confidence"]
+            .as_f64()
+            .expect("head confidence");
         assert!(
             score >= 1.0,
             "relation below its threshold survived: {score} in {pair:?}"

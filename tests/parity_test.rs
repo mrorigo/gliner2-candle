@@ -19,10 +19,10 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::process::Command;
 
+use gliner2_candle::GLiNER2;
 use gliner2_candle::schema::builder::SchemaBuilder;
 use gliner2_candle::schema::types::Schema;
-use gliner2_candle::GLiNER2;
-use serde_json::{json, Value as JsonValue};
+use serde_json::{Value as JsonValue, json};
 
 /// Decision spans and label sets must match exactly; probabilities only have to
 /// agree closely. Observed Python/Rust drift on float32 CPU is ~1e-6, so this is
@@ -121,10 +121,7 @@ fn load_cases() -> Vec<Case> {
                             .collect()
                     })
                     .unwrap_or_default(),
-                threshold: c
-                    .get("threshold")
-                    .and_then(|v| v.as_f64())
-                    .unwrap_or(0.5),
+                threshold: c.get("threshold").and_then(|v| v.as_f64()).unwrap_or(0.5),
             }
         })
         .collect()
@@ -205,9 +202,19 @@ fn norm_entities(raw: &JsonValue) -> JsonValue {
             })
             .unwrap_or_default();
         rows.sort_by(|a, b| {
-            let (ta, ca) = (a["text"].as_str().unwrap_or(""), a["confidence"].as_f64().unwrap_or(0.0));
-            let (tb, cb) = (b["text"].as_str().unwrap_or(""), b["confidence"].as_f64().unwrap_or(0.0));
-            ta.cmp(tb).then(cb.partial_cmp(&ca).unwrap_or(std::cmp::Ordering::Equal).reverse())
+            let (ta, ca) = (
+                a["text"].as_str().unwrap_or(""),
+                a["confidence"].as_f64().unwrap_or(0.0),
+            );
+            let (tb, cb) = (
+                b["text"].as_str().unwrap_or(""),
+                b["confidence"].as_f64().unwrap_or(0.0),
+            );
+            ta.cmp(tb).then(
+                cb.partial_cmp(&ca)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .reverse(),
+            )
         });
         out.insert(label.clone(), JsonValue::Array(rows));
     }
@@ -284,8 +291,15 @@ fn norm_relations(raw: &JsonValue) -> JsonValue {
 
 fn norm_structure(raw: &JsonValue, key: &str) -> JsonValue {
     let mut fields = serde_json::Map::new();
-    for inst in raw.get(key).and_then(|v| v.as_array()).cloned().unwrap_or_default() {
-        let Some(obj) = inst.as_object() else { continue };
+    for inst in raw
+        .get(key)
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default()
+    {
+        let Some(obj) = inst.as_object() else {
+            continue;
+        };
         for (field, value) in obj {
             let items = match value {
                 JsonValue::Array(a) => a.clone(),
@@ -379,7 +393,10 @@ fn classification_schema(spec: &JsonValue) -> Schema {
             if let Some(ex) = head.get("examples").and_then(|v| v.as_array()) {
                 for e in ex {
                     if let Some(a) = e.as_array()
-                        && let (Some(i), Some(o)) = (a.first().and_then(|v| v.as_str()), a.get(1).and_then(|v| v.as_str()))
+                        && let (Some(i), Some(o)) = (
+                            a.first().and_then(|v| v.as_str()),
+                            a.get(1).and_then(|v| v.as_str()),
+                        )
                     {
                         cls = cls.example(i, o);
                     }
@@ -430,7 +447,11 @@ fn run_case(engine: &GLiNER2, case: &Case) -> JsonValue {
                 .entities_with_descriptions(ordered)
                 .build()
                 .expect("entity schema");
-            norm_entities(&engine.extract(&case.text, &schema, threshold, true, true, None).unwrap())
+            norm_entities(
+                &engine
+                    .extract(&case.text, &schema, threshold, true, true, None)
+                    .unwrap(),
+            )
         }
         "classifications" => {
             let schema = classification_schema(&case.classifications);
@@ -450,7 +471,11 @@ fn run_case(engine: &GLiNER2, case: &Case) -> JsonValue {
             &engine
                 .extract_relations(
                     &case.text,
-                    &case.relations.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+                    &case
+                        .relations
+                        .iter()
+                        .map(|s| s.as_str())
+                        .collect::<Vec<_>>(),
                     Some(threshold),
                     true,
                     true,
@@ -487,7 +512,9 @@ fn run_case(engine: &GLiNER2, case: &Case) -> JsonValue {
             let key = case.structure_key.clone().expect("structure key");
             let schema = structure_schema(&key, &case.structure_fields);
             norm_structure(
-                &engine.extract(&case.text, &schema, threshold, true, true, None).unwrap(),
+                &engine
+                    .extract(&case.text, &schema, threshold, true, true, None)
+                    .unwrap(),
                 &key,
             )
         }
@@ -627,10 +654,38 @@ macro_rules! parity_test {
     };
 }
 
-parity_test!(gliner2_base_v1_parity, "fastino/gliner2-base-v1", "loads real weights from the Hub cache");
-parity_test!(gliner2_large_v1_parity, "fastino/gliner2-large-v1", "loads real weights from the Hub cache");
-parity_test!(gliner25_decide_parity, "fastino/GLiNER2.5-Decide", "loads real weights from the Hub cache");
-parity_test!(gliner25_base_v1_parity, "fastino/gliner2.5-base-v1", "loads real weights from the Hub cache");
-parity_test!(gliner25_small_v1_parity, "fastino/gliner2.5-small-v1", "loads real weights from the Hub cache");
-parity_test!(gliner25_multi_v1_parity, "fastino/gliner2.5-multi-v1", "loads real weights from the Hub cache");
-parity_test!(gliner25_multi_decide_parity, "fastino/GLiNER2.5-multi-Decide", "loads real weights from the Hub cache");
+parity_test!(
+    gliner2_base_v1_parity,
+    "fastino/gliner2-base-v1",
+    "loads real weights from the Hub cache"
+);
+parity_test!(
+    gliner2_large_v1_parity,
+    "fastino/gliner2-large-v1",
+    "loads real weights from the Hub cache"
+);
+parity_test!(
+    gliner25_decide_parity,
+    "fastino/GLiNER2.5-Decide",
+    "loads real weights from the Hub cache"
+);
+parity_test!(
+    gliner25_base_v1_parity,
+    "fastino/gliner2.5-base-v1",
+    "loads real weights from the Hub cache"
+);
+parity_test!(
+    gliner25_small_v1_parity,
+    "fastino/gliner2.5-small-v1",
+    "loads real weights from the Hub cache"
+);
+parity_test!(
+    gliner25_multi_v1_parity,
+    "fastino/gliner2.5-multi-v1",
+    "loads real weights from the Hub cache"
+);
+parity_test!(
+    gliner25_multi_decide_parity,
+    "fastino/GLiNER2.5-multi-Decide",
+    "loads real weights from the Hub cache"
+);

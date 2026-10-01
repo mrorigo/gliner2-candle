@@ -253,9 +253,7 @@ impl GLiNER2 {
                     config.intermediate_size = is as usize;
                 }
             }
-        } else if let Ok(hf_config_str) =
-            std::fs::read_to_string(input.join("config.json"))
-        {
+        } else if let Ok(hf_config_str) = std::fs::read_to_string(input.join("config.json")) {
             config.apply_hf_config_json(&hf_config_str);
             config.boundary =
                 crate::config::BoundaryConfig::detect(input.to_string_lossy().as_ref());

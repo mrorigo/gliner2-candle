@@ -626,9 +626,8 @@ impl ExtractorCollator {
         entity_names: &[String],
         entity_descriptions: Option<&JsonValue>,
     ) -> Vec<String> {
-        let descriptions: Option<serde_json::Map<String, JsonValue>> = entity_descriptions
-            .and_then(|v| v.as_object())
-            .cloned();
+        let descriptions: Option<serde_json::Map<String, JsonValue>> =
+            entity_descriptions.and_then(|v| v.as_object()).cloned();
 
         let mut prompt_str = "entities".to_string();
         if let Some(descriptions) = &descriptions {
@@ -636,10 +635,7 @@ impl ExtractorCollator {
                 if let Some(desc) = descriptions.get(name).and_then(|v| v.as_str())
                     && !desc.is_empty()
                 {
-                    prompt_str.push_str(&format!(
-                        " {} {name}: {desc}",
-                        special_tokens::DESC_TOKEN
-                    ));
+                    prompt_str.push_str(&format!(" {} {name}: {desc}", special_tokens::DESC_TOKEN));
                 }
             }
         }

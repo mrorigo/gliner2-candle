@@ -601,20 +601,19 @@ impl ExtractorConfig {
         {
             self.counting_layer = layer;
         }
-        if let Some(width) = v
-            .get("max_width")
-            .and_then(|x| x.as_u64())
-            .or_else(|| {
-                v.get("span_head")
-                    .and_then(|h| h.get("max_width"))
-                    .and_then(|x| x.as_u64())
-            })
-        {
+        if let Some(width) = v.get("max_width").and_then(|x| x.as_u64()).or_else(|| {
+            v.get("span_head")
+                .and_then(|h| h.get("max_width"))
+                .and_then(|x| x.as_u64())
+        }) {
             self.max_width = width as usize;
         }
         // `max_len: null` means "no limit", which is already the default; a
         // number caps input length and must be honoured.
-        self.max_len = v.get("max_len").and_then(|x| x.as_u64()).map(|x| x as usize);
+        self.max_len = v
+            .get("max_len")
+            .and_then(|x| x.as_u64())
+            .map(|x| x as usize);
         if let Some(pooling) = v
             .get("token_pooling")
             .and_then(|x| x.as_str())
